@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/luchs"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/flotilla-org/luchs"
+
+[workspace.dependencies]
+jackstay = { git = "https://github.com/flotilla-org/jackstay", rev = "33369151429d82a2b923ab2891e199b05aca075a" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
