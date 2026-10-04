@@ -27,13 +27,17 @@ fn python(script: &str) -> Helper {
 
 #[test]
 fn fake_helper_streams_split_records_binary_pixels_and_resizes() {
+    // Exercise descriptor numbers above dash's redirection range deterministically.
+    let _occupied: Vec<_> = (0..16)
+        .map(|_| std::fs::File::open("/dev/null").unwrap())
+        .collect();
     let first = common::frame(1, &[0, 10, 255, 1]);
     let second = common::frame(2, b"12345678");
     let mut helper = fake(&format!(
         "{}; {}; {}",
-        common::printf(&first[..2]),
-        common::printf(&first[2..]),
-        common::printf(&second)
+        common::socket_write(&first[..2]),
+        common::socket_write(&first[2..]),
+        common::socket_write(&second)
     ));
     let first = helper.receive(TIMEOUT).unwrap().unwrap();
     assert_eq!(first.pixels, [0, 10, 255, 1]);
@@ -153,7 +157,7 @@ ack(command(), 'failed', 'no view')
 #[test]
 fn state_event_is_delivered_to_callback() {
     let (send, receive) = mpsc::channel();
-    let script = common::printf(&common::control(
+    let script = common::socket_write(&common::control(
         3,
         json!({"url":"file:///page", "nested":{"revision":7}}),
     ));
@@ -171,7 +175,7 @@ fn state_event_is_delivered_to_callback() {
 
 #[test]
 fn invalid_records_are_rejected_before_reading_payloads() {
-    let header = json!({"format":"rgba8", "width":1, "height":1, "stride":4, "len":4});
+    let header = json!({"format":"bgra8", "width":1, "height":1, "stride":4, "len":4});
     let mut cases = vec![
         vec![0, 0, 0, 0],
         vec![1],
@@ -185,7 +189,7 @@ fn invalid_records_are_rejected_before_reading_payloads() {
     for key in ["format", "width", "height", "stride", "len"] {
         let mut invalid = header.clone();
         invalid[key] = match key {
-            "format" => json!("bgra8"),
+            "format" => json!("rgba8"),
             "width" | "height" => json!(0),
             "stride" => json!(3),
             _ => json!(5),
@@ -232,7 +236,7 @@ fn oversized_record_control_and_frame_header_are_rejected() {
         io::ErrorKind::InvalidData
     );
     let header = serde_json::to_vec(&json!({
-        "format":"rgba8", "width":1, "height":1,
+        "format":"bgra8", "width":1, "height":1,
         "stride":protocol::MAX_FRAME_BYTES + 1, "len":protocol::MAX_FRAME_BYTES + 1,
     }))
     .unwrap();
@@ -268,7 +272,7 @@ fn malformed_record_stops_and_reaps_without_waiting_for_drop() {
     let helper = fake(&format!(
         "echo $$ > '{}'; {}; exec sleep 60",
         pid_path.display(),
-        common::printf(&common::envelope(&[99]))
+        common::socket_write(&common::envelope(&[99]))
     ));
     assert_eq!(
         helper.receive(TIMEOUT).unwrap().unwrap_err().kind(),
@@ -284,7 +288,7 @@ fn panicking_state_callback_fails_and_reaps_helper() {
     let script = format!(
         "echo $$ > '{}'; {}; exec sleep 60",
         pid_path.display(),
-        common::printf(&common::control(3, json!({})))
+        common::socket_write(&common::control(3, json!({})))
     );
     let helper = Helper::spawn_with_state(Command::new("/bin/sh").args(["-c", &script]), |_| {
         panic!("test callback")
@@ -362,10 +366,141 @@ fn pending_slots_and_blocked_command_writes_are_bounded() {
 }
 
 #[test]
-fn write_failure_keeps_root_cause_when_stdout_closes() {
-    let mut helper = python("os.close(0)\nframe()\ntime.sleep(60)\n");
+fn socket_eof_disconnects_commands_without_losing_the_final_frame() {
+    let mut helper = python("frame()\nwire.close()\ntransport.close()\ntime.sleep(0.1)\n");
     helper.receive(TIMEOUT).unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
     assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Uncertain);
-    let error = helper.receive(TIMEOUT).unwrap().unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(matches!(
+        helper.receive(TIMEOUT),
+        Err(RecvTimeoutError::Disconnected)
+    ));
+}
+
+#[test]
+fn frame_decode_reuses_returned_pixel_storage() {
+    let bytes = common::frame(2, b"12345678");
+    let buffer = Vec::with_capacity(8);
+    let pointer = buffer.as_ptr();
+    let mut pool = vec![buffer];
+    let Record::Frame(frame) = protocol::read_record_reusing(&mut bytes.as_slice(), &mut pool)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(frame.pixels.as_ptr(), pointer);
+    assert_eq!(frame.pixels, b"12345678");
+    pool.push(frame.pixels);
+    let Record::Frame(frame) = protocol::read_record_reusing(&mut bytes.as_slice(), &mut pool)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(frame.pixels.as_ptr(), pointer);
+}
+
+#[test]
+fn stdout_is_unused_and_cannot_corrupt_socket_framing() {
+    let helper = fake(&format!(
+        "printf 'not a protocol record'; {}",
+        common::socket_write(&common::frame(1, b"bgra"))
+    ));
+    assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"bgra");
+}
+
+#[test]
+fn idle_event_wait_sleeps_and_host_ack_and_state_wake_it() {
+    let mut helper = python(
+        r#"
+a = raw_command()
+ack(a)
+time.sleep(.1)
+control(3, {'capture_changed': True})
+raw_command()
+"#,
+    );
+    let start = Instant::now();
+    assert!(matches!(
+        helper.receive_event(Duration::from_millis(500)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(
+        start.elapsed() >= Duration::from_millis(450),
+        "idle receive kept waking"
+    );
+    let wake = helper.wake_handle();
+    let notify = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        wake.notify();
+    });
+    let start = Instant::now();
+    assert!(matches!(
+        helper.receive_event(TIMEOUT),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "presentation did not interrupt sleep"
+    );
+    notify.join().unwrap();
+    let pending = helper.send_command("ping", TIMEOUT).unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        helper.receive_event(TIMEOUT),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(pending.wait(), CommandOutcome::Executed);
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "ack did not wake scheduler"
+    );
+    let start = Instant::now();
+    assert!(matches!(
+        helper.receive_event(TIMEOUT),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(
+        start.elapsed() < Duration::from_millis(300),
+        "page activity did not wake scheduler"
+    );
+}
+
+#[test]
+fn inherited_socket_survives_closed_parent_stdio() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "child_closed_stdio"])
+        .env("LUCHS_CLOSED_STDIO_CHILD", "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "closed-stdio helper transport failed: {status}"
+    );
+}
+
+#[test]
+#[ignore = "spawned by inherited_socket_survives_closed_parent_stdio"]
+fn child_closed_stdio() {
+    assert_eq!(std::env::var("LUCHS_CLOSED_STDIO_CHILD").unwrap(), "1");
+    // Isolated process: force socketpair to allocate descriptors 0 and 1.
+    unsafe {
+        for fd in 0..=2 {
+            libc::close(fd);
+        }
+    }
+    let mut helper = python(
+        r#"
+assert transport.fileno() > 2
+cmd = raw_command()
+frame()
+ack(cmd)
+"#,
+    );
+    let pending = helper.send_command("ping", TIMEOUT).unwrap();
+    assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"rgba");
+    assert_eq!(pending.wait(), CommandOutcome::Executed);
+    helper.finish().unwrap();
+    std::process::exit(0);
 }

@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 pub fn frame(width: u32, pixels: &[u8]) -> Vec<u8> {
     let header = serde_json::to_vec(&json!({
-        "format": "rgba8", "width": width, "height": 1,
+        "format": "bgra8", "width": width, "height": 1,
         "stride": width * 4, "len": pixels.len(),
     }))
     .unwrap();
@@ -27,46 +27,54 @@ pub fn control(tag: u8, json: Value) -> Vec<u8> {
     envelope(&body)
 }
 
-pub fn printf(bytes: &[u8]) -> String {
+pub fn socket_write(bytes: &[u8]) -> String {
+    // dash only accepts single-digit descriptors in shell redirections. Use
+    // Python's fd API so concurrent tests can inherit any descriptor number.
     format!(
-        "printf '{}'",
-        bytes
-            .iter()
-            .map(|b| format!("\\{b:03o}"))
-            .collect::<String>()
+        "python3 -c 'import os; w=os.fdopen(int(os.environ[\"LUCHS_HELPER_FD\"]), \"wb\", closefd=False); w.write(bytes.fromhex(\"{}\")); w.flush()'",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     )
 }
 
 pub const PYTHON_PROTOCOL: &str = r#"
-import json, struct, sys, os, time
+import json, struct, sys, os, time, socket
+transport = socket.socket(fileno=int(os.environ["LUCHS_HELPER_FD"]))
+wire = transport.makefile("rwb", buffering=0)
 
 def exact(n):
     data = b''
     while len(data) < n:
-        chunk = sys.stdin.buffer.read(n - len(data))
+        chunk = wire.read(n - len(data))
         if not chunk:
             raise EOFError()
         data += chunk
     return data
 
-def command():
+def raw_command():
     n = struct.unpack('<I', exact(4))[0]
     assert 0 < n <= 128 * 1024
     return json.loads(exact(n))
 
+def command():
+    while True:
+        cmd = raw_command()
+        if cmd['type'] != 'capture': return cmd
+        ack(cmd, capture={'published':False, 'snapshot_ns':100, 'publish_ns':0})
+
 def control(tag, obj):
     body = bytes([tag]) + json.dumps(obj).encode()
-    sys.stdout.buffer.write(struct.pack('<I', len(body)) + body)
-    sys.stdout.buffer.flush()
+    wire.write(struct.pack('<I', len(body)) + body)
+    wire.flush()
 
-def ack(cmd, outcome='executed', detail=None):
+def ack(cmd, outcome='executed', detail=None, capture=None):
     obj = {'id': cmd['id'], 'outcome': outcome}
     if detail is not None: obj['detail'] = detail
+    if capture is not None: obj['capture'] = capture
     control(2, obj)
 
 def frame():
-    header = json.dumps({'format':'rgba8', 'width':1, 'height':1, 'stride':4, 'len':4}).encode()
+    header = json.dumps({'format':'bgra8', 'width':1, 'height':1, 'stride':4, 'len':4}).encode()
     body = b'\x01' + struct.pack('<I', len(header)) + header + b'rgba'
-    sys.stdout.buffer.write(struct.pack('<I', len(body)) + body)
-    sys.stdout.buffer.flush()
+    wire.write(struct.pack('<I', len(body)) + body)
+    wire.flush()
 "#;

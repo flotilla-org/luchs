@@ -192,7 +192,7 @@ fn immediate_helper_eof_without_consumer_stops_successfully() {
         &helper,
         format!(
             "#!/bin/sh\n{}\n",
-            common::printf(&common::frame(1, b"rgba"))
+            common::socket_write(&common::frame(1, b"rgba"))
         ),
     )
     .unwrap();
@@ -249,10 +249,11 @@ fn invalid_helper_frame_drops_source_and_reaps_helper() {
         format!(
             r#"#!/bin/sh
 echo $$ > '{}'
-printf '\001\000\000\000\143'
-while IFS= read -r line; do :; done
+{}
+exec sleep 60
 "#,
-            pid.display()
+            pid.display(),
+            common::socket_write(&[1, 0, 0, 0, 99])
         ),
     )
     .unwrap();
@@ -442,4 +443,33 @@ while True:
         "duplicate retry diagnostics: {stderr}"
     );
     assert!(!std::path::Path::new(endpoint.trim()).exists());
+}
+
+#[test]
+fn exhausted_snapshot_retry_diagnostic_reaches_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = dir.path().join("helper");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/usr/bin/env python3\n{}\n{}",
+            common::PYTHON_PROTOCOL,
+            r#"
+cmd = raw_command()
+assert cmd['type'] == 'capture'
+ack(cmd, 'failed', detail='snapshot failed after 3 consecutive attempts: unexpected pixel size')
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_luchs"))
+        .arg("--helper")
+        .arg(helper)
+        .args(["--size=1x1", "https://example.com"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("renderer capture failed: snapshot failed after 3 consecutive attempts: unexpected pixel size"), "{stderr}");
 }

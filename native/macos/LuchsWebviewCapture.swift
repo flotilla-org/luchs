@@ -13,7 +13,7 @@ private func fail(_ message: String) -> Never {
 
 // Page console output, page errors and navigations, one line each, in the
 // file LUCHS_CONSOLE_LOG names (default /tmp/luchs-console-<pid>.log). The
-// helper's stdout carries frames and its stderr is the launcher's, so this
+// helper's socket carries frames and its stderr is the launcher's, so this
 // is the one place a page can be debugged from.
 private let consoleLogPath: String = ProcessInfo.processInfo.environment["LUCHS_CONSOLE_LOG"]
     ?? "/tmp/luchs-console-\(getpid()).log"
@@ -64,7 +64,7 @@ private let consoleForwarderSource = """
 // A caret for the frame's focused text field. WebKit draws its own only
 // while its window is key, which this transparent window never is, so the
 // page gets one drawn from the selection; it follows focus, input and
-// scrolling in every frame, iframes included.
+// scrolling from page events, iframes included.
 private let caretScriptSource = """
 (() => {
   try {
@@ -147,12 +147,18 @@ private let caretScriptSource = """
       caret.style.height = `${Math.round(caretHeight)}px`;
     };
     window.__luchsUpdateCaret = update;
+    let queued = false;
+    const schedule = () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; update(); });
+    };
     for (const name of ["focusin", "focusout", "input", "keydown", "keyup", "mousedown", "mouseup"]) {
-      document.addEventListener(name, update, true);
+      document.addEventListener(name, schedule, true);
     }
-    document.addEventListener("selectionchange", update, true);
-    window.addEventListener("scroll", update, true);
-    window.addEventListener("resize", update, true);
+    document.addEventListener("selectionchange", schedule, true);
+    window.addEventListener("scroll", schedule, true);
+    window.addEventListener("resize", schedule, true);
     update();
   };
   window.__luchsEnsureCaret();
@@ -160,14 +166,81 @@ private let caretScriptSource = """
 })();
 """
 
-// All stdout records are emitted on the main thread, so pixels and control
-// records cannot interleave. Lengths include the tag; all integers are LE.
+// The socket writer is serial and runs off WebKit's main thread. A command
+// reader waits for its acknowledgement to drain before admitting another.
+private let transport: FileHandle = {
+    guard let value = ProcessInfo.processInfo.environment["LUCHS_HELPER_FD"],
+          let fd = Int32(value), fd >= 0 else { fail("LUCHS_HELPER_FD must name an inherited socket") }
+    guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else { fail("could not protect inherited socket") }
+    var noSigpipe: Int32 = 1
+    guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+        fail("could not configure helper socket")
+    }
+    return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+}()
+private let writer = DispatchQueue(label: "luchs.socket-writer")
+private let commandDrained = DispatchSemaphore(value: 0)
+
+private func writeBytes(_ pointer: UnsafeRawPointer, _ count: Int) {
+    var offset = 0
+    while offset < count {
+        let n = Darwin.write(transport.fileDescriptor, pointer.advanced(by: offset), count - offset)
+        if n < 0 && errno == EINTR { continue }
+        if n <= 0 { fail("socket write failed") }
+        offset += n
+    }
+}
+private func writeData(_ data: Data) {
+    data.withUnsafeBytes { if let base = $0.baseAddress { writeBytes(base, $0.count) } }
+}
+
+// Mutations and native edit/selection events wake capture. Probe animation
+// activity only while something is running; static pages have no rAF loop.
+private let activityScriptSource = """
+(() => {
+  let last = -Infinity, probing = false;
+  const changed = () => {
+    const now = performance.now();
+    if (now - last < 30) return;
+    last = now;
+    window.webkit.messageHandlers.luchsActivity.postMessage({capture_changed: true});
+  };
+  const animations = () => {
+    if (document.getAnimations().some(a => a.playState === "running")) {
+      changed();
+      requestAnimationFrame(animations);
+    } else { probing = false; }
+  };
+  const probe = () => {
+    if (!probing) { probing = true; requestAnimationFrame(animations); }
+  };
+  new MutationObserver(() => { changed(); probe(); }).observe(document, {subtree:true, childList:true, attributes:true, characterData:true});
+  for (const name of ["input", "change", "selectionchange", "focusin", "focusout", "scroll", "resize"]) {
+    window.addEventListener(name, changed, true);
+  }
+  for (const name of ["animationstart", "transitionrun"]) {
+    window.addEventListener(name, () => { changed(); probe(); }, true);
+  }
+  probe();
+})();
+"""
+
 private let maxControlBytes = 128 * 1024
 private let maxFrameBytes = 64 * 1024 * 1024
+
+private let activityRecord: Data = {
+    let body = Data("{\"capture_changed\":true}".utf8)
+    var record = littleEndian(UInt32(body.count + 1))
+    record.append(3)
+    record.append(body)
+    return record
+}()
 
 private struct HelperCommand: Decodable {
     let id: UInt64
     let type: String
+    let scale: Double?
+    let visible: Bool?
 }
 
 private func littleEndian(_ value: UInt32) -> Data {
@@ -180,7 +253,7 @@ private func readExactly(_ count: Int, allowEOF: Bool = false) -> Data? {
     while result.count < count {
         let chunk: Data
         do {
-            chunk = try FileHandle.standardInput.read(upToCount: count - result.count) ?? Data()
+            chunk = try transport.read(upToCount: count - result.count) ?? Data()
         } catch {
             fail("command read failed: \(error.localizedDescription)")
         }
@@ -193,17 +266,22 @@ private func readExactly(_ count: Int, allowEOF: Bool = false) -> Data? {
     return result
 }
 
-private func emitAck(_ id: UInt64, outcome: String, detail: String? = nil) {
+private func emitAck(_ id: UInt64, outcome: String, detail: String? = nil, capture: [String: Any]? = nil) {
     precondition(Thread.isMainThread)
     var object: [String: Any] = ["id": id, "outcome": outcome]
     if let detail { object["detail"] = detail }
+    if let capture { object["capture"] = capture }
     guard let json = try? JSONSerialization.data(withJSONObject: object), json.count + 1 <= maxControlBytes else {
         fail("could not encode acknowledgement")
     }
     var record = littleEndian(UInt32(json.count + 1))
     record.append(2)
     record.append(json)
-    FileHandle.standardOutput.write(record)
+    let bytes = record
+    writer.async {
+        writeData(bytes)
+        commandDrained.signal()
+    }
 }
 
 private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
@@ -214,7 +292,6 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     private let width: Int
     private let height: Int
     private let frameCount: Int
-    private let frameInterval: TimeInterval
     private var window: NSWindow?
     private var webView: WKWebView?
     // Windows the page opened (OAuth sign-in, target=_blank), newest last.
@@ -225,15 +302,29 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     private var popups: [WKWebView] = []
     private var activeView: WKWebView? { popups.last ?? webView }
     private var loaded = false
-    private var capturing = false
+    private var everLoadedMain = false
+    private let snapshotConfiguration = WKSnapshotConfiguration()
+    private var configuredScale = 0.0
+    private var configuredBacking = 0.0
+    private var scale = 1.0
+    private var visible = true
+    private var bitmap: UnsafeMutableRawPointer?
+    private var context: CGContext?
+    private var graphicsContext: NSGraphicsContext?
+    private var pixelWidth = 0
+    private var pixelHeight = 0
+    private var envelope = Data()
+    private var fingerprint: UInt64?
     private var emittedFrames = 0
+    private var activityPending = false
+    private var snapshotRecovery = SnapshotRecovery()
 
-    init(pageURL: URL, width: Int, height: Int, frameCount: Int, fps: Int) {
+    init(pageURL: URL, width: Int, height: Int, frameCount: Int) {
         self.pageURL = pageURL
         self.width = width
         self.height = height
         self.frameCount = frameCount
-        self.frameInterval = 1.0 / Double(fps)
+
     }
 
     func run() -> Never {
@@ -247,6 +338,9 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         configuration.userContentController.addUserScript(
             WKUserScript(source: consoleForwarderSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         configuration.userContentController.add(self, name: "luchsConsole")
+        configuration.userContentController.add(self, name: "luchsActivity")
+        configuration.userContentController.addUserScript(
+            WKUserScript(source: activityScriptSource, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         configuration.userContentController.addUserScript(
             WKUserScript(source: caretScriptSource, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         debugLog("luchs-webview-capture \(width)x\(height) page \(pageURL.absoluteString)")
@@ -303,6 +397,10 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let body = message.body as? [String: Any] else { return }
+        if message.name == "luchsActivity" {
+            reportActivity()
+            return
+        }
         let level = body["level"] as? String ?? "log"
         let text = body["text"] as? String ?? ""
         debugLog("console.\(level) \(text)")
@@ -310,17 +408,14 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         debugLog("navigation start \(webView.url?.absoluteString ?? "?")")
+        if webView === activeView { loaded = false }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         debugLog("navigation finish \(webView.url?.absoluteString ?? "?")")
-        loaded = true
-        // One capture chain for the helper's life: a reload lands in it.
-        guard !capturing else { return }
-        capturing = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.capture()
-        }
+        if webView === self.webView { everLoadedMain = true }
+        if webView === activeView { loaded = true }
+        reportActivity()
     }
 
     // window.open and target=_blank get a real second view (without a
@@ -361,15 +456,19 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         let cancelled = (error as NSError).domain == NSURLErrorDomain && (error as NSError).code == NSURLErrorCancelled
         let view = webView === self.webView ? "main view" : "popup"
         debugLog("navigation failed in \(view): \(error.localizedDescription)")
-        if webView === self.webView && !loaded && !cancelled {
+        if webView === self.webView && !everLoadedMain && !cancelled {
             fail("navigation failed: \(error.localizedDescription)")
+        }
+        if webView === activeView && everLoadedMain && !cancelled {
+            loaded = true
+            reportActivity()
         }
     }
 
     private func startInputReader() {
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             // Only one command is queued at a time. Waiting for main-thread
-            // handling bounds memory even if the parent floods stdin.
+            // handling and writer completion bounds memory under command floods.
             while let prefix = readExactly(4, allowEOF: true) {
                 let size = prefix.enumerated().reduce(UInt32(0)) { value, byte in
                     value | (UInt32(byte.element) << (8 * byte.offset))
@@ -386,14 +485,46 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
                     guard let self else { fail("command controller stopped") }
                     self.handleCommand(command)
                 }
+                commandDrained.wait()
             }
-            DispatchQueue.main.async { NSApplication.shared.terminate(nil) }
+            writer.async { DispatchQueue.main.async { NSApplication.shared.terminate(nil) } }
+        }
+    }
+
+    private func reportActivity() {
+        // Coalesce page wakes while one state record is in flight.
+        guard !activityPending else { return }
+        activityPending = true
+        writer.async { [weak self] in
+            writeData(activityRecord)
+            DispatchQueue.main.async { self?.activityPending = false }
         }
     }
 
     private func handleCommand(_ command: HelperCommand) {
         precondition(Thread.isMainThread)
+        if command.type != "capture" { reportActivity() }
         switch command.type {
+        case "capture":
+            // Never park the command reader behind page loading. Navigation
+            // completion wakes Rust; ping, reload and visibility remain usable.
+            if !loaded { emitAck(command.id, outcome: "executed") } else { capture(command) }
+        case "presentation":
+            guard let scale = command.scale, let visible = command.visible,
+                  scale.isFinite, scale > 0 else {
+                emitAck(command.id, outcome: "failed", detail: "invalid presentation")
+                return
+            }
+            let pw = (Double(width) * scale).rounded()
+            let ph = (Double(height) * scale).rounded()
+            guard pw >= 1 && ph >= 1 && pw * ph * 4 <= Double(maxFrameBytes) else {
+                emitAck(command.id, outcome: "failed", detail: "pixel size exceeds capture limit")
+                return
+            }
+            if self.scale != scale || (!self.visible && visible) { fingerprint = nil }
+            self.scale = scale
+            self.visible = visible
+            emitAck(command.id, outcome: "executed")
         case "ping":
             emitAck(command.id, outcome: "executed")
         case "reload":
@@ -615,92 +746,138 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         return table[keycode] ?? 0xFFFF
     }
 
-    private func capture() {
-        guard let webView = activeView else { return }
-        let tickMilliseconds = Int(Double(emittedFrames) * frameInterval * 1000.0)
-        let script = """
-        (() => {
-          const tick = \(tickMilliseconds);
-          // The window is on screen (transparent), so the page's own clock
-          // runs its animations, transitions and requestAnimationFrame. The
-          // capture tick is exposed for pages that animate off it instead.
-          document.documentElement.style.setProperty("--luchs-capture-tick", String(tick));
-          document.documentElement.style.setProperty("--luchs-capture-scale", String(0.15 + 0.85 * ((tick % 1000) / 1000)));
-          if (window.__luchsUpdateCaret) { window.__luchsUpdateCaret(); }
-          if (document.body) { void document.body.offsetWidth; }
-          return 0;
-        })()
-        """
-        webView.evaluateJavaScript(script) { [weak self] _, _ in
-            self?.snapshot(webView)
+    private func capture(_ command: HelperCommand) {
+        guard visible, let webView = activeView else {
+            emitAck(command.id, outcome: "executed")
+            return
         }
-    }
-
-    private func snapshot(_ webView: WKWebView) {
-        let snapshot = WKSnapshotConfiguration()
-        snapshot.rect = CGRect(x: 0, y: 0, width: width, height: height)
+        let requestedWidth = Int((Double(width) * scale).rounded())
+        let requestedHeight = Int((Double(height) * scale).rounded())
+        let snapshot = snapshotConfiguration
+        let backing = window?.backingScaleFactor ?? 1
+        if configuredScale != scale || configuredBacking != backing {
+            snapshot.rect = CGRect(x: 0, y: 0, width: width, height: height)
+            // snapshotWidth is in points. AppKit's NSImage backing is at the
+            // window's backing scale, so divide to request device pixels.
+            snapshot.snapshotWidth = NSNumber(value: Double(width) * scale / backing)
+            configuredScale = scale
+            configuredBacking = backing
+        }
+        let start = ProcessInfo.processInfo.systemUptime
         webView.takeSnapshot(with: snapshot) { [weak self] image, error in
             guard let self else { return }
+            // A display-scale or navigation change can invalidate an in-flight
+            // snapshot. Retry through the scheduler rather than terminating.
+            if (self.window?.backingScaleFactor ?? 1) != backing || !self.loaded {
+                self.retrySnapshot(command, "backing scale or navigation changed during snapshot", expectedTransition: true)
+                return
+            }
             if let error {
-                fail("snapshot failed: \(error.localizedDescription)")
+                self.retrySnapshot(command, "WebKit snapshot error: \(error.localizedDescription)")
+                return
             }
             guard let image else {
-                fail("snapshot returned no image")
+                self.retrySnapshot(command, "snapshot returned no image")
+                return
             }
-            self.emit(image)
+            let elapsed = ProcessInfo.processInfo.systemUptime - start
+            self.emit(image, width: requestedWidth, height: requestedHeight, command: command, snapshotSeconds: elapsed)
         }
     }
 
-    private func emit(_ image: NSImage) {
-        var proposed = NSRect(x: 0, y: 0, width: width, height: height)
-        guard let cgImage = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else {
-            fail("snapshot has no CGImage")
+    private func retrySnapshot(_ command: HelperCommand, _ detail: String, expectedTransition: Bool = false) {
+        configuredBacking = 0
+        if let failure = snapshotRecovery.discard(detail, expectedTransition: expectedTransition) {
+            debugLog(failure)
+            emitAck(command.id, outcome: "failed", detail: failure)
+        } else {
+            debugLog("discarding snapshot: \(detail); retrying")
+            emitAck(command.id, outcome: "executed")
+            reportActivity()
         }
+    }
 
-        let stride = width * 4
-        var pixels = [UInt8](repeating: 0, count: stride * height)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        // Pixels are emitted as RGBA bytes with premultiplied alpha. The Zig
-        // consumer currently treats them as straight RGBA; for fully opaque
-        // pages this is invisible, but pages with CSS transparency will read
-        // slightly darker than expected. Switch this to non-premultiplied
-        // (`.last`) if accurate alpha is needed downstream.
-        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
-        pixels.withUnsafeMutableBytes { raw in
-            guard let context = CGContext(
-                data: raw.baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: stride,
-                space: colorSpace,
-                bitmapInfo: bitmapInfo
-            ) else {
-                fail("failed to create bitmap context")
-            }
-            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    private func prepareBitmap(_ image: NSImage, width: Int, height: Int) {
+        if pixelWidth == width && pixelHeight == height { return }
+        graphicsContext = nil
+        context = nil
+        bitmap?.deallocate()
+        pixelWidth = width
+        pixelHeight = height
+        bitmap = UnsafeMutableRawPointer.allocate(byteCount: width * height * 4, alignment: 64)
+        // Native little-endian premultiplied BGRA, with the snapshot's RGB
+        // colour space. No channel swizzle or intermediate image copy.
+        let info = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        // Inspect colour space only when allocating a new size. NSImage's
+        // screen-scaled CGImage extraction rounds odd sizes; steady-state draws
+        // below use WebKit's original representation directly.
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let space = cgImage.colorSpace, let context = CGContext(data: bitmap, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: width * 4, space: space, bitmapInfo: info) else {
+            fail("failed to create BGRA bitmap context")
         }
-
-        precondition(Thread.isMainThread)
-        let header = "{\"format\":\"rgba8\",\"width\":\(width),\"height\":\(height),\"stride\":\(stride),\"len\":\(pixels.count)}"
-        let json = Data(header.utf8)
-        var envelope = littleEndian(UInt32(1 + 4 + json.count + pixels.count))
+        self.context = context
+        self.graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
+        fingerprint = nil
+        let json = Data("{\"format\":\"bgra8\",\"width\":\(width),\"height\":\(height),\"stride\":\(width * 4),\"len\":\(width * height * 4)}".utf8)
+        envelope = littleEndian(UInt32(5 + json.count + width * height * 4))
         envelope.append(1)
         envelope.append(littleEndian(UInt32(json.count)))
         envelope.append(json)
-        FileHandle.standardOutput.write(envelope)
-        pixels.withUnsafeBufferPointer { buffer in
-            FileHandle.standardOutput.write(Data(buffer: buffer))
+    }
+
+    private func emit(_ image: NSImage, width: Int, height: Int, command: HelperCommand, snapshotSeconds: Double) {
+        let publishStart = ProcessInfo.processInfo.systemUptime
+        guard let representation = image.representations.first,
+              representation.pixelsWide == width, representation.pixelsHigh == height else {
+            retrySnapshot(command, "unexpected pixel size; requested \(width)x\(height)")
+            return
         }
-        emittedFrames += 1
-        if frameCount > 0 && emittedFrames >= frameCount {
-            NSApplication.shared.terminate(nil)
-            exit(0)
+        prepareBitmap(image, width: width, height: height)
+        guard let bitmap, let context, let graphicsContext else { fail("bitmap unavailable") }
+        // Draw the snapshot's native representation 1:1. Asking NSImage for a
+        // screen-scaled CGImage can round 26x17 pixels down to 24x16 on Retina.
+        context.setBlendMode(.copy)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        graphicsContext.compositingOperation = .copy
+        let drawn = representation.draw(in: NSRect(x: 0, y: 0, width: width, height: height))
+        NSGraphicsContext.restoreGraphicsState()
+        if !drawn {
+            retrySnapshot(command, "snapshot draw failed")
+            return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + frameInterval) { [weak self] in
-            self?.capture()
+        snapshotRecovery.succeeded()
+        let count = width * height * 4
+        // FNV-1a over native words: one read pass, no previous-frame allocation.
+        let words = bitmap.bindMemory(to: UInt32.self, capacity: count / 4)
+        var hash: UInt64 = 14695981039346656037
+        for i in 0..<(count / 4) { hash = (hash ^ UInt64(words[i])) &* 1099511628211 }
+        if fingerprint == hash {
+            emitAck(command.id, outcome: "executed", capture: ["published": false,
+                "snapshot_ns": UInt64(snapshotSeconds * 1e9), "publish_ns": 0])
+            return
+        }
+        fingerprint = hash
+        // The command reader waits for this ack. No later capture can reuse
+        // the bitmap until the serial writer has finished borrowing its bytes.
+        let header = envelope
+        writer.async { [weak self] in
+            writeData(header)
+            writeBytes(bitmap, count)
+            let elapsed = ProcessInfo.processInfo.systemUptime - publishStart
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.emittedFrames += 1
+                emitAck(command.id, outcome: "executed", capture: ["published": true,
+                    "snapshot_ns": UInt64(snapshotSeconds * 1e9), "publish_ns": UInt64(elapsed * 1e9)])
+                if self.frameCount > 0 && self.emittedFrames >= self.frameCount {
+                    writer.async { DispatchQueue.main.async { NSApplication.shared.terminate(nil) } }
+                }
+            }
         }
     }
+
 }
 
 @main
@@ -713,9 +890,11 @@ private enum LuchsWebviewCapture {
         let width = args.count >= 3 ? (Int(args[2]) ?? defaultWidth) : defaultWidth
         let height = args.count >= 4 ? (Int(args[3]) ?? defaultHeight) : defaultHeight
         let frameCount = args.count >= 5 ? (Int(args[4]) ?? defaultFrameCount) : defaultFrameCount
+        // Retain the positional fps argument for older launchers. Rust now
+        // schedules capture commands; the helper only validates this argument.
         let fps = args.count >= 6 ? (Int(args[5]) ?? defaultFps) : defaultFps
         guard width > 0 && height > 0 && width <= maxFrameBytes / 4 && height <= maxFrameBytes / 4 / width && frameCount >= 0 && fps > 0 else {
-            fail("width, height, and fps must be positive; RGBA pixels must fit 64 MiB; frame_count must be zero or positive")
+            fail("width, height, and fps must be positive; BGRA pixels must fit 64 MiB; frame_count must be zero or positive")
         }
 
         let page = args[1]
@@ -732,7 +911,7 @@ private enum LuchsWebviewCapture {
             }
         }
 
-        let controller = CaptureController(pageURL: url, width: width, height: height, frameCount: frameCount, fps: fps)
+        let controller = CaptureController(pageURL: url, width: width, height: height, frameCount: frameCount)
         controller.run()
     }
 }

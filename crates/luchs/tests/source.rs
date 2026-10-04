@@ -50,7 +50,7 @@ fn connect(path: &str) -> (CpuSetupClient, ArenaConsumer) {
 fn pixels(width: u32) -> Frame {
     Frame {
         header: Header {
-            format: "rgba8".into(),
+            format: luchs::protocol::Format::Bgra8,
             width,
             height: 1,
             stride: width * 4,
@@ -71,9 +71,9 @@ fn acquire(consumer: &ArenaConsumer) -> FrameLease {
     }
 }
 
-// Frames retain their RGBA/sync contract across replacement while old leases stay valid.
+// Frames retain their BGRA/sync contract across replacement while old leases stay valid.
 #[test]
-fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
+fn private_bootstrap_source_publishes_bgra_and_reconfigures() {
     let (mut source, path) = source();
     // Private parent permissions protect the socket before inode chmod.
     let parent = std::path::Path::new(&path).parent().unwrap();
@@ -91,7 +91,7 @@ fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
     source.publish(pixels(1)).unwrap();
     let old = acquire(&consumer);
     assert_eq!(old.bytes(), [42; 4]);
-    assert_eq!(old.descriptor().pixel_format, 2);
+    assert_eq!(old.descriptor().pixel_format, 1);
     // Katzensteg rejects CPU frames without the copy-complete sync contract.
     assert_eq!(old.descriptor().sync_kind, 1);
     assert_eq!(old.descriptor().clock_domain, 2);
