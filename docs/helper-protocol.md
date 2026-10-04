@@ -104,7 +104,12 @@ There is no JavaScript event-synthesis path or SDL keycode vocabulary.
 
 Rust's `keymap.rs` maps DOM physical codes to Carbon virtual key codes. Unknown
 codes are unsupported without a guess. Logical keys carry literal characters or
-AppKit's named-key characters. The helper derives physical `characters` and
+AppKit's named-key characters. For a printable logical character without a
+known physical position, `key_code=65535` (`u16::MAX`) explicitly means no
+physical binding. It is used only with literal `logical` characters, retained
+for release, and never sent to `UCKeyTranslate` or guessed as another key. The
+helper passes this sentinel to `NSEvent.keyEvent` so native text delivery cannot
+accidentally select a physical-key shortcut. The helper derives physical `characters` and
 `charactersIgnoringModifiers` from the current layout with
 [UCKeyTranslate](https://developer.apple.com/documentation/coreservices/1390584-uckeytranslate).
 It retains code, characters, original flags and destination view per press.
@@ -139,7 +144,9 @@ Set line fields first, then fixed-point fields, then point fields: Quartz's line
 setter otherwise overwrites point values. `NSEvent` exposes integer point deltas
 from this CGEvent path, so four 0.25-point events deliver one point without loss.
 Unsupported values outside the signed fixed-point range are rejected. Cleanup
-resets remainders. Phases and momentum metadata are deferred by the v1 contract.
+resets remainders after its executed ack. Scroll carry advances only after an
+executed ack; failed sends, rejection and uncertainty leave the prior carry
+unchanged. Phases and momentum metadata are deferred by the v1 contract.
 
 The toolkit owns exclusive controller admission and cleanup barriers. Rust sends
 one scoped cleanup command and waits for the helper to release every hold before

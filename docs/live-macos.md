@@ -279,7 +279,8 @@ input client, pairs a cooperative `z` press with its text commit, types physical
 `é🙂zx`. Cleanup releases a held physical `KeyQ` and secondary button, while an
 undelivered cooperative `w` press produces no keyDown. Four 0.25-point scrolls
 accumulate into one native point; the CGEvent trace retains `fixed=-0.25`.
-The test then scrolls a 2,000-point content region with an 80.5-point event.
+The test then scrolls a 2,000-point content region with an 80.5-point Pixel event,
+a half-Line event (20 native points), and a quarter-Page event (150 native points).
 
 The fake-helper suite covers ack success, unsupported rejection, failed and
 missing ack uncertainty, fractional pointer coordinates, all three modes,
@@ -311,10 +312,38 @@ An earlier scroll check found Quartz's line-field setter overwriting point field
 and amplifying displacement by eight. Setting line, fixed-point, then point
 fields produced the stated native values.
 
-### Physical device acceptance still pending
+### Manual device follow-up
 
-Desktop automation proves the precise input path, but does not establish use of
-a real trackpad or a notched mouse wheel. The operator was asked to scroll the
-live SDL fixture using both devices and identify them. Until that run is recorded,
-the issue's physical wheel/trackpad acceptance criterion remains open. Line
-conversion and fractional precise delivery have automated coverage above.
+The governor amended [#2](https://github.com/flotilla-org/luchs/issues/2) on
+2026-10-04: synthetic precise and Line scroll evidence satisfies its acceptance
+criterion. Physical notched-wheel and trackpad checks are a manual operator task
+in [#17](https://github.com/flotilla-org/luchs/issues/17), outside this change's
+completion criteria. The automated Pixel path and Line/Page conversion evidence
+above remain the recorded acceptance for #2. The earlier operator question is
+withdrawn; no physical-device action is required to complete this PR.
+
+### Review regressions
+
+Scroll carry now commits only after an executed helper ack. Fake helpers check
+that failed sends, unsupported/failed acks and timeouts do not consume the
+previous fractional carry, and that values outside the 16.16 range are rejected
+without sending a command. A helper that exits with code 23 during a key press
+settles input as uncertain and leaves cleanup quarantined. The real CLI preserves
+that renderer error and removes its endpoint, rather than masking the crash with
+an input-cleanup diagnostic.
+
+The producer now owns its serialized executor directly. A regression withholds
+an input ack until the test reattaches the same helper, proving that attachment
+is not blocked by the ack wait. Swift allocates the Edit menu only for Command
+key equivalents; ordinary key presses take the native responder path directly.
+The protocol documents `key_code=65535` for literal logical Unicode without a
+physical binding and the retained holds after partial cleanup failure.
+
+The review follow-up passed all 48 ordinary Rust tests, the locked workspace
+build, clippy with warnings denied, formatting, Swift compilation and native
+recovery checks. All six live helper tests passed with
+`cargo test --locked --test live_macos -- --ignored --nocapture --test-threads=1`.
+An earlier parallel run hit `EINVAL` while the existing slow-load HTTP fixture
+set its accepted socket's timeout; the sequential rerun passed that fixture and
+the other five tests. The native input test now verifies both Line and Page
+conversion in real WebKit, in addition to the fractional Pixel sequence.

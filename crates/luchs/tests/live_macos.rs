@@ -554,13 +554,21 @@ const scroller=document.querySelector('#scroll'); scroller.addEventListener('scr
             reason: Reason::Focus,
         },
     );
-    for y in [0.25, 0.25, 0.25, 0.25, 80.5] {
+    for (unit, y) in [
+        (ScrollUnit::Pixel, 0.25),
+        (ScrollUnit::Pixel, 0.25),
+        (ScrollUnit::Pixel, 0.25),
+        (ScrollUnit::Pixel, 0.25),
+        (ScrollUnit::Pixel, 80.5),
+        (ScrollUnit::Line, 0.5),
+        (ScrollUnit::Page, 0.25),
+    ] {
         execute(
             Mode::SourceText,
             Operation::Event(Event::Scroll {
                 x: 0.0,
                 y,
-                unit: ScrollUnit::Pixel,
+                unit,
                 position: Position { y: 150.25, ..p },
             }),
         );
@@ -575,6 +583,14 @@ const scroller=document.querySelector('#scroll'); scroller.addEventListener('scr
             assert!(text.contains("EVENT keydown z trusted=true"));
             assert!(text.contains("button=2 down=false"));
             assert!(text.contains("fixed=-0.25"));
+            assert!(
+                text.contains("dy=20.0 fixed=-20.0 native=0.0,-20.0 precise=true"),
+                "{text}"
+            );
+            assert!(
+                text.contains("dy=150.0 fixed=-150.0 native=0.0,-150.0 precise=true"),
+                "{text}"
+            );
             assert!(
                 text.contains("dy=0.25") && text.contains("native=0.0,-1.0 precise=true"),
                 "{text}"

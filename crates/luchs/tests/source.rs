@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     os::unix::fs::MetadataExt,
     sync::atomic::{AtomicU32, Ordering},
@@ -212,4 +214,73 @@ fn all_typing_modes_advertise_native_families_and_preserve_media() {
         drop((consumer, setup, connected.input, connected.affordances));
         source.stop().unwrap();
     }
+}
+
+#[test]
+fn helper_attachment_does_not_wait_for_in_flight_input_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release-ack");
+    let script = format!(
+        r#"
+cmd=command(); assert cmd['type']=='key_down'
+control(3,{{'started':True}})
+while not os.path.exists({path}): time.sleep(0.01)
+ack(cmd)
+cmd=command(); assert cmd['type']=='cleanup'; ack(cmd)
+"#,
+        path = serde_json::to_string(&release.to_string_lossy()).unwrap()
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut helper = luchs::helper::Helper::spawn_with_state(
+        std::process::Command::new("python3")
+            .args(["-c", &format!("{}{script}", common::PYTHON_PROTOCOL)]),
+        move |state| {
+            if state["started"].as_bool() == Some(true) {
+                tx.send(()).unwrap();
+            }
+        },
+    )
+    .unwrap();
+    let (source, path) = source();
+    source.attach_input(&helper);
+    let connected = bootstrap::connect_v2(
+        Stream::connect(&path).unwrap(),
+        InputRequest::Required(jackstay::input::Mode::Physical),
+        ChannelRequest::None,
+    )
+    .unwrap();
+    let input = connected.input.as_ref().unwrap();
+    let sequence = input
+        .send(jackstay::input::Event::Key {
+            press: 1,
+            action: jackstay::input::Action::Down,
+            key: jackstay::input::Key::Physical("KeyA".into()),
+            modifiers: 0,
+        })
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let start = Instant::now();
+    source.attach_input(&helper);
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "attachment waited for input acknowledgement"
+    );
+    std::fs::write(&release, "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(jackstay::input::Status::Completed {
+            sequence: completed,
+            outcome,
+        }) = input.poll()
+        {
+            assert_eq!(completed, sequence);
+            assert_eq!(outcome, jackstay::input::Outcome::Executed);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(connected);
+    source.stop().unwrap();
+    helper.finish().unwrap();
 }

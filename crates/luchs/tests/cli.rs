@@ -42,7 +42,7 @@ fn watch_console_environment_and_sigterm_cleanup_with_fake_helper() {
     sigterm_cleanup(false);
 }
 
-// Optional input must not make an orderly SIGTERM fail or send helper commands.
+// Optional input must acknowledge cleanup without failing an orderly SIGTERM.
 #[test]
 fn optional_controls_do_not_fail_sigterm_cleanup() {
     sigterm_cleanup(true);
@@ -468,4 +468,79 @@ ack(cmd, 'failed', detail='snapshot failed after 3 consecutive attempts: unexpec
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("renderer capture failed: snapshot failed after 3 consecutive attempts: unexpected pixel size"), "{stderr}");
+}
+
+#[test]
+fn helper_crash_during_input_preserves_renderer_error_and_removes_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = dir.path().join("helper");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/usr/bin/env python3\n{}\n{}",
+            common::PYTHON_PROTOCOL,
+            "frame()\ncmd=command()\nassert cmd['type']=='key_down'\nsys.exit(23)\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_luchs"))
+        .arg("--helper")
+        .arg(&helper)
+        .args(["--size=1x1", "https://example.com"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut endpoint = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut endpoint)
+        .unwrap();
+    let connected = jackstay::bootstrap::connect_v2(
+        jackstay::local::Stream::connect(endpoint.trim()).unwrap(),
+        jackstay::bootstrap::InputRequest::Required(jackstay::input::Mode::Physical),
+        jackstay::bootstrap::ChannelRequest::None,
+    )
+    .unwrap();
+    let input = connected.input.as_ref().unwrap();
+    input
+        .send(jackstay::input::Event::Key {
+            press: 1,
+            action: jackstay::input::Action::Down,
+            key: jackstay::input::Key::Physical("KeyA".into()),
+            modifiers: 0,
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("helper crash did not stop the CLI");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        !status.success(),
+        "a renderer crash must not be reported as an orderly stop"
+    );
+    assert!(
+        stderr.contains("renderer exited") && stderr.contains("23"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("input cleanup failed"),
+        "cleanup masked the renderer error: {stderr}"
+    );
+    assert!(!std::path::Path::new(endpoint.trim()).exists());
 }

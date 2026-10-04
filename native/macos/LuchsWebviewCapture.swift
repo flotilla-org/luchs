@@ -635,20 +635,19 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         if traceInput { debugLog("input key code=\(key.code) down=\(down) characters=\(key.characters) flags=\(event.modifierFlags.rawValue)") }
         if kind == .flagsChanged { key.view.flagsChanged(with: event) }
         else if down {
-            // A standalone WebKit host needs AppKit's standard Edit menu for
-            // key equivalents. Target the bound view, including a retained popup.
-            let menu = NSMenu(title: "Edit")
-            for (title, action, equivalent) in [("Select All", "selectAll:", "a"), ("Copy", "copy:", "c"),
-                ("Paste", "paste:", "v"), ("Cut", "cut:", "x"), ("Undo", "undo:", "z")] {
-                let item = NSMenuItem(title: title, action: NSSelectorFromString(action), keyEquivalent: equivalent)
-                item.target = key.view
-                menu.addItem(item)
-            }
-            if !event.modifierFlags.contains(.command) || !menu.performKeyEquivalent(with: event) {
-                if !event.modifierFlags.contains(.command) || !key.view.performKeyEquivalent(with: event) {
-                    key.view.keyDown(with: event)
+            if event.modifierFlags.contains(.command) {
+                // A standalone WebKit host needs AppKit's standard Edit menu
+                // for key equivalents. Target the bound view, including popups.
+                let menu = NSMenu(title: "Edit")
+                for (title, action, equivalent) in [("Select All", "selectAll:", "a"), ("Copy", "copy:", "c"),
+                    ("Paste", "paste:", "v"), ("Cut", "cut:", "x"), ("Undo", "undo:", "z")] {
+                    let item = NSMenuItem(title: title, action: NSSelectorFromString(action), keyEquivalent: equivalent)
+                    item.target = key.view
+                    menu.addItem(item)
                 }
+                if menu.performKeyEquivalent(with: event) || key.view.performKeyEquivalent(with: event) { return true }
             }
+            key.view.keyDown(with: event)
         } else { key.view.keyUp(with: event) }
         return true
     }
@@ -681,6 +680,9 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         return true
     }
     private func cleanup(_ scope: String) -> Bool {
+        // Remove only confirmed releases. A partial failure deliberately retains
+        // the remaining bindings for retry; Rust quarantines controller admission.
+
         for button in heldButtons.keys.sorted() {
             guard let held = heldButtons[button], mouse(button, down: false, point: held.point, count: held.count, view: held.view) else { return false }
             heldButtons.removeValue(forKey: button)

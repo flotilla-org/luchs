@@ -38,7 +38,7 @@ fn position() -> Position {
     }
 }
 fn executor(helper: &Helper) -> Executor {
-    let mut executor = Executor::new(600.0).with_timeout(Duration::from_millis(300));
+    let mut executor = Executor::new(600.0).with_timeout(Duration::from_secs(3));
     executor.attach(helper.command_sender());
     executor
 }
@@ -56,7 +56,7 @@ time.sleep(0.5)
 ack(cmd)
 "#,
     );
-    let mut executor = executor(&helper);
+    let mut executor = executor(&helper).with_timeout(Duration::from_millis(300));
     for outcome in [
         Outcome::Executed,
         Outcome::Unsupported,
@@ -242,4 +242,134 @@ fn scroll_accumulates_each_axis_and_sign_without_rounding_each_event() {
     assert_eq!(remainder.points(0.25, -0.25), (1, -1));
     assert_eq!(remainder.points(-0.75, 0.5), (0, 0));
     assert_eq!(remainder.points(-0.25, 0.5), (-1, 1));
+}
+
+fn scroll(x: f64, y: f64, unit: ScrollUnit) -> Work {
+    work(Operation::Event(Event::Scroll {
+        x,
+        y,
+        unit,
+        position: position(),
+    }))
+}
+
+#[test]
+fn scroll_carry_commits_only_after_executed_ack() {
+    let mut helper = fake(
+        r#"
+cmd=command(); assert cmd['point_dx']==0 and cmd['point_dy']==0; ack(cmd)
+for outcome in ['unsupported', 'failed', 'timeout']:
+    cmd=command(); assert cmd['point_dx']==1 and cmd['point_dy']==-1
+    if outcome=='timeout': time.sleep(0.4); ack(cmd)
+    else: ack(cmd,outcome)
+cmd=command(); assert cmd['point_dx']==0 and cmd['point_dy']==0; ack(cmd)
+cmd=command(); assert cmd['point_dx']==1 and cmd['point_dy']==-1; ack(cmd)
+"#,
+    );
+    let mut e = executor(&helper).with_timeout(Duration::from_millis(300));
+    assert_eq!(
+        e.execute(scroll(0.25, -0.25, ScrollUnit::Pixel)),
+        Outcome::Executed
+    );
+    for outcome in [Outcome::Unsupported, Outcome::Uncertain, Outcome::Uncertain] {
+        assert_eq!(e.execute(scroll(0.75, -0.75, ScrollUnit::Pixel)), outcome);
+    }
+    assert_eq!(
+        e.execute(scroll(0.5, -0.5, ScrollUnit::Pixel)),
+        Outcome::Executed
+    );
+    assert_eq!(
+        e.execute(scroll(0.25, -0.25, ScrollUnit::Pixel)),
+        Outcome::Executed
+    );
+    helper.finish().unwrap();
+}
+
+#[test]
+fn failed_scroll_send_preserves_carry_for_the_next_executed_command() {
+    let mut helper = fake(
+        r#"
+cmd=command(); assert cmd['point_dx']==0 and cmd['point_dy']==0; ack(cmd)
+cmd=command(); assert cmd['point_dx']==1 and cmd['point_dy']==-1; ack(cmd)
+"#,
+    );
+    let mut e = executor(&helper);
+    assert_eq!(
+        e.execute(scroll(0.25, -0.25, ScrollUnit::Pixel)),
+        Outcome::Executed
+    );
+    let mut dead = fake("sys.exit(0)");
+    dead.finish().unwrap();
+    e.attach(dead.command_sender());
+    assert_eq!(
+        e.execute(scroll(0.75, -0.75, ScrollUnit::Pixel)),
+        Outcome::Uncertain
+    );
+    e.attach(helper.command_sender());
+    assert_eq!(
+        e.execute(scroll(0.75, -0.75, ScrollUnit::Pixel)),
+        Outcome::Executed
+    );
+    helper.finish().unwrap();
+}
+
+#[test]
+fn out_of_range_scroll_is_unsupported_without_sending_or_consuming_carry() {
+    let mut helper = fake(
+        r#"
+cmd=command(); assert cmd['dx']==0.25 and cmd['point_dx']==0; ack(cmd)
+cmd=command(); assert cmd['dx']==0.75 and cmd['point_dx']==1; ack(cmd)
+cmd=command(); assert cmd['dx']==32767 and cmd['dy']==-32767; ack(cmd)
+"#,
+    );
+    let mut e = executor(&helper);
+    assert_eq!(
+        e.execute(scroll(0.25, 0.0, ScrollUnit::Pixel)),
+        Outcome::Executed
+    );
+    for (x, y, unit) in [
+        (32768.0, 0.0, ScrollUnit::Pixel),
+        (0.0, -32768.0, ScrollUnit::Pixel),
+        (820.0, 0.0, ScrollUnit::Line),
+        (0.0, 55.0, ScrollUnit::Page),
+        (f64::INFINITY, 0.0, ScrollUnit::Pixel),
+        (0.0, f64::NAN, ScrollUnit::Pixel),
+    ] {
+        assert_eq!(e.execute(scroll(x, y, unit)), Outcome::Unsupported);
+    }
+    assert_eq!(
+        e.execute(scroll(0.75, 0.0, ScrollUnit::Pixel)),
+        Outcome::Executed
+    );
+    assert_eq!(
+        e.execute(scroll(32767.0, -32767.0, ScrollUnit::Pixel)),
+        Outcome::Executed
+    );
+    helper.finish().unwrap();
+}
+
+#[test]
+fn helper_dying_during_input_leaves_execution_uncertain_and_cleanup_quarantined() {
+    let mut helper = fake("cmd=command(); assert cmd['type']=='key_down'; sys.exit(23)");
+    let mut e = executor(&helper);
+    let target = Target::new(Config::default()).unwrap();
+    let controller = target.admit(Mode::Cooperative).unwrap();
+    controller.submit(1, 1, key(Action::Down)).unwrap();
+    let w = target.next().unwrap();
+    let id = w.id;
+    assert_eq!(e.execute(w), Outcome::Uncertain);
+    target.complete(id, Outcome::Uncertain).unwrap();
+    let cleanup = target.next().unwrap();
+    let id = cleanup.id;
+    assert!(matches!(cleanup.operation, Operation::Cleanup { .. }));
+    assert_eq!(e.execute(cleanup), Outcome::Uncertain);
+    assert_eq!(
+        target.complete(id, Outcome::Uncertain),
+        Err(Error::CleanupFailed)
+    );
+    assert_eq!(
+        target.admit(Mode::Cooperative).err(),
+        Some(Error::CleanupFailed)
+    );
+    assert!(helper.finish().unwrap_err().to_string().contains("23"));
 }

@@ -27,12 +27,13 @@ use std::{
 };
 
 struct PageProducer {
+    input: crate::input::Executor,
     recycled: Arc<Mutex<Vec<Vec<u8>>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
     logical_size: (f64, f64),
     latest: Arc<Mutex<Option<jackstay_producer::Frame>>>,
-    input: Arc<Mutex<crate::input::Executor>>,
+    input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
 }
 impl Producer for PageProducer {
     fn frame(&mut self) -> Option<jackstay_producer::Frame> {
@@ -45,7 +46,13 @@ impl Producer for PageProducer {
     }
 
     fn execute(&mut self, work: Work) -> Outcome {
-        self.input.lock().unwrap().execute(work)
+        // The toolkit owns and serializes the executor. Only attachment is
+        // shared; release its lock before the helper acknowledgement wait.
+        let sender = self.input_sender.lock().unwrap().clone();
+        if let Some(sender) = sender {
+            self.input.attach(sender);
+        }
+        self.input.execute(work)
     }
     fn recycle(&mut self, frame: jackstay_producer::Frame) {
         let mut pool = self.recycled.lock().unwrap();
@@ -78,7 +85,7 @@ pub struct Source {
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     source: jackstay_producer::Source,
     latest: Arc<Mutex<Option<jackstay_producer::Frame>>>,
-    input: Arc<Mutex<crate::input::Executor>>,
+    input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
     started: Instant,
     sequence: u64,
 }
@@ -91,7 +98,7 @@ impl Source {
         let recycled = Arc::new(Mutex::new(Vec::with_capacity(4)));
         let presentation = Arc::new(Mutex::new(None));
         let wake = Arc::new(Mutex::new(None));
-        let input = Arc::new(Mutex::new(crate::input::Executor::new(f64::from(height))));
+        let input_sender = Arc::new(Mutex::new(None));
         let source = Builder::new(
             endpoint,
             ArenaConfig {
@@ -120,7 +127,8 @@ impl Source {
                 wake: wake.clone(),
                 logical_size: (f64::from(width), f64::from(height)),
                 latest: latest.clone(),
-                input: input.clone(),
+                input: crate::input::Executor::new(f64::from(height)),
+                input_sender: input_sender.clone(),
             },
         )
         .max_connections(16)
@@ -132,7 +140,7 @@ impl Source {
         Ok((
             Self {
                 wake,
-                input,
+                input_sender,
                 recycled,
                 presentation,
                 source,
@@ -145,7 +153,7 @@ impl Source {
     }
 
     pub fn attach_input(&self, helper: &Helper) {
-        self.input.lock().unwrap().attach(helper.command_sender());
+        *self.input_sender.lock().unwrap() = Some(helper.command_sender());
     }
 
     pub fn publish(&mut self, frame: Frame) -> Result<()> {
