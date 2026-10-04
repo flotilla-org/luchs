@@ -251,6 +251,10 @@ test by default for existing CI; local builders can set
 
 ## Native input executor (2026-10-04)
 
+This records PR #16 before it was combined with page affordances. The rebased
+producer retains native input and uses ABI 0.13; the 0.12 measurements below
+describe that earlier validation run.
+
 Validated on macOS 26.6 arm64 with Apple Swift 6.4, Rust 1.98.0 and
 SDL 2.32.70. Both the Rust producer and the SDL reference viewer use Jackstay
 `9e6f145e5f9f2d1ba5732b0672a5ba6fb7c4b9ad` (ABI 0.12). The viewer was built
@@ -349,6 +353,10 @@ the other five tests. The native input test now verifies both Line and Page
 conversion in real WebKit, in addition to the fractional Pixel sequence.
 
 ## Page affordances (2026-10-04)
+
+This records the affordances branch before native input landed. The rebased
+producer now delivers host pointer events through the native input executor;
+the observation-only limits below describe the original evidence run.
 
 Validated Luchs `482abfa4aebfc78ba1c40bcc507eddfc15b0f437` on the same
 macOS 26.6 arm64 desktop, Apple Swift 6.4, Rust 1.98.0 and SDL 2.32.70.
@@ -459,3 +467,25 @@ all four withdrawals precede fresh snapshots and queued old commands are cleared
 The follow-up passed all 41 ordinary Rust tests, Clippy, formatting, helper
 compilation and Swift policy tests. The production live page-affordances test
 passed again after the review changes.
+
+## Combined input and affordances after rebase (2026-10-04)
+
+Rebased onto `d6ee0dc`, which landed native input from PR #16. The producer keeps
+its input executor, capabilities and cleanup path alongside complete page-state
+snapshots and navigation/scroll verbs. Swift decodes both command families,
+including the explicit CodingKeys for navigation and document scrolling. The
+older validation sections above retain the revisions and limits of their runs.
+
+The pinned CI commands passed locally: Rust 1.98 formatting, stable locked
+workspace build and all 54 ordinary tests, Clippy with warnings denied, helper
+compilation, and Swift recovery/URL policy tests. All eight ignored live macOS
+tests passed sequentially. The added combined test uses one v2 connection with
+required SourceText input and required affordances. It verifies a trusted native
+click at x=20,y=20, cursor `text`, UTF-8 insertion `é🙂` reflected in window title,
+document y=40 positioning, a file load to `Combined next`, and clean input close.
+
+A host motion probe completed as executed but produced no DOM mousemove on this
+machine. The existing direct native motion path is retained; investigation is
+tracked in [#19](https://github.com/flotilla-org/luchs/issues/19). Native clicks do
+produce pointer-driven cursor state, and the original visible-window cursor
+checks remain recorded above. No experimental hover routing is included.
