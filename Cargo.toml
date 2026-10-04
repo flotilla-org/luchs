@@ -9,7 +9,6 @@ repository = "https://github.com/flotilla-org/luchs"
 
 [workspace.dependencies]
 jackstay = { git = "https://github.com/flotilla-org/jackstay", rev = "ed785976df1246d2d3ce3f0c41df91c02f38e20d" }
-
 jackstay-producer = { git = "https://github.com/flotilla-org/jackstay", rev = "ed785976df1246d2d3ce3f0c41df91c02f38e20d" }
 
 [workspace.lints.rust]

@@ -15,8 +15,9 @@ physical and source-text admission are unsupported. The helper retains its
 existing stdin protocol, but this core
 only sends reload commands. The toolkit reports `input cleanup failed` at
 shutdown if a cooperative input channel was admitted, because even cleanup work
-returns unsupported. Use no input request for a clean observation-only shutdown;
-optional input still receives media, without authority to execute events.
+returns unsupported. Luchs logs that specific error and exits successfully on
+orderly SIGINT, SIGTERM or EOF; other shutdown errors still fail the run.
+Optional input receives media, without authority to execute events.
 
 ## Build and install
 

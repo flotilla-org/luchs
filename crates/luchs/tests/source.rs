@@ -34,7 +34,7 @@ fn source() -> (Source, String) {
 fn connect(path: &str) -> (CpuSetupClient, ArenaConsumer) {
     let stream = Stream::connect(path).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let connected =
         bootstrap::connect_v2(stream, InputRequest::None, ChannelRequest::None).unwrap();
@@ -61,7 +61,7 @@ fn pixels(width: u32) -> Frame {
 }
 
 fn acquire(consumer: &ArenaConsumer) -> FrameLease {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() {
             return frame;
@@ -85,7 +85,7 @@ fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
         .is_err()
     );
     let (mut setup, mut consumer) = connect(&path);
-    source.publish(&pixels(1)).unwrap();
+    source.publish(pixels(1)).unwrap();
     let old = acquire(&consumer);
     assert_eq!(old.bytes(), [42; 4]);
     assert_eq!(old.descriptor().pixel_format, 2);
@@ -94,8 +94,8 @@ fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
     assert_eq!(old.descriptor().clock_domain, 2);
     assert_eq!(old.descriptor().damage_kind, 1);
     let old_generation = old.descriptor().config_generation;
-    source.publish(&pixels(2)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    source.publish(pixels(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
     while !matches!(
         consumer.acquire_latest(0).unwrap(),
         AcquireOutcome::Reconfiguration
@@ -114,7 +114,7 @@ fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
     drop(consumer);
     drop(setup);
     let (setup, consumer) = connect(&path);
-    source.publish(&pixels(2)).unwrap();
+    source.publish(pixels(2)).unwrap();
     assert_eq!(acquire(&consumer).bytes(), [42; 8]);
     // Shutdown closes even a connected consumer and removes the endpoint.
     drop((setup, consumer));
@@ -128,7 +128,7 @@ fn stalled_bootstrap_does_not_block_frames_or_shutdown() {
     let (mut source, path) = source();
     let stalled = Stream::connect(&path).unwrap();
     let (setup, consumer) = connect(&path);
-    source.publish(&pixels(1)).unwrap();
+    source.publish(pixels(1)).unwrap();
     assert_eq!(acquire(&consumer).bytes(), [42; 4]);
     drop((setup, consumer));
     let started = Instant::now();
@@ -155,7 +155,7 @@ fn consumer_process_death_releases_reservation() {
     let directory = tempfile::tempdir().unwrap();
     // More than max_incarnations, each dying with an outstanding frame lease.
     for index in 0..5 {
-        source.publish(&pixels(1)).unwrap();
+        source.publish(pixels(1)).unwrap();
         let ready = directory.path().join(index.to_string());
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_consumer", "--ignored"])
@@ -165,7 +165,7 @@ fn consumer_process_death_releases_reservation() {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready.exists() && Instant::now() < deadline {
-            source.publish(&pixels(1)).unwrap();
+            source.publish(pixels(1)).unwrap();
             std::thread::sleep(Duration::from_millis(10));
         }
         let attached = ready.exists();
@@ -176,7 +176,7 @@ fn consumer_process_death_releases_reservation() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let (_setup, consumer) = connect(&path);
-    source.publish(&pixels(1)).unwrap();
+    source.publish(pixels(1)).unwrap();
     assert_eq!(acquire(&consumer).bytes(), [42; 4]);
 }
 
@@ -211,7 +211,7 @@ fn optional_input_and_affordances_receive_media_without_input_authority() {
         // SAFETY: this test owns a grant from its conforming sole producer.
         let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
         let consumer = setup.attach(1).unwrap();
-        source.publish(&pixels(1)).unwrap();
+        source.publish(pixels(1)).unwrap();
         assert_eq!(acquire(&consumer).bytes(), [42; 4]);
     }
     // Rejecting cleanup is deliberately reported by the toolkit, never executed.

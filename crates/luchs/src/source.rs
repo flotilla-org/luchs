@@ -11,7 +11,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
         mpsc::RecvTimeoutError,
     },
@@ -23,8 +23,14 @@ struct Observation {
 }
 impl Producer for Observation {
     fn frame(&mut self) -> Option<jackstay_producer::Frame> {
-        self.latest.lock().unwrap().take()
+        // Only an Option is swapped under this lock; unwinding cannot leave a
+        // partially mutated frame or ownership bookkeeping to repair.
+        self.latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
+
     fn execute(&mut self, _work: Work) -> Outcome {
         Outcome::Unsupported
     }
@@ -71,6 +77,9 @@ impl Source {
         )
         .max_connections(16)
         .start()?;
+        // Builder starts accepting before this chmod, but Jackstay creates and
+        // verifies an owner-only (0700) runtime directory before binding. That
+        // parent protects the socket regardless of the launcher's umask.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         Ok((
             Self {
@@ -82,38 +91,43 @@ impl Source {
             path,
         ))
     }
-    pub fn publish(&mut self, frame: &Frame) -> Result<()> {
+
+    pub fn publish(&mut self, frame: Frame) -> Result<()> {
         if self.source.is_finished() {
             return Err("source pump stopped".into());
         }
 
         self.sequence += 1;
         let header = &frame.header;
-        *self.latest.lock().map_err(|_| "frame mutex poisoned")? = Some(jackstay_producer::Frame {
-            descriptor: FrameDescriptor {
-                sequence: self.sequence,
-                timestamp_ns: self.started.elapsed().as_nanos() as u64,
-                width: header.width,
-                height: header.height,
-                stride: header.stride,
-                pixel_format: PixelFormat::Rgba8Unorm as u32,
-                clock_domain: ClockDomain::MediaTime as u32,
-                sync_kind: FrameSyncKind::CpuCopyComplete as u32,
-                damage_kind: DamageKind::FullFrame as u32,
-                ..FrameDescriptor::default()
-            },
-            bytes: frame.pixels.clone(),
-        });
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(jackstay_producer::Frame {
+                descriptor: FrameDescriptor {
+                    sequence: self.sequence,
+                    timestamp_ns: self.started.elapsed().as_nanos() as u64,
+                    width: header.width,
+                    height: header.height,
+                    stride: header.stride,
+                    pixel_format: PixelFormat::Rgba8Unorm as u32,
+                    clock_domain: ClockDomain::MediaTime as u32,
+                    sync_kind: FrameSyncKind::CpuCopyComplete as u32,
+                    damage_kind: DamageKind::FullFrame as u32,
+                    ..FrameDescriptor::default()
+                },
+                bytes: frame.pixels,
+            });
         Ok(())
     }
+
     pub fn stop(self) -> Result<()> {
         // EOF can follow the final helper frame immediately. Let the pump take
         // that frame before stopping; joining it completes that publication.
+        // The pinned toolkit pump calls frame() unconditionally, even without
+        // peers. is_finished() also breaks the wait after a fatal pump error.
         while !self.source.is_finished()
             && self
                 .latest
                 .lock()
-                .map_err(|_| "frame mutex poisoned")?
+                .unwrap_or_else(PoisonError::into_inner)
                 .is_some()
         {
             std::thread::sleep(Duration::from_millis(5));
@@ -145,7 +159,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         match helper.receive(Duration::from_millis(50)) {
             Ok(frame) => {
-                source.publish(&frame?)?;
+                source.publish(frame?)?;
                 received += 1;
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -170,6 +184,13 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         }
     }
     eprintln!("luchs: stopped after {received} frames");
-    source.stop()?;
+    match source.stop() {
+        // Zero-capability input never acquires held state. Rejecting cleanup is
+        // expected for this observation-only producer, not a failed CLI run.
+        Err(error) if error.to_string() == "input cleanup failed" => {
+            eprintln!("luchs: shutdown: {error}");
+        }
+        result => result?,
+    }
     Ok(())
 }
