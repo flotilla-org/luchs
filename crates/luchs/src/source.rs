@@ -56,6 +56,7 @@ impl Source {
                 retained_history: 1,
                 producer_reserve: 1,
                 payload_capacity: width as usize * height as usize * 4,
+                // Frames are capped at 64 MiB; 1 GiB bounds aggregate arena allocations.
                 memory_budget: 1024 * 1024 * 1024,
                 max_incarnations: 3,
                 drain_timeout: Duration::from_secs(5),
@@ -195,7 +196,8 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         // expected for this observation-only producer, not a failed CLI run.
         // jackstay-producer at ed785976 returns io::Error without a typed
         // cleanup variant. This exact message is pinned by the CLI test.
-        // Typed error follow-up: https://github.com/flotilla-org/jackstay/issues/70
+        // TODO(jackstay#70): replace the message comparison with a typed cleanup error.
+        // https://github.com/flotilla-org/jackstay/issues/70
         Err(error) if error.to_string() == "input cleanup failed" => {
             eprintln!("luchs: shutdown: {error}");
         }
