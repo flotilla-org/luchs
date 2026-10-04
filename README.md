@@ -124,8 +124,9 @@ failures are reported. Consumer shutdown does not terminate Luchs.
 Use `--affordances required --log-affordances` in the SDL viewer to inspect page
 state and enable its navigation toolbar and document scrollbar overlays.
 `testdata/affordances.html` has links, a text field, a title-change button, and
-both scroll axes. Window readiness requires a completed navigation and a
-published frame. Titles, history and loading follow the active WebKit view,
+both scroll axes. Window readiness latches after the first completed navigation
+and published frame for a helper lifetime. Later loads update navigation loading;
+helper replacement resets readiness. Titles, history and loading follow the active WebKit view,
 including popups. Cursor changes follow the last pointer position in the page;
 host pointer motion reaches WebKit through the native input executor.
 

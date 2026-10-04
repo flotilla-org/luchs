@@ -80,6 +80,9 @@ impl PageState {
                 };
                 window.requested_size = None;
                 let mut state = self.0.lock().unwrap();
+                // Readiness latches for this helper lifetime after the first
+                // completed navigation and published frame. Later navigation
+                // changes navigation.loading; helper_stopped resets readiness.
                 state.navigation_finished |= window.ready;
                 window.ready = state.navigation_finished && state.frame_published;
                 insert(&mut state, Snapshot::Window(window));
@@ -176,6 +179,8 @@ impl PageState {
                 };
                 match policy.allowed_url(value) {
                     Some(url) => json!({"type": "navigation.load", "url": url}),
+                    // The helper owns the configured console log. Keep rejected
+                    // loads on its ordered command path to reach that file.
                     None => json!({"type": "navigation.rejected", "url": value}),
                 }
             }

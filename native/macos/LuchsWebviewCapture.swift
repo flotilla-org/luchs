@@ -538,6 +538,8 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         guard let view = activeView else { return }
         // Advisory helper readiness: emittedFrames counts socket writes. Rust
         // additionally gates this on publication through the producer toolkit.
+        // It stays true after the first completed navigation; later loads use
+        // navigation.loading to describe progress without hiding the window.
         emitState(["domain": "window", "body": ["title": view.title as Any? ?? NSNull(),
             "requested_size": NSNull(), "ready": navigationFinished && emittedFrames > 0]])
         emitState(["domain": "navigation", "body": ["url": view.url?.absoluteString as Any? ?? NSNull(),
