@@ -277,11 +277,14 @@ while True:
     assert!(capture["time"].as_f64().unwrap() - log[index]["time"].as_f64().unwrap() < 0.2);
     assert_eq!(input.welcome().config.geometry.width, 1.);
     assert_eq!(input.welcome().config.geometry.height, 1.);
-    drop((consumer, setup, hints, input));
+    // Release media before shutdown, but keep presentation attached: its closure
+    // restores scale=1 and may publish another frame before SIGTERM arrives.
+    drop((consumer, setup, input));
     unsafe {
         libc::kill(process.0.id() as i32, libc::SIGTERM);
     }
     wait(|| process.0.try_wait().unwrap().is_some());
+    drop(hints);
     let mut stderr = String::new();
     process
         .0
