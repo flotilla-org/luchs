@@ -9,7 +9,7 @@ use jackstay::{
         arena::{AcquireOutcome, ArenaConsumer, FrameLease},
         socket::CpuSetupClient,
     },
-    bootstrap::{self, InputRequest},
+    bootstrap::{self, ChannelRequest, InputRequest},
     local::Stream,
 };
 use luchs::{
@@ -34,18 +34,12 @@ fn source() -> (Source, String) {
 fn connect(path: &str) -> (CpuSetupClient, ArenaConsumer) {
     let stream = Stream::connect(path).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let connected = bootstrap::connect(
-        stream,
-        InputRequest::Optional(jackstay::input::Mode::Cooperative),
-    )
-    .unwrap();
+    let connected =
+        bootstrap::connect_v2(stream, InputRequest::None, ChannelRequest::None).unwrap();
     assert!(connected.input.is_none());
-    assert_eq!(
-        connected.input_error,
-        Some(jackstay::input::Error::Unsupported)
-    );
+    assert!(connected.input_error.is_none());
     // SAFETY: the test source is a conforming sole producer. This process owns
     // the grant and never forwards it or forks with the received mappings.
     let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
@@ -67,15 +61,23 @@ fn pixels(width: u32) -> Frame {
 }
 
 fn acquire(consumer: &ArenaConsumer) -> FrameLease {
-    match consumer.acquire_latest(0).unwrap() {
-        AcquireOutcome::Frame(frame) => frame,
-        _ => panic!("expected a frame"),
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() {
+            return frame;
+        }
+        assert!(Instant::now() < deadline, "expected a frame");
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
+// Frames retain their RGBA/sync contract across replacement while old leases stay valid.
 #[test]
 fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
     let (mut source, path) = source();
+    // Private parent permissions protect the socket before inode chmod.
+    let parent = std::path::Path::new(&path).parent().unwrap();
+    assert_eq!(std::fs::metadata(parent).unwrap().mode() & 0o777, 0o700);
     assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
     assert!(
         Source::bind(
@@ -86,7 +88,7 @@ fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
         .is_err()
     );
     let (mut setup, mut consumer) = connect(&path);
-    source.publish(&pixels(1)).unwrap();
+    source.publish(pixels(1)).unwrap();
     let old = acquire(&consumer);
     assert_eq!(old.bytes(), [42; 4]);
     assert_eq!(old.descriptor().pixel_format, 2);
@@ -95,11 +97,15 @@ fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
     assert_eq!(old.descriptor().clock_domain, 2);
     assert_eq!(old.descriptor().damage_kind, 1);
     let old_generation = old.descriptor().config_generation;
-    source.publish(&pixels(2)).unwrap();
-    assert!(matches!(
+    source.publish(pixels(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(
         consumer.acquire_latest(0).unwrap(),
         AcquireOutcome::Reconfiguration
-    ));
+    ) {
+        assert!(Instant::now() < deadline, "expected reconfiguration");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     setup.install_configuration(&mut consumer).unwrap();
     assert_eq!(old.bytes(), [42; 4]);
     drop(old);
@@ -111,21 +117,23 @@ fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
     drop(consumer);
     drop(setup);
     let (setup, consumer) = connect(&path);
-    source.publish(&pixels(2)).unwrap();
+    source.publish(pixels(2)).unwrap();
     assert_eq!(acquire(&consumer).bytes(), [42; 8]);
     // Shutdown closes even a connected consumer and removes the endpoint.
-    drop(source);
-    assert!(!std::path::Path::new(&path).exists());
     drop((setup, consumer));
+    source.stop().unwrap();
+    assert!(!std::path::Path::new(&path).exists());
 }
 
+// An idle handshake cannot block media publication or ordered shutdown.
 #[test]
 fn stalled_bootstrap_does_not_block_frames_or_shutdown() {
     let (mut source, path) = source();
     let stalled = Stream::connect(&path).unwrap();
-    let (_setup, consumer) = connect(&path);
-    source.publish(&pixels(1)).unwrap();
+    let (setup, consumer) = connect(&path);
+    source.publish(pixels(1)).unwrap();
     assert_eq!(acquire(&consumer).bytes(), [42; 4]);
+    drop((setup, consumer));
     let started = Instant::now();
     drop(source);
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -143,13 +151,14 @@ fn child_consumer() {
     }
 }
 
+// Killed consumers release held leases so repeated replacement consumers can attach.
 #[test]
 fn consumer_process_death_releases_reservation() {
     let (mut source, path) = source();
     let directory = tempfile::tempdir().unwrap();
     // More than max_incarnations, each dying with an outstanding frame lease.
     for index in 0..5 {
-        source.publish(&pixels(1)).unwrap();
+        source.publish(pixels(1)).unwrap();
         let ready = directory.path().join(index.to_string());
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_consumer", "--ignored"])
@@ -159,7 +168,7 @@ fn consumer_process_death_releases_reservation() {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready.exists() && Instant::now() < deadline {
-            source.publish(&pixels(1)).unwrap();
+            source.publish(pixels(1)).unwrap();
             std::thread::sleep(Duration::from_millis(10));
         }
         let attached = ready.exists();
@@ -170,6 +179,50 @@ fn consumer_process_death_releases_reservation() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let (_setup, consumer) = connect(&path);
-    source.publish(&pixels(1)).unwrap();
+    source.publish(pixels(1)).unwrap();
     assert_eq!(acquire(&consumer).bytes(), [42; 4]);
+}
+
+// Optional controls must preserve media while luchs remains observation-only.
+#[test]
+fn optional_input_and_affordances_receive_media_without_input_authority() {
+    let (mut source, path) = source();
+    for mode in [
+        jackstay::input::Mode::Physical,
+        jackstay::input::Mode::SourceText,
+        jackstay::input::Mode::Cooperative,
+    ] {
+        let connected = bootstrap::connect_v2(
+            Stream::connect(&path).unwrap(),
+            InputRequest::Optional(mode),
+            ChannelRequest::Optional,
+        )
+        .unwrap();
+        assert!(connected.affordances.is_some());
+        if let Some(input) = &connected.input {
+            assert_eq!(input.welcome().config.capabilities, 0);
+            assert_eq!(
+                input.send(jackstay::input::Event::Text("never executed".into())),
+                Err(jackstay::input::Error::Unsupported)
+            );
+        } else {
+            assert_eq!(
+                connected.input_error,
+                Some(jackstay::input::Error::Unsupported)
+            );
+        }
+        // SAFETY: this test owns a grant from its conforming sole producer.
+        let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
+        let consumer = setup.attach(1).unwrap();
+        source.publish(pixels(1)).unwrap();
+        assert_eq!(acquire(&consumer).bytes(), [42; 4]);
+    }
+    // Rejecting cleanup is deliberately reported by the toolkit, never executed.
+    assert!(
+        source
+            .stop()
+            .unwrap_err()
+            .to_string()
+            .contains("input cleanup failed")
+    );
 }

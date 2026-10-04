@@ -68,3 +68,13 @@ a regression assertion; the results in the table come from rerunning that build.
 The test suite independently covers resize, holding an old lease across a
 replacement, consumer process death with a held lease, reload through a fake
 helper, and SIGTERM cleanup. Input delivery is outside this slice.
+
+## Bootstrap v2 migration (2026-10-04)
+
+Jackstay is now pinned to `ed785976df1246d2d3ce3f0c41df91c02f38e20d`
+(ABI 0.12). The evidence above predates this migration and covers bootstrap v1.
+The v2 live check remains pending: Jackstay #59, the SDL reference viewer's
+bootstrap v2 slice, is still open. After it lands, present
+`testdata/interactive.html` using that viewer on a live macOS desktop and append
+the tested revisions and results here. Automated tests exercise v2 media, optional
+controls, replacement, process death and SIGTERM with a live consumer.

@@ -2,15 +2,22 @@
 
 Luchs is a page viewer that publishes frames as a Jackstay source. Its Rust core
 owns the CLI, renderer process and CPU producer; the first renderer is the
-macOS `WKWebView` helper extracted from Katzensteg. Any Jackstay consumer can
-present the page. SDL is a reference consumer, not Luchs's primary presenter.
+macOS `WKWebView` helper extracted from Katzensteg. A bootstrap v2 Jackstay
+consumer can present the page. SDL is a reference consumer, not Luchs's primary presenter.
 
 This repository implements the frame-producing slice of
 [Jackstay's split](https://github.com/flotilla-org/jackstay/issues/32).
 Input admission and affordances belong to later slices. Every connection is
-observation-only, including one that requests optional input. Required input
-fails admission. The helper retains its existing stdin protocol, but this core
-only sends reload commands.
+observation-only, including one that requests optional input. No input
+capabilities are advertised. ABI 0.12 requires a nonzero typing mode,
+so cooperative admission is available but every operation returns unsupported;
+physical and source-text admission are unsupported. The helper retains its
+existing stdin protocol, but this core only sends reload commands. This producer
+never acquires held input state, yet rejects every work item, including cleanup.
+The toolkit reports `input cleanup failed` at shutdown if cooperative input was
+admitted because its cleanup was rejected. Luchs logs that specific error and exits successfully on
+orderly SIGINT, SIGTERM or EOF; other shutdown errors still fail the run.
+Viewers requesting optional input still receive frames; input events are rejected.
 
 ## Build and install
 
@@ -39,20 +46,26 @@ luchs --endpoint=my-web-page https://example.com
 ```
 
 Luchs prints its source socket path on stdout and diagnostics on stderr. Pass
-that path to a consumer built with Jackstay source bootstrap support:
+that path to a consumer built with Jackstay bootstrap v2 support (ABI 0.12):
 
 ```sh
-katzensteg jackstay-source /path/printed/by/luchs.sock --observe
 capture-viewer-sdl --source-socket /path/printed/by/luchs.sock --observe
 ```
+
+The SDL example requires its bootstrap v2 slice (Jackstay #59) to land first.
+Bootstrap v2 is required; v1-only consumers, including current Katzensteg
+`jackstay-source`, Wheelhouse, and SDL before that slice, cannot connect.
+Rust consumers use `jackstay::bootstrap::connect_v2` with optional or no controls.
 
 The endpoint lives in Jackstay's private per-user runtime directory and the
 socket mode is `0600`. Its default name is `luchs-<pid>`; `--endpoint` chooses a
 name, not an arbitrary socket path. Jackstay checks peer ownership and Luchs
-runs `jackstay::bootstrap::accept` without an input target before CPU setup.
+uses `jackstay_producer::Builder` and bootstrap v2 before CPU setup.
 Consumers may join, leave, or die while the renderer keeps running. The producer
 has eight resources, one retained frame, one producer reserve and at most three
-consumer incarnations; admission also depends on each consumer's holding credit.
+arena incarnations, with `max_connections=16` bounding simultaneous toolkit
+workers (including stalled handshakes and independent controls). Arena admission
+also depends on each consumer's holding credit.
 
 `--size=WxH` defaults to 800x600. `--watch` polls a local file's modification time
 every 250 ms and asks WebKit to reload without its cache; URLs load once.
@@ -71,10 +84,15 @@ content, an inherited limitation. A live macOS desktop session is required.
 
 The Swift viewport stays fixed for a run. The Rust protocol accepts changes in
 frame dimensions or stride and reconfigures the Jackstay CPU allocation before
-publishing the replacement. A capacity-paused replacement waits for retirement;
-it never overwrites leased pixels. Frames are limited to 64 MiB and the producer's
+publishing the replacement. The toolkit manages capacity-paused replacements,
+retrying reconfiguration on later helper frames as old allocations retire;
+it never overwrites leased pixels. The callback keeps only the latest helper
+frame, so intermediate frames may be skipped. Shutdown allows up to one second
+for the final queued frame before starting ordered toolkit teardown. Frames are limited to 64 MiB and the producer's
 allocation budget is 1 GiB. SIGINT, SIGTERM, EOF and errors all close the endpoint
-and stop/reap the helper. Consumer shutdown does not terminate Luchs.
+and stop/reap the helper. The toolkit drains for up to five seconds; consumers
+must retire their mappings and leases when media closes. Drain or input cleanup
+failures are reported. Consumer shutdown does not terminate Luchs.
 
 ## Verification
 

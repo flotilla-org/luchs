@@ -8,7 +8,9 @@ rust-version = "1.85"
 repository = "https://github.com/flotilla-org/luchs"
 
 [workspace.dependencies]
-jackstay = { git = "https://github.com/flotilla-org/jackstay", rev = "33369151429d82a2b923ab2891e199b05aca075a" }
+# Keep Jackstay and its producer toolkit at the same revision.
+jackstay = { git = "https://github.com/flotilla-org/jackstay", rev = "ed785976df1246d2d3ce3f0c41df91c02f38e20d" }
+jackstay-producer = { git = "https://github.com/flotilla-org/jackstay", rev = "ed785976df1246d2d3ce3f0c41df91c02f38e20d" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
