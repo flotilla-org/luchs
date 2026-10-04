@@ -12,8 +12,14 @@ pub const ACK_TAG: u8 = 2;
 pub const STATE_TAG: u8 = 3;
 
 #[derive(Debug, Deserialize, Serialize)]
+pub enum Format {
+    #[serde(rename = "bgra8")]
+    Bgra8,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Header {
-    pub format: String,
+    pub format: Format,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -39,6 +45,14 @@ pub struct Ack {
     pub id: u64,
     pub outcome: AckOutcome,
     pub detail: Option<String>,
+    pub capture: Option<CaptureReport>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CaptureReport {
+    pub published: bool,
+    pub snapshot_ns: u64,
+    pub publish_ns: u64,
 }
 
 #[derive(Debug)]
@@ -51,7 +65,7 @@ pub enum Record {
 pub fn validate_size(width: u32, height: u32) -> Result<(), String> {
     let bytes = (u64::from(width) * u64::from(height)).checked_mul(4);
     if width == 0 || height == 0 || bytes.is_none_or(|bytes| bytes > MAX_FRAME_BYTES as u64) {
-        return Err("size must be positive and fit in 64 MiB of RGBA pixels".into());
+        return Err("size must be positive and fit in 64 MiB of BGRA pixels".into());
     }
     Ok(())
 }
@@ -69,6 +83,13 @@ fn read_u32(reader: &mut impl Read) -> io::Result<usize> {
 /// Validate sizes before allocating or reading their payloads. EOF is clean
 /// only between records, never inside an envelope, header or pixel buffer.
 pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
+    read_record_reusing(reader, &mut Vec::new())
+}
+
+pub fn read_record_reusing(
+    reader: &mut impl Read,
+    buffers: &mut Vec<Vec<u8>>,
+) -> io::Result<Option<Record>> {
     let mut first = [0];
     loop {
         match reader.read(&mut first) {
@@ -95,13 +116,12 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
             if header_len == 0 || header_len > MAX_HEADER_BYTES || header_len > len - 5 {
                 return Err(invalid("invalid frame header length"));
             }
-            let mut json = vec![0; header_len];
-            reader.read_exact(&mut json)?;
-            let header: Header = serde_json::from_slice(&json)?;
+            let mut json = [0; MAX_HEADER_BYTES];
+            reader.read_exact(&mut json[..header_len])?;
+            let header: Header = serde_json::from_slice(&json[..header_len])?;
             let row_bytes = u64::from(header.width) * 4;
             let pixel_len = u64::from(header.stride) * u64::from(header.height);
-            if header.format != "rgba8"
-                || header.width == 0
+            if header.width == 0
                 || header.height == 0
                 || u64::from(header.stride) < row_bytes
                 || pixel_len != header.len as u64
@@ -109,10 +129,11 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
                 || header.len != len - 5 - header_len
             {
                 return Err(invalid(
-                    "invalid RGBA frame dimensions, stride, format, or length",
+                    "invalid BGRA frame dimensions, stride, format, or length",
                 ));
             }
-            let mut pixels = vec![0; header.len];
+            let mut pixels = buffers.pop().unwrap_or_default();
+            pixels.resize(header.len, 0);
             reader.read_exact(&mut pixels)?;
             Ok(Some(Record::Frame(Frame { header, pixels })))
         }
@@ -132,14 +153,11 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     }
 }
 
-pub fn encode_command(id: u64, kind: &str) -> io::Result<Vec<u8>> {
-    if kind.len() > MAX_CONTROL_BYTES {
-        return Err(invalid("oversized command"));
-    }
-    if kind.is_empty() {
+pub fn encode_json_command(command: &Value) -> io::Result<Vec<u8>> {
+    if command["type"].as_str().is_none_or(str::is_empty) {
         return Err(invalid("empty command type"));
     }
-    let json = serde_json::to_vec(&serde_json::json!({"id": id, "type": kind}))?;
+    let json = serde_json::to_vec(command)?;
     if json.len() > MAX_CONTROL_BYTES {
         return Err(invalid("oversized command"));
     }
@@ -147,4 +165,8 @@ pub fn encode_command(id: u64, kind: &str) -> io::Result<Vec<u8>> {
     bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&json);
     Ok(bytes)
+}
+
+pub fn encode_command(id: u64, kind: &str) -> io::Result<Vec<u8>> {
+    encode_json_command(&serde_json::json!({"id": id, "type": kind}))
 }

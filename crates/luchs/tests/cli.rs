@@ -249,8 +249,8 @@ fn invalid_helper_frame_drops_source_and_reaps_helper() {
         format!(
             r#"#!/bin/sh
 echo $$ > '{}'
-printf '\001\000\000\000\143'
-while IFS= read -r line; do :; done
+printf '\001\000\000\000\143' >&$LUCHS_HELPER_FD
+sleep 60
 "#,
             pid.display()
         ),

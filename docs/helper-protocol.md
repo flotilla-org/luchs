@@ -1,9 +1,14 @@
 # Helper protocol
 
-Luchs owns a renderer subprocess with piped stdin and stdout. This contract
-applies to the macOS WKWebView helper and future WebKitGTK and WebView2 helpers.
-Stderr carries diagnostics; stdout carries only protocol records. There is no
-JSON-line input, `LUCHS_RAW_FRAME` prefix, or JavaScript input bridge.
+Rust creates one `AF_UNIX` `SOCK_STREAM` socketpair per renderer and passes the
+child endpoint in `LUCHS_HELPER_FD`. Only that endpoint survives exec; the helper
+sets close-on-exec again before starting WebKit. Stdin and stdout are `/dev/null`
+and carry no protocol bytes. Stderr carries diagnostics. The socket can carry
+future `SCM_RIGHTS` arena grants (#13); this slice passes no descriptors.
+
+One helper process owns each engine and uses `takeSnapshot`, without Screen
+Recording permission. Direct writing into delegated Jackstay arena slots is
+follow-on work in #13, depending on Jackstay #75.
 
 ## Envelopes and limits
 
@@ -25,7 +30,7 @@ JSON, invalid fields, oversized records, and truncation are fatal. Reject a
 length before allocating its payload. Frame readers validate the header before
 allocating pixels. On failure Rust terminates and reaps the helper, disconnects
 ack waiters, and reports the error through frame reception. The helper exits
-with an error for malformed stdin and terminates on clean stdin EOF.
+with an error for malformed command records and terminates on clean socket EOF.
 
 ## Commands and acknowledgements
 
@@ -42,7 +47,10 @@ fields are reserved for extensions.
 
 The helper emits exactly one ack per valid command, including unknown command
 types. It applies the command on its UI main thread and then emits the ack on
-that thread. Serial stdout ownership prevents frames and acks from interleaving.
+that thread. A serial background socket writer keeps records from interleaving
+and keeps blocking writes off WebKit's main thread. The command reader admits
+one command at a time and waits for its acknowledgement to drain; a capture's
+bitmap stays borrowed until its write completes. This bounds queued work.
 An `executed` ack confirms actual application of the command; enqueueing work
 for another thread is not execution.
 
@@ -60,19 +68,20 @@ An invalid ack schema is a protocol failure.
 | --- | --- |
 | `ping` | The main thread has handled the command; ack `executed` |
 | `reload` | Apply a cache-bypassing reload request to the main page view; ack `executed` after the WebKit load/reload call returns |
+| `capture` | Complete a visible snapshot and any changed-frame write before ack; hidden requests take no snapshot |
+| `presentation` | Apply `visible` (boolean) and `scale` (positive finite number), validating the resulting pixel size before ack |
 | Any other type | Apply no effect; ack `unsupported` |
 
 For a local page, reload reads the file and calls `loadHTMLString` with the page
 URL as base URL. A read failure gets `failed`. Remote pages use
 `reloadFromOrigin`. An executed reload confirms submission to WebKit, not
 navigation completion or delivery of a replacement frame; later navigation
-errors go to the console log. Input and affordance commands belong to later
-slices. Old SDL command names currently receive `unsupported`; future input
+errors go to the console log. Native input and producer-state publication belong to later slices. Old SDL command names currently receive `unsupported`; future input
 handlers must deliver native events, with no JavaScript event-synthesis path.
 
 ## Rust dispatch and timeouts
 
-One reader thread demultiplexes all stdout records. It keeps at most two queued
+One reader thread demultiplexes all socket records. It keeps at most two queued
 frames, dropping the oldest when full so frame reception cannot block ack
 routing. `Helper::dropped_frames()` counts mailbox drops; the CLI logs the
 count at shutdown when nonzero. `Helper::spawn_with_state` delivers state objects
@@ -85,10 +94,10 @@ returns a `PendingCommand`. Multiple commands can be outstanding and acks can
 arrive in any order. At most 64 commands can await acknowledgement; further
 admission returns `WouldBlock`. Dropping a waiter frees its slot.
 
-The timeout starts when the command is admitted and includes writing stdin.
-Writes use a nonblocking pipe; a timeout or write failure terminates and reaps
-the helper because a partial command cannot be retried on the same stream. Pipe
-readiness uses `poll`; frame reception retains the write error even if stdout
+The timeout starts when the command is admitted and includes writing the socket.
+Writes use a nonblocking socket; a timeout or write failure terminates and reaps
+the helper because a partial command cannot be retried on the same stream. Socket
+readiness uses `poll`; frame reception retains the write error even if socket
 EOF races shutdown.
 `Helper::command` maps send failure, timeout, and helper disconnection to
 `CommandOutcome::Uncertain`. A reader accepts an ack only before its command's
@@ -112,20 +121,72 @@ policy.
 
 ## Frames
 
-The JSON header retains the existing RGBA fields:
+The JSON header uses device-pixel dimensions and premultiplied BGRA bytes:
 
 ```json
-{"format":"rgba8","width":800,"height":600,"stride":3200,"len":1920000}
+{"format":"bgra8","width":800,"height":600,"stride":3200,"len":1920000}
 ```
 
 Width and height must be positive unsigned 32-bit integers. Stride must be at
 least `width * 4`, and `len` must equal `stride * height`, fit the 64 MiB cap,
-and match the bytes remaining in the record. The format must be `rgba8`.
+and match the bytes remaining in the record. The format must be `bgra8`.
 No record can contain trailing bytes after its declared pixels.
 
-The Swift helper emits premultiplied RGBA, as before. Frame envelopes contain
-raw pixels rather than base64; dimensions and stride may change between frames.
-The current Swift viewport stays fixed during a run.
+The Swift helper emits little-endian premultiplied BGRA (`Bgra8Unorm`). It sets
+`snapshotWidth` to `logical_width * scale / window_backing_scale`, then draws
+WebKit's native image representation 1:1 into a reused bitmap/context. Integer
+pixel dimensions round each logical dimension times scale to the nearest pixel.
+The original representation preserves odd sizes which screen-scaled `NSImage`
+CGImage extraction would round away. There is no channel swizzle, intermediate
+pixel `Data`, or per-frame page mutation. The CGContext uses the snapshot's RGB
+colour space, determined when allocating a size.
+
+Bitmap storage, its graphics contexts and frame envelope are reused until the
+pixel size changes. Rust decodes headers with fixed scratch storage and recycles
+pixel vectors from mailbox drops, replaced latest frames and the toolkit's
+`recycle()` callback. Frame-sized allocations occur during warm-up or size growth;
+small command/ack JSON and WebKit's snapshot objects still use framework storage.
+The toolkit's `input_size()` callback keeps input geometry in the logical viewport
+when scale changes the pixel allocation. The Swift logical viewport stays fixed;
+preferred size and focus hints remain #7's work.
+
+## Capture policy and reports
+
+Rust requests one capture at a time, using the ordinary command IDs and acks.
+A successful capture ack adds an optional report without changing its outcome:
+
+```json
+{"id":4,"outcome":"executed","capture":{"published":false,"snapshot_ns":2100000,"publish_ns":0}}
+```
+
+`published` means the helper sent a changed frame. Snapshot time measures the
+WebKit API latency; publish time includes drawing, hashing and draining a changed
+frame to the socket. Skipped frames have zero publish time. A hidden capture ack
+has no report because no snapshot was taken. `--stats` reports completed snapshots,
+Jackstay publications, unchanged skips and the mean times at exit. An in-flight
+capture interrupted by shutdown is not counted as completed.
+
+The helper compares an FNV-1a fingerprint of native pixels with its last sent
+frame. A match emits no frame record. Rust also fingerprints dimensions, stride
+and pixels before Jackstay publication, guarding against renderer duplicates.
+After one second without a changed frame or wake, captures back off from `--fps`
+(default 30) to 2 fps. A changed frame restores full rate. Reload and presentation
+commands wake capture; every non-capture helper command also reports a wake.
+Page mutations, editing, selection, focus, scroll and resize report
+`{"capture_changed":true}` on the existing state tag. Active CSS animations report
+activity from a page rAF probe; an idle static page's probe sends nothing. The
+caret updates from page events, with a deferred rAF after native default actions.
+Canvas/video changes without a DOM or animation signal are discovered by the idle
+probe, within its 500 ms interval, then restore full rate.
+
+The toolkit's `affordance()` callback forwards host presentation hints. Last
+received hints win; withdrawal or channel closure restores defaults. An oversized
+scale hint is logged and ignored. `visible=false` stops capture requests and
+suppresses queued publications while leaving the WebKit window ordered in, so
+its page clock keeps running. `visible=true` requests an immediate capture and
+invalidates the previous fingerprint so an unchanged image can be presented
+again. `--frames=N` counts changed helper frames; a static page with N greater
+than one can therefore remain running until content or presentation changes.
 
 ## Verification
 
@@ -134,6 +195,9 @@ frame passthrough, split records, out-of-order acks under frame backpressure,
 unknown commands, failed commands, timeout and late acks, state callbacks,
 malformed records, size bounds, callback panic, process reaping, and CLI watch
 reload recovery after failed and uncertain acks (including unsupported failure).
+`capture_policy` exercises the real CLI with a fake socketpair renderer: duplicate
+suppression, idle threshold, reload and page-signal wake, scale through the actual
+presentation callback, hidden capture suspension and immediate re-show.
 Fake command helpers require `python3`, available on the CI runners.
 
 On a logged-in macOS desktop, build the Swift helper and run:
@@ -144,6 +208,6 @@ cargo test --locked --test live_macos -- --ignored --nocapture
 ```
 
 The tests check native ping/reload acks, a full-range u64 ID, zero-status exit on
-stdin EOF, and verify that `--watch` publishes
+socket EOF, and verify that `--watch` publishes
 changed page pixels through the real CLI, Swift helper, and Jackstay producer.
 See [live macOS evidence](live-macos.md) for the recorded run.

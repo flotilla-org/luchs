@@ -1,8 +1,12 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, BufReader, Write},
+    io::{self, BufReader, Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{net::UnixStream, process::CommandExt},
+    },
     panic::{AssertUnwindSafe, catch_unwind},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
@@ -11,11 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::protocol::{Ack, AckOutcome, Frame, Record, encode_command, read_record};
-use rustix::{
-    event::{PollFd, PollFlags, Timespec, poll},
-    fs::{OFlags, fcntl_getfl, fcntl_setfl},
-};
+use crate::protocol::{Ack, AckOutcome, Frame, Record, encode_json_command, read_record_reusing};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_PENDING_COMMANDS: usize = 64;
@@ -48,6 +49,7 @@ struct AckWaiter {
 #[derive(Default)]
 struct StreamState {
     frames: VecDeque<Frame>,
+    buffers: Vec<Vec<u8>>,
     dropped_frames: u64,
     ignored_acks: u64,
     error: Option<io::Error>,
@@ -75,6 +77,14 @@ impl PendingCommand {
         self.id
     }
 
+    pub fn poll(&self) -> Option<crate::protocol::Ack> {
+        self.ack.try_recv().ok()
+    }
+
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
     pub fn wait(self) -> CommandOutcome {
         // The reader timestamps acceptance against this same deadline. A queued
         // ack accepted in time stays valid even if wait() is called later;
@@ -99,11 +109,11 @@ impl Drop for PendingCommand {
     }
 }
 
-/// Owns the process and a single stdout demultiplexer. Frames never block ack
+/// Owns the process and a single socket demultiplexer. Frames never block ack
 /// dispatch: the bounded two-frame mailbox drops the oldest on overflow.
 pub struct Helper {
     child: Arc<Mutex<Child>>,
-    stdin: Option<ChildStdin>,
+    socket: Option<UnixStream>,
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
     next_id: u64,
@@ -121,32 +131,45 @@ impl Helper {
         command: &mut Command,
         mut state_event: impl FnMut(serde_json::Map<String, serde_json::Value>) + Send + 'static,
     ) -> io::Result<Self> {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+        let (socket, inherited) = UnixStream::pair()?;
+        socket.set_nonblocking(true)?;
+        let input = socket.try_clone()?;
+        let fd = inherited.as_raw_fd();
+        command.env("LUCHS_HELPER_FD", fd.to_string());
+        // SAFETY: only async-signal-safe fcntl runs between fork and exec. The
+        // parent retains CLOEXEC; only this child's socket survives exec.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stdin = child.stdin.take().expect("piped stdin");
-        // Bound command writes too, including a helper that stops reading stdin.
-        if let Err(error) =
-            fcntl_getfl(&stdin).and_then(|flags| fcntl_setfl(&stdin, flags | OFlags::NONBLOCK))
-        {
-            kill_and_reap(&mut child);
-            return Err(error.into());
-        }
+        drop(inherited);
         let child = Arc::new(Mutex::new(child));
         let shared = Arc::new(Shared::default());
         let stream = shared.clone();
         let process = child.clone();
         let reader = thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
+            let mut reader = BufReader::new(BlockingRead(input));
+            let mut buffers = Vec::new();
             loop {
-                match read_record(&mut reader) {
+                buffers.append(&mut stream.state.lock().unwrap().buffers);
+                buffers.truncate(4);
+                match read_record_reusing(&mut reader, &mut buffers) {
                     Ok(Some(Record::Frame(frame))) => {
                         let mut state = stream.state.lock().unwrap();
                         if state.frames.len() == 2 {
-                            state.frames.pop_front();
+                            if let Some(frame) = state.frames.pop_front() {
+                                buffers.push(frame.pixels);
+                            }
                             state.dropped_frames = state.dropped_frames.saturating_add(1);
                         }
                         state.frames.push_back(frame);
@@ -182,7 +205,7 @@ impl Helper {
         });
         Ok(Self {
             child,
-            stdin: Some(stdin),
+            socket: Some(socket),
             shared,
             reader: Some(reader),
             next_id: 1,
@@ -210,6 +233,17 @@ impl Helper {
         }
     }
 
+    pub fn ended(&self) -> bool {
+        self.shared.state.lock().unwrap().ended
+    }
+
+    pub fn recycle(&self, pixels: Vec<u8>) {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.buffers.len() < 4 {
+            state.buffers.push(pixels);
+        }
+    }
+
     pub fn dropped_frames(&self) -> u64 {
         self.shared.state.lock().unwrap().dropped_frames
     }
@@ -220,11 +254,23 @@ impl Helper {
     }
 
     pub fn send_command(&mut self, kind: &str, timeout: Duration) -> io::Result<PendingCommand> {
+        self.send_json_command(serde_json::json!({"type": kind}), timeout)
+    }
+
+    pub fn send_json_command(
+        &mut self,
+        mut command: serde_json::Value,
+        timeout: Duration,
+    ) -> io::Result<PendingCommand> {
         let id = self.next_id;
         let next = id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("command ids exhausted"))?;
-        let bytes = encode_command(id, kind)?;
+        let object = command.as_object_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "command must be an object")
+        })?;
+        object.insert("id".into(), id.into());
+        let bytes = encode_json_command(&command)?;
         let (send, ack) = mpsc::sync_channel(1);
         let deadline = Instant::now() + timeout;
         {
@@ -248,7 +294,7 @@ impl Helper {
             deadline,
         };
         if let Err(error) = write_command(
-            self.stdin.as_mut().expect("running helper"),
+            self.socket.as_mut().expect("running helper"),
             &bytes,
             deadline,
         ) {
@@ -283,7 +329,7 @@ impl Helper {
                 };
             }
             if Instant::now() >= deadline {
-                return Err(io::Error::other("renderer closed stdout without exiting"));
+                return Err(io::Error::other("renderer closed socket without exiting"));
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -310,7 +356,28 @@ fn end_stream(shared: &Shared, process: &Mutex<Child>, error: Option<io::Error>)
     shared.ready.notify_all();
 }
 
-fn write_command(stdin: &mut ChildStdin, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+// dup'd socket descriptors share O_NONBLOCK. Poll only the reader thread,
+// retaining bounded writes on all Unix platforms (Darwin ignores MSG_DONTWAIT).
+struct BlockingRead(UnixStream);
+impl Read for BlockingRead {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.0.read(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let mut fds = [PollFd::new(&self.0, PollFlags::IN)];
+                    if let Err(error) = poll(&mut fds, None) {
+                        if error != rustix::io::Errno::INTR {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+fn write_command(socket: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
     while !bytes.is_empty() {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -318,11 +385,11 @@ fn write_command(stdin: &mut ChildStdin, mut bytes: &[u8], deadline: Instant) ->
                 "command write timed out",
             ));
         }
-        match stdin.write(bytes) {
+        match socket.write(bytes) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
-                    "helper stdin closed",
+                    "helper socket closed",
                 ));
             }
             Ok(len) => bytes = &bytes[len..],
@@ -334,7 +401,7 @@ fn write_command(stdin: &mut ChildStdin, mut bytes: &[u8], deadline: Instant) ->
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(1));
                 let timeout = Timespec::try_from(remaining).expect("at most one second");
-                let mut fds = [PollFd::new(&*stdin, PollFlags::OUT)];
+                let mut fds = [PollFd::new(&*socket, PollFlags::OUT)];
                 if let Err(error) = poll(&mut fds, Some(&timeout)) {
                     if error != rustix::io::Errno::INTR {
                         return Err(error.into());
@@ -349,7 +416,9 @@ fn write_command(stdin: &mut ChildStdin, mut bytes: &[u8], deadline: Instant) ->
 
 impl Drop for Helper {
     fn drop(&mut self) {
-        self.stdin.take();
+        if let Some(socket) = self.socket.take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
         let mut child = self.child.lock().unwrap();
         if matches!(child.try_wait(), Ok(None)) {
             // SAFETY: the unreaped child owns this PID.

@@ -7,7 +7,8 @@ consumer can present the page. SDL is a reference consumer, not Luchs's primary 
 
 This repository implements the frame-producing slice of
 [Jackstay's split](https://github.com/flotilla-org/jackstay/issues/32).
-Input admission and affordances belong to later slices. Every connection is
+Input admission and producer-state affordances belong to later slices; host
+presentation scale and visibility hints are handled by this slice. Every connection is
 observation-only, including one that requests optional input. No input
 capabilities are advertised. ABI 0.12 requires a nonzero typing mode,
 so cooperative admission is available but every operation returns unsupported;
@@ -50,12 +51,12 @@ Luchs prints its source socket path on stdout and diagnostics on stderr. Pass
 that path to a consumer built with Jackstay bootstrap v2 support (ABI 0.12):
 
 ```sh
-capture-viewer-sdl --source-socket /path/printed/by/luchs.sock --observe
+capture-viewer-sdl --source-socket /path/printed/by/luchs.sock --observe --affordances optional
 ```
 
-The SDL example requires its bootstrap v2 slice (Jackstay #59) to land first.
-Bootstrap v2 is required; v1-only consumers, including current Katzensteg
-`jackstay-source`, Wheelhouse, and SDL before that slice, cannot connect.
+Bootstrap v2 is required. The SDL viewer supports it; request its presentation
+channel with `--affordances optional` on a raw source socket. V1-only consumers
+cannot connect.
 Rust consumers use `jackstay::bootstrap::connect_v2` with optional or no controls.
 
 The endpoint lives in Jackstay's private per-user runtime directory and the
@@ -81,9 +82,28 @@ hosts, and a bare `--` separates options from the page. `--fps` defaults to 30;
 The helper uses the persistent website data store,
 a transparent on-screen window so WebKit keeps its page clock running, Safari's
 user agent, popup views with their opener, and the existing caret script.
-Frames come from `takeSnapshot`, not screen capture. The helper emits
-premultiplied RGBA; consumers that assume straight alpha can darken translucent
-content, an inherited limitation. A live macOS desktop session is required.
+Frames come from `takeSnapshot`, not screen capture. The helper emits BGRA
+with premultiplied alpha (`Bgra8Unorm`); consumers must respect premultiplication
+when compositing translucent pixels. It reuses its bitmap and contexts and writes
+changed pixels on a background queue through an inherited socketpair. Rust pools
+frame storage and returns consumed buffers through the producer toolkit.
+A live macOS desktop session is required.
+
+Each snapshot is compared with the previous publication. Unchanged pixels are
+skipped, and capture backs off to 2 fps after one second idle. Commands and page
+activity restore full rate. `visible=false` pauses snapshots while WebKit's window
+stays ordered in; showing it again captures immediately. A `scale` hint requests
+rounded `width * scale` by `height * scale` device pixels and draws them 1:1,
+including Retina and odd fractional sizes. Input coordinates stay logical.
+`--stats` logs completed snapshots, published frames, unchanged skips and mean
+snapshot/publish times at shutdown. `--frames` counts changed frames, so a static
+page need not reach a limit greater than one.
+
+The renderer architecture stays one engine per helper. ScreenCaptureKit and
+capturing the helper window through Porthole are not the frame path; guaranteed
+GPU capture would require a different engine. Direct writing into delegated
+Jackstay arena slots remains #13, after Jackstay #75. The socketpair is the
+future descriptor-transfer channel.
 
 The Swift viewport stays fixed for a run. The Rust protocol accepts changes in
 frame dimensions or stride and reconfigures the Jackstay CPU allocation before
@@ -109,7 +129,8 @@ cargo +1.98.0 fmt --all --check
 CI runs these checks on macOS and Linux, plus helper compilation on macOS.
 Tests spawn fake helpers without WebKit and exercise framed records, ack
 ordering and timeouts, state callbacks, bounds, reload, console environment,
-termination, source bootstrap, replacement and consumer process death. Command
+termination, source bootstrap, replacement, pooled storage, idle policy,
+presentation hints and consumer process death. Command
 fixtures require `python3`. The ignored `live_macos` test requires a built Swift
 helper and a logged-in desktop; a separate ignored child-process fixture runs
 inside the consumer-death test.

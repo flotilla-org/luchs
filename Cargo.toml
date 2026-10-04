@@ -9,8 +9,8 @@ repository = "https://github.com/flotilla-org/luchs"
 
 [workspace.dependencies]
 # Keep Jackstay and its producer toolkit at the same revision.
-jackstay = { git = "https://github.com/flotilla-org/jackstay", rev = "ed785976df1246d2d3ce3f0c41df91c02f38e20d" }
-jackstay-producer = { git = "https://github.com/flotilla-org/jackstay", rev = "ed785976df1246d2d3ce3f0c41df91c02f38e20d" }
+jackstay = { git = "https://github.com/flotilla-org/jackstay", rev = "9e6f145e5f9f2d1ba5732b0672a5ba6fb7c4b9ad" }
+jackstay-producer = { git = "https://github.com/flotilla-org/jackstay", rev = "9e6f145e5f9f2d1ba5732b0672a5ba6fb7c4b9ad" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

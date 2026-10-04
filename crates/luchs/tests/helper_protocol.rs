@@ -171,7 +171,7 @@ fn state_event_is_delivered_to_callback() {
 
 #[test]
 fn invalid_records_are_rejected_before_reading_payloads() {
-    let header = json!({"format":"rgba8", "width":1, "height":1, "stride":4, "len":4});
+    let header = json!({"format":"bgra8", "width":1, "height":1, "stride":4, "len":4});
     let mut cases = vec![
         vec![0, 0, 0, 0],
         vec![1],
@@ -185,7 +185,7 @@ fn invalid_records_are_rejected_before_reading_payloads() {
     for key in ["format", "width", "height", "stride", "len"] {
         let mut invalid = header.clone();
         invalid[key] = match key {
-            "format" => json!("bgra8"),
+            "format" => json!("rgba8"),
             "width" | "height" => json!(0),
             "stride" => json!(3),
             _ => json!(5),
@@ -232,7 +232,7 @@ fn oversized_record_control_and_frame_header_are_rejected() {
         io::ErrorKind::InvalidData
     );
     let header = serde_json::to_vec(&json!({
-        "format":"rgba8", "width":1, "height":1,
+        "format":"bgra8", "width":1, "height":1,
         "stride":protocol::MAX_FRAME_BYTES + 1, "len":protocol::MAX_FRAME_BYTES + 1,
     }))
     .unwrap();
@@ -362,10 +362,46 @@ fn pending_slots_and_blocked_command_writes_are_bounded() {
 }
 
 #[test]
-fn write_failure_keeps_root_cause_when_stdout_closes() {
-    let mut helper = python("os.close(0)\nframe()\ntime.sleep(60)\n");
+fn socket_eof_disconnects_commands_without_losing_the_final_frame() {
+    let mut helper = python("frame()\nwire.close()\ntransport.close()\ntime.sleep(0.1)\n");
     helper.receive(TIMEOUT).unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
     assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Uncertain);
-    let error = helper.receive(TIMEOUT).unwrap().unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(matches!(
+        helper.receive(TIMEOUT),
+        Err(RecvTimeoutError::Disconnected)
+    ));
+}
+
+#[test]
+fn frame_decode_reuses_returned_pixel_storage() {
+    let bytes = common::frame(2, b"12345678");
+    let buffer = Vec::with_capacity(8);
+    let pointer = buffer.as_ptr();
+    let mut pool = vec![buffer];
+    let Record::Frame(frame) = protocol::read_record_reusing(&mut bytes.as_slice(), &mut pool)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(frame.pixels.as_ptr(), pointer);
+    assert_eq!(frame.pixels, b"12345678");
+    pool.push(frame.pixels);
+    let Record::Frame(frame) = protocol::read_record_reusing(&mut bytes.as_slice(), &mut pool)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(frame.pixels.as_ptr(), pointer);
+}
+
+#[test]
+fn stdout_is_unused_and_cannot_corrupt_socket_framing() {
+    let helper = fake(&format!(
+        "printf 'not a protocol record'; {}",
+        common::printf(&common::frame(1, b"bgra"))
+    ));
+    assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"bgra");
 }

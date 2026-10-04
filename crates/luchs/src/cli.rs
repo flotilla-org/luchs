@@ -42,6 +42,9 @@ pub struct Cli {
     pub frames: u32,
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     pub fps: u32,
+    /// Report snapshot, publication and unchanged-frame counters at exit.
+    #[arg(long)]
+    pub stats: bool,
 }
 
 impl Cli {
