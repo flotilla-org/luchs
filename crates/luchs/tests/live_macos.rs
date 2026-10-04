@@ -64,7 +64,7 @@ fn native_ping_reload_and_watch() {
     assert_eq!(&initial.pixels[..4], &[0, 0, 255, 255]);
     assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Executed);
     assert_eq!(
-        helper.command("mouse_down", TIMEOUT),
+        helper.command("old_sdl_input", TIMEOUT),
         CommandOutcome::Unsupported
     );
     page(&html, "blue");
@@ -374,4 +374,218 @@ fn native_capture_during_slow_load_does_not_block_commands() {
         helper.finish().is_err(),
         "first navigation failure must report an error"
     );
+}
+
+#[test]
+#[ignore = "requires built Swift helper and a live macOS desktop"]
+fn native_input_modes_cleanup_and_precise_scroll() {
+    use jackstay::input::*;
+    let dir = tempfile::tempdir().unwrap();
+    let html = dir.path().join("input.html");
+    let log = dir.path().join("console.log");
+    std::fs::write(&html, r#"<!doctype html><meta charset="utf-8">
+<style>body{margin:0}input{position:absolute;left:0;top:0;width:300px;height:40px}#scroll{position:absolute;top:100px;left:0;width:300px;height:150px;overflow:auto}</style>
+<input id="input"><div id="scroll"><div style="height:2000px">long content</div></div>
+<script>
+input.addEventListener('input',e=>console.log('VALUE '+input.value+' trusted='+e.isTrusted));
+for(const kind of ['keydown','keyup','mousedown','mouseup']) document.addEventListener(kind,e=>console.log('EVENT '+kind+' '+(e.key||e.button)+' trusted='+e.isTrusted+' meta='+e.metaKey));
+const scroller=document.querySelector('#scroll'); scroller.addEventListener('scroll',()=>console.log('SCROLL '+scroller.scrollTop));
+</script>"#).unwrap();
+    let renderer =
+        std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
+    let mut helper = Helper::spawn(
+        Command::new(renderer)
+            .arg(&html)
+            .args(["800", "600", "0", "15"])
+            .env("LUCHS_CONSOLE_LOG", &log)
+            .env("LUCHS_INPUT_TRACE", "1"),
+    )
+    .unwrap();
+    request_frame(&mut helper);
+    let mut executor = luchs::input::Executor::new(600.0);
+    executor.attach(helper.command_sender());
+    let mut id = 0;
+    let mut execute = |mode, operation| {
+        id += 1;
+        assert_eq!(
+            executor.execute(Work {
+                mode,
+                id,
+                controller: 1,
+                epoch: 1,
+                sequence: id,
+                operation
+            }),
+            Outcome::Executed
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let p = Position {
+        revision: 1,
+        x: 60.125,
+        y: 20.875,
+    };
+    for action in [Action::Down, Action::Up] {
+        execute(
+            Mode::SourceText,
+            Operation::Event(Event::Button {
+                button: 1,
+                action,
+                position: p,
+            }),
+        );
+    }
+    execute(
+        Mode::SourceText,
+        Operation::Event(Event::Text("é🙂".into())),
+    );
+    execute(
+        Mode::Cooperative,
+        Operation::Event(Event::Key {
+            press: 1,
+            action: Action::Down,
+            key: Key::Logical("z".into()),
+            modifiers: 0,
+        }),
+    );
+    execute(Mode::Cooperative, Operation::Event(Event::Text("z".into())));
+    execute(
+        Mode::Cooperative,
+        Operation::Event(Event::Key {
+            press: 1,
+            action: Action::Up,
+            key: Key::Logical("z".into()),
+            modifiers: 0,
+        }),
+    );
+    execute(
+        Mode::Physical,
+        Operation::Event(Event::Key {
+            press: 2,
+            action: Action::Down,
+            key: Key::Physical("KeyX".into()),
+            modifiers: 0,
+        }),
+    );
+    execute(
+        Mode::Physical,
+        Operation::Event(Event::Key {
+            press: 2,
+            action: Action::Up,
+            key: Key::Physical("KeyX".into()),
+            modifiers: 0,
+        }),
+    );
+    // Shortcut native key-equivalent path: select, copy, then paste once.
+    for (press, key) in [(3, "a"), (4, "c"), (5, "v")] {
+        for action in [Action::Down, Action::Up] {
+            execute(
+                Mode::Cooperative,
+                Operation::Event(Event::Key {
+                    press,
+                    action,
+                    key: Key::Logical(key.into()),
+                    modifiers: 8,
+                }),
+            );
+        }
+    }
+    execute(
+        Mode::Cooperative,
+        Operation::Event(Event::Key {
+            press: 8,
+            action: Action::Down,
+            key: Key::Logical("ArrowRight".into()),
+            modifiers: 0,
+        }),
+    );
+    execute(
+        Mode::Cooperative,
+        Operation::Event(Event::Key {
+            press: 8,
+            action: Action::Up,
+            key: Key::Logical("ArrowRight".into()),
+            modifiers: 0,
+        }),
+    );
+    for action in [Action::Down, Action::Up] {
+        execute(
+            Mode::Cooperative,
+            Operation::Event(Event::Key {
+                press: 9,
+                action,
+                key: Key::Logical("v".into()),
+                modifiers: 8,
+            }),
+        );
+    }
+    // Native cleanup releases a delivered key and secondary button, but drops
+    // a deferred printable key without typing it during focus loss.
+    execute(
+        Mode::Physical,
+        Operation::Event(Event::Key {
+            press: 6,
+            action: Action::Down,
+            key: Key::Physical("KeyQ".into()),
+            modifiers: 0,
+        }),
+    );
+    execute(
+        Mode::Cooperative,
+        Operation::Event(Event::Key {
+            press: 7,
+            action: Action::Down,
+            key: Key::Logical("w".into()),
+            modifiers: 0,
+        }),
+    );
+    execute(
+        Mode::Cooperative,
+        Operation::Event(Event::Button {
+            button: 2,
+            action: Action::Down,
+            position: p,
+        }),
+    );
+    execute(
+        Mode::Cooperative,
+        Operation::Cleanup {
+            scope: Scope::All,
+            reason: Reason::Focus,
+        },
+    );
+    for y in [0.25, 0.25, 0.25, 0.25, 80.5] {
+        execute(
+            Mode::SourceText,
+            Operation::Event(Event::Scroll {
+                x: 0.0,
+                y,
+                unit: ScrollUnit::Pixel,
+                position: Position { y: 150.25, ..p },
+            }),
+        );
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap();
+        if text.contains("VALUE é🙂zxé🙂zx")
+            && text.contains("EVENT keyup q trusted=true")
+            && text.contains("SCROLL ")
+        {
+            assert!(text.contains("EVENT keydown z trusted=true"));
+            assert!(text.contains("button=2 down=false"));
+            assert!(text.contains("fixed=-0.25"));
+            assert!(
+                text.contains("dy=0.25") && text.contains("native=0.0,-1.0 precise=true"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("EVENT keydown w "),
+                "deferred cleanup typed a key: {text}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "native input log: {text}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

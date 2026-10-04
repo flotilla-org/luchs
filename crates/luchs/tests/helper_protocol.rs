@@ -504,3 +504,30 @@ ack(cmd)
     helper.finish().unwrap();
     std::process::exit(0);
 }
+
+#[test]
+fn cloned_command_ports_share_ids_without_holding_writer_while_waiting() {
+    let mut helper = python(
+        r#"
+commands=[command() for _ in range(8)]
+assert len({c['id'] for c in commands})==8
+for _ in range(4): frame()
+for c in reversed(commands): ack(c)
+"#,
+    );
+    let workers: Vec<_> = (0..8)
+        .map(|i| {
+            let sender = helper.command_sender();
+            std::thread::spawn(move || {
+                sender
+                    .send_json_command(json!({"type":"ping", "caller":i}), TIMEOUT)
+                    .unwrap()
+                    .wait()
+            })
+        })
+        .collect();
+    for worker in workers {
+        assert_eq!(worker.join().unwrap(), CommandOutcome::Executed);
+    }
+    helper.finish().unwrap();
+}

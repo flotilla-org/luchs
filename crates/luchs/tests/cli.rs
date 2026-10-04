@@ -118,9 +118,10 @@ while True:
     .unwrap();
     if optional_controls {
         let input = connected.input.as_ref().unwrap();
-        assert_eq!(
-            input.send(jackstay::input::Event::Text("not executed".into())),
-            Err(jackstay::input::Error::Unsupported)
+        assert!(
+            input
+                .send(jackstay::input::Event::Text("native commit".into()))
+                .is_ok()
         );
     }
     // SAFETY: the spawned luchs process is the sole conforming producer.
@@ -161,15 +162,10 @@ while True:
         .read_to_string(&mut stderr)
         .unwrap();
     assert!(status.success(), "{stderr}");
-    assert_eq!(
-        stderr.contains("shutdown: input cleanup failed"),
-        optional_controls
-    );
-    assert!(
-        !std::fs::read_to_string(&log)
-            .unwrap()
-            .contains("not executed")
-    );
+    assert!(!stderr.contains("input cleanup failed"));
+    if optional_controls {
+        assert!(std::fs::read_to_string(&log).unwrap().contains("cleanup"));
+    }
     assert!(logged.contains("1 1 0 30"));
     assert!(logged.contains("\"type\": \"reload\""));
     assert!(!std::path::Path::new(endpoint.trim()).exists());

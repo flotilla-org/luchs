@@ -248,3 +248,73 @@ without charging the failure budget. The native policy test covers that
 distinction as well as genuine repeated failures. The helper build runs this
 test by default for existing CI; local builders can set
 `LUCHS_SKIP_NATIVE_TESTS=1` and run `scripts/test-helper.sh` separately.
+
+## Native input executor (2026-10-04)
+
+Validated on macOS 26.6 arm64 with Apple Swift 6.4, Rust 1.98.0 and
+SDL 2.32.70. Both the Rust producer and the SDL reference viewer use Jackstay
+`9e6f145e5f9f2d1ba5732b0672a5ba6fb7c4b9ad` (ABI 0.12). The viewer was built
+from a scratch checkout of that exact revision; the workspace's newer ABI 0.13
+viewer cannot attach to this producer. No dependency pin or viewer source changed.
+The production helper was used with its transparent, mouse-ignoring window.
+
+```sh
+scripts/build-helper.sh
+cargo build --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo test --locked --test live_macos -- --ignored --nocapture
+LUCHS_INPUT_TRACE=1 LUCHS_CONSOLE_LOG=/tmp/luchs-input-native.log \
+  target/debug/luchs --endpoint=luchs-input-acceptance-2 --size=800x600 \
+  testdata/interactive.html
+capture-viewer-sdl --source-endpoint luchs-input-acceptance-2 \
+  --typing cooperative --affordances optional --log-affordances
+```
+
+The ignored native suite passed all six tests. Its added input test receives
+trusted DOM events from native responder calls, inserts `é🙂` through the text
+input client, pairs a cooperative `z` press with its text commit, types physical
+`KeyX` using the current layout, and checks native Cmd+A/C/V by duplicating
+`é🙂zx`. Cleanup releases a held physical `KeyQ` and secondary button, while an
+undelivered cooperative `w` press produces no keyDown. Four 0.25-point scrolls
+accumulate into one native point; the CGEvent trace retains `fixed=-0.25`.
+The test then scrolls a 2,000-point content region with an 80.5-point event.
+
+The fake-helper suite covers ack success, unsupported rejection, failed and
+missing ack uncertainty, fractional pointer coordinates, all three modes,
+Line/Page conversion, scroll accumulation, shared command-port IDs, and the
+library's cleanup barrier. A geometry reset sends pointer-only cleanup while a
+key remains releasable by its original press identity. Replacement stays busy
+until cleanup ack and executor completion; failed cleanup quarantines admission.
+
+### SDL observations
+
+The unmodified reference binary was copied into a scratch macOS application
+bundle so desktop automation could select its window. No renderer or event path
+was altered. The viewer received 1600x1200 pixels from the 800x600 logical source
+on the Retina display.
+
+| Mode / operation | Observed result in `testdata/interactive.html` |
+| --- | --- |
+| Cooperative click and typing | `clicks 1`; text field contains `Coop` |
+| Cmd+A, Cmd+C, Right, Cmd+V | Field and readout contain `CoopCoop` |
+| Text mode, typing ` text` | Field and readout contain `CoopCoop text`; helper trace has no key event for this commit |
+| Physical mode, typing ` physical` | Field/readout show insertion at the clicked caret position; trace contains native key downs/ups from the current layout, with SDL text commits disabled |
+| Automated precise scroll over the scroll region | Helper trace: `dx=-0.0 dy=847.9998779296875 fixed=-847.9998779296875 native=0.0,-847.0 precise=true` |
+
+The shortcut check initially failed because the standalone WebKit host lacked
+AppKit's Edit-menu key-equivalent dispatch. The helper now passes native events
+through a standard Edit menu targeted at the bound view. The duplicate-text
+assertion and SDL shortcut sequence above were rerun after that fix.
+An earlier scroll check found Quartz's line-field setter overwriting point fields
+and amplifying displacement by eight. Setting line, fixed-point, then point
+fields produced the stated native values.
+
+### Physical device acceptance still pending
+
+Desktop automation proves the precise input path, but does not establish use of
+a real trackpad or a notched mouse wheel. The operator was asked to scroll the
+live SDL fixture using both devices and identify them. Until that run is recorded,
+the issue's physical wheel/trackpad acceptance criterion remains open. Line
+conversion and fractional precise delivery have automated coverage above.

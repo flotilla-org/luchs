@@ -183,15 +183,14 @@ fn consumer_process_death_releases_reservation() {
     assert_eq!(acquire(&consumer).bytes(), [42; 4]);
 }
 
-// Optional controls must preserve media while luchs remains observation-only.
 #[test]
-fn optional_input_and_affordances_receive_media_without_input_authority() {
-    let (mut source, path) = source();
+fn all_typing_modes_advertise_native_families_and_preserve_media() {
     for mode in [
         jackstay::input::Mode::Physical,
         jackstay::input::Mode::SourceText,
         jackstay::input::Mode::Cooperative,
     ] {
+        let (mut source, path) = source();
         let connected = bootstrap::connect_v2(
             Stream::connect(&path).unwrap(),
             InputRequest::Optional(mode),
@@ -199,30 +198,18 @@ fn optional_input_and_affordances_receive_media_without_input_authority() {
         )
         .unwrap();
         assert!(connected.affordances.is_some());
-        if let Some(input) = &connected.input {
-            assert_eq!(input.welcome().config.capabilities, 0);
-            assert_eq!(
-                input.send(jackstay::input::Event::Text("never executed".into())),
-                Err(jackstay::input::Error::Unsupported)
-            );
-        } else {
-            assert_eq!(
-                connected.input_error,
-                Some(jackstay::input::Error::Unsupported)
-            );
-        }
+        let input = connected.input.as_ref().unwrap();
+        assert_eq!(
+            input.welcome().config.capabilities,
+            jackstay::input::CAP_ALL
+        );
+        assert_eq!(input.welcome().config.modes, 7);
         // SAFETY: this test owns a grant from its conforming sole producer.
         let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
         let consumer = setup.attach(1).unwrap();
         source.publish(pixels(1)).unwrap();
         assert_eq!(acquire(&consumer).bytes(), [42; 4]);
+        drop((consumer, setup, connected.input, connected.affordances));
+        source.stop().unwrap();
     }
-    // Rejecting cleanup is deliberately reported by the toolkit, never executed.
-    assert!(
-        source
-            .stop()
-            .unwrap_err()
-            .to_string()
-            .contains("input cleanup failed")
-    );
 }
