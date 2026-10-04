@@ -154,7 +154,7 @@ impl Helper {
     }
 
     /// The callback runs on the reader thread and must return promptly. State
-    /// is an opaque JSON object until the affordance slice defines its schema.
+    /// includes complete page-domain snapshots (see docs/helper-protocol.md).
     /// A callback panic terminates/reaps the helper and reports a stream error.
     pub fn spawn_with_state(
         command: &mut Command,

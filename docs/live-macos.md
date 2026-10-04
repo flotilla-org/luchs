@@ -251,6 +251,10 @@ test by default for existing CI; local builders can set
 
 ## Native input executor (2026-10-04)
 
+This records PR #16 before it was combined with page affordances. The rebased
+producer retains native input and uses ABI 0.13; the 0.12 measurements below
+describe that earlier validation run.
+
 Validated on macOS 26.6 arm64 with Apple Swift 6.4, Rust 1.98.0 and
 SDL 2.32.70. Both the Rust producer and the SDL reference viewer use Jackstay
 `9e6f145e5f9f2d1ba5732b0672a5ba6fb7c4b9ad` (ABI 0.12). The viewer was built
@@ -347,3 +351,141 @@ An earlier parallel run hit `EINVAL` while the existing slow-load HTTP fixture
 set its accepted socket's timeout; the sequential rerun passed that fixture and
 the other five tests. The native input test now verifies both Line and Page
 conversion in real WebKit, in addition to the fractional Pixel sequence.
+
+## Page affordances (2026-10-04)
+
+This records the affordances branch before native input landed. The rebased
+producer now delivers host pointer events through the native input executor;
+the observation-only limits below describe the original evidence run.
+
+Validated Luchs `482abfa4aebfc78ba1c40bcc507eddfc15b0f437` on the same
+macOS 26.6 arm64 desktop, Apple Swift 6.4, Rust 1.98.0 and SDL 2.32.70.
+Both Rust dependency pins and the reference viewer use Jackstay
+`e5ad1a61e7317e0c6287216330b6104c5d415e96` (ABI 0.13). The previous 0.12 pin
+could not attach to this viewer's six-object CPU setup; updating both pins
+resolved that mismatch.
+
+```sh
+# Jackstay
+cargo build --locked -p jackstay --features backend-macos
+cmake -S tools/capture-viewer-sdl -B build/viewer
+cmake --build build/viewer
+# Luchs
+scripts/build-helper.sh
+cargo test --workspace --locked
+cargo test --locked --test live_macos --test live_macos_affordances -- --ignored --nocapture
+target/debug/luchs --endpoint=luchs-affordances-live --size=800x600 testdata/affordances.html
+# Use the endpoint printed by Luchs:
+capture-viewer-sdl --source-socket "$source_path" --observe \
+  --affordances required --log-affordances
+```
+
+The 39 ordinary Rust tests passed, including the required-affordances fake-host
+integration, all four initial domains and changed domains, helper replacement
+withdrawals, URL accept/reject cases, and navigation/scroll forwarding.
+The six ignored native tests also passed. Native Swift tests cover both snapshot
+recovery and the independent engine URL policy, including symlink escape.
+Clippy with denied warnings and the Rust 1.98 formatter passed.
+
+The new native test uses the production CLI, helper and a required-affordances
+host. It observed readiness after the first frame, a timed title update, and a
+DOM height change from 2221 to 2421 CSS px. The document viewport was 623x463,
+including WebKit's native scrollbar space. A small step reached y=40, a large
+step reached y=456 (WebKit rounds the requested 416.7 px delta), and an oversized
+position clamped to y=1958. Horizontal set-position reached x=200. Local-file
+load, back, forward and reload completed. Back restored the history-cached title
+and previous scroll position; a forced `pageshow` publication prevents the
+helper's navigation reset from hiding that restored state. A javascript load
+left the channel open and wrote a rejection to the console log.
+
+### SDL navigation and scroll
+
+The production transparent helper published the fixture to the real Retina SDL
+viewer. Desktop inspection showed the heading, native content, toolbar and
+scrollbar overlays; scale hints changed the source from 800x600 to 1600x1200.
+Typing the second fixture's file URL into the viewer changed its title to
+`Second affordance page`. Back restored `Luchs affordances`, forward restored
+the second page, and reload produced another console-log navigation completion.
+A vertical track click changed the published position from y=0 to y=524 and
+moved the overlay thumb with the content.
+
+A visible scratch helper was used for native page pointer and scroll interaction.
+It changed only the activation policy and window presentation: a titled,
+mouse-accepting, opaque window at normal level. WebKit configuration, capture,
+protocol, state scripts and native page behavior were the production sources.
+An app bundle around the unchanged SDL binary made it selectable by desktop
+automation. This grants no Jackstay input authority.
+
+A desktop thumb gesture subsequently published y=1136. The desktop automation
+pipe closed during that gesture, so both-axis drag confirmation also used a
+scratch copy of the viewer's SDL self-test driver. It computed tracks from the
+real frame rectangle, including the navigation strip, then queued hover, down,
+held motion and up through the normal SDL event routing. The live helper and
+all producer/consumer transport code were unchanged. It reported:
+
+```text
+LIVE_DRAG_QUEUED axis=y from=276,51 to=276,144 target=1136.67
+LIVE_DRAG_QUEUED axis=x from=107,204 to=181,204 target=431.667
+LIVE_DRAG_PASS y=1136 target_y=1136.67 x=431 target_x=431.667
+acquired_frames=200
+```
+
+The differences are WebKit's integer scroll positions. Native page scrolling
+also produced successive scroll snapshots and the SDL overlay followed them.
+Wheel input through an observation-only Jackstay connection remains outside this
+slice; it belongs to input admission in #2.
+
+### Cursor and title
+
+The visible helper's text field, link and empty region produced cursor tags
+10 (`text`), 5 (`pointer`) and 1 (`default`) in the SDL log. The script now tracks
+mousedown as well as mousemove, and the native window accepts mouse-moved events,
+so a click establishes the last pointer position even without a preceding move.
+Clicking the fixture's title button changed both the window snapshot and SDL's
+visible window title to `Title changed by the page`. Cursor checks use native
+page interaction because the observation-only host cannot deliver pointer input.
+
+Both source runs stopped on SIGTERM, and their viewers logged completed
+affordances cleanup. Flotilla retains the live drag and cursor/title logs as
+raw-test-output artifacts; the scratch driver and visible helper are outside
+the repository.
+
+### Review follow-up
+
+HTTP and HTTPS navigation may target any host even when the startup page is
+local, as required by issue #3. The directory boundary applies only to file
+URLs; no optional remote-host allowlist was added. Swift readiness is advisory
+until Rust confirms producer publication. The command-size allowance names the
+26-byte maximum JSON command-ID field; the four-byte record prefix is outside
+the JSON limit.
+
+Review regressions add a parentless-startup-path error, Swift localhost-file
+acceptance and localhost/directory-symlink escape rejection, and replacement
+state arriving before the producer polls withdrawals. The latter checks that
+all four withdrawals precede fresh snapshots and queued old commands are cleared.
+
+The follow-up passed all 41 ordinary Rust tests, Clippy, formatting, helper
+compilation and Swift policy tests. The production live page-affordances test
+passed again after the review changes.
+
+## Combined input and affordances after rebase (2026-10-04)
+
+Rebased onto `d6ee0dc`, which landed native input from PR #16. The producer keeps
+its input executor, capabilities and cleanup path alongside complete page-state
+snapshots and navigation/scroll verbs. Swift decodes both command families,
+including the explicit CodingKeys for navigation and document scrolling. The
+older validation sections above retain the revisions and limits of their runs.
+
+The pinned CI commands passed locally: Rust 1.98 formatting, stable locked
+workspace build and all 54 ordinary tests, Clippy with warnings denied, helper
+compilation, and Swift recovery/URL policy tests. All eight ignored live macOS
+tests passed sequentially. The added combined test uses one v2 connection with
+required SourceText input and required affordances. It verifies a trusted native
+click at x=20,y=20, cursor `text`, UTF-8 insertion `é🙂` reflected in window title,
+document y=40 positioning, a file load to `Combined next`, and clean input close.
+
+A host motion probe completed as executed but produced no DOM mousemove on this
+machine. The existing direct native motion path is retained; investigation is
+tracked in [#19](https://github.com/flotilla-org/luchs/issues/19). Native clicks do
+produce pointer-driven cursor state, and the original visible-window cursor
+checks remain recorded above. No experimental hover routing is included.

@@ -1,3 +1,4 @@
+pub mod affordances;
 pub mod cli;
 pub mod helper;
 pub mod protocol;

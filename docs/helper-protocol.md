@@ -91,14 +91,21 @@ An invalid ack schema is a protocol failure.
 | `key_down`, `key_up` | Apply a key operation with `press`, `key_code`, `modifiers`, `repeat`, `cooperative`, and optional `logical` characters |
 | `text` | Apply UTF-8 `text`; `cooperative=true` pairs a deferred printable press, otherwise uses the web view's `NSTextInputClient.insertText` |
 | `cleanup` | `scope=pointer` releases held buttons; `scope=all` also releases held keys and discards undelivered printable presses, before ack |
+| `navigation.back`, `navigation.forward`, `navigation.reload`, `navigation.stop` | Apply the matching method to the active WKWebView |
+| `navigation.load` | Validate `url` and submit the load to the active view; rejected loads log and ack internally without replying to the host |
+| `navigation.rejected` | Log a load rejected by Rust's URL policy; no navigation |
+| `scroll.set_position` | Clamp `position` on `axis` (`x` or `y`) to the current document range, then `scrollTo` |
+| `scroll.scroll_by_step` | Move `axis` by 40 CSS px (`step: small`) or 90% of its viewport (`large`), with `direction: increment/decrement` |
 | Any other type | Apply no effect; ack `unsupported` |
 
 For a local page, reload reads the file and calls `loadHTMLString` with the page
 URL as base URL. A read failure gets `failed`. Remote pages use
 `reloadFromOrigin`. An executed reload confirms submission to WebKit, not
 navigation completion or delivery of a replacement frame; later navigation
-errors go to the console log. Producer-state publication beyond capture activity belongs to later slices.
-There is no JavaScript event-synthesis path or SDL keycode vocabulary.
+errors go to the console log. Navigation verbs use the active view;
+`navigation.reload` calls `reloadFromOrigin`, while the file-watch `reload`
+command retains its original main-page behavior. Native input uses no
+JavaScript event-synthesis path or SDL keycode vocabulary.
 
 ## Native input
 
@@ -154,6 +161,47 @@ acknowledging it. Failed or timed-out cleanup quarantines replacement admission.
 Geometry changes trigger pointer cleanup through the toolkit. A capture-scale
 change retains logical geometry and therefore does not cancel holds.
 
+## Page state records
+
+Each page event publishes one complete domain body, never a delta:
+
+```json
+{"domain":"window","body":{"title":"Page title","requested_size":null,"ready":true}}
+{"domain":"navigation","body":{"url":"https://example.com/","title":"Page title","can_go_back":false,"can_go_forward":false,"loading":false,"capabilities":{}}}
+{"domain":"cursor","body":{"shape":"pointer"}}
+{"domain":"scroll","body":{"x":{"scrollable":false,"content_length":800,"viewport_length":800,"position":0},"y":{"scrollable":true,"content_length":2200,"viewport_length":600,"position":400},"capabilities":{}}}
+```
+
+Rust supplies the navigation and scroll capability flags. The helper observes
+WKWebView title, URL, history and loading with KVO. Readiness latches after the
+first navigation finishes and a frame reaches the producer toolkit. The Rust
+bridge treats helper readiness as advisory and also gates it on frame publication. The active popup owns these
+domains until it closes, then the main view republishes its state.
+
+The main-frame script reads only `document.scrollingElement`, in CSS pixels.
+Scroll, resize, mutation, resource load and ResizeObserver notifications coalesce
+into one animation-frame update. History-cache `pageshow` forces republication.
+Overflow hidden/clip axes publish zero and are not scrollable. Content/viewport
+lengths remain available. Rust clamps all positions again before publishing.
+
+The cursor script computes CSS under the last page pointer position and posts
+only when the resolved shape changes. Auto resolves to pointer on links, text
+on editable content or text hit by the pointer, and default elsewhere. Unknown
+shapes become default. Host pointer motion reaches the script through native
+WebKit input events.
+
+Host navigation/scroll verbs enter a bounded 64-command queue; the CLI dispatches
+one verb at a time without waiting on WebKit in the producer callback. Helper
+acks are internal and never become host replies. Unsupported verbs are ignored.
+When replacing a helper, `Source::helper_stopped` discards pending frames and
+commands and withdraws all four domains before new state is published. Normal
+CLI EOF preserves the final frame for its existing flush, then closes the source.
+
+Rust parses host loads as URLs and canonicalizes file paths under the startup
+page directory. The helper independently validates schemes and symlink
+containment at the engine boundary. HTTP/HTTPS may target any host, including from a local startup page; remote
+startup pages grant no file authority. Rejected loads log to the helper console file.
+
 ## Rust dispatch and timeouts
 
 One reader thread demultiplexes all socket records. It keeps at most two queued
@@ -161,8 +209,8 @@ frames, dropping the oldest when full so frame reception cannot block ack
 routing. `Helper::dropped_frames()` counts mailbox drops; the CLI logs the
 count at shutdown when nonzero. `Helper::spawn_with_state` delivers state objects
 to a callback on that reader thread; the callback must return promptly. A
-callback panic terminates and reaps the helper and reports a stream error. This slice
-reserves the tag and accepts opaque objects. Issue #3 will define their fields.
+callback panic terminates and reaps the helper and reports a stream error. State objects use the complete domain schema below; unrelated objects are ignored
+by the page-state bridge.
 
 `Helper::send_command` registers a per-ID waiter before writing any bytes and
 returns a `PendingCommand`. Multiple commands can be outstanding and acks can

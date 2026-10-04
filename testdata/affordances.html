@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Luchs affordances</title>
+<style>
+  html, body { margin: 0; color: #edf1f5; background: #152333; font: 18px system-ui; }
+  main { width: 1400px; height: 2200px; padding: 24px; box-sizing: border-box; }
+  a, input, button { display: block; margin: 18px 0; }
+  a { color: #83caff; width: fit-content; }
+  input, button { font: inherit; padding: 12px; }
+  .empty { width: 300px; height: 100px; border: 1px solid #567; cursor: auto; }
+  .marker { position: absolute; top: 1000px; left: 700px; padding: 30px; background: #354b62; }
+</style>
+<main>
+  <h1>Document scroll and page state</h1>
+  <a href="affordances-next.html">Open the second page</a>
+  <input placeholder="Text cursor" aria-label="Text cursor">
+  <button onclick="document.title='Title changed by the page'">Change title</button>
+  <button onclick="window.scrollTo(350,700)">Scroll the document</button>
+  <div class="empty" aria-label="Default cursor area"></div>
+  <div class="marker">Document position 700, 1000</div>
+</main>

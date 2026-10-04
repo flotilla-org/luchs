@@ -1,6 +1,7 @@
 //! Helper frames and native input callbacks for the native producer toolkit.
 use crate::{
     Result,
+    affordances::{LoadPolicy, PageState},
     capture::CapturePolicy,
     cli::Cli,
     helper::{CommandOutcome, Helper},
@@ -28,6 +29,8 @@ use std::{
 
 struct PageProducer {
     input: crate::input::Executor,
+    page: PageState,
+    load_policy: LoadPolicy,
     recycled: Arc<Mutex<Vec<Vec<u8>>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
@@ -54,7 +57,11 @@ impl Producer for PageProducer {
         }
         self.input.execute(work)
     }
+    fn snapshots(&mut self) -> Vec<jackstay::affordances::Snapshot> {
+        self.page.snapshots()
+    }
     fn recycle(&mut self, frame: jackstay_producer::Frame) {
+        self.page.frame_published();
         let mut pool = self.recycled.lock().unwrap();
         if pool.len() < 4 {
             pool.push(frame.bytes);
@@ -65,6 +72,13 @@ impl Producer for PageProducer {
     }
     fn affordance(&mut self, event: jackstay::affordances::Event) {
         use jackstay::affordances::{Domain, Event, Presentation, Snapshot};
+        if let Event::Verb(verb) = event {
+            self.page.verb(verb, &self.load_policy);
+            if let Some(wake) = self.wake.lock().unwrap().as_ref() {
+                wake.notify();
+            }
+            return;
+        }
         let hint = match event {
             Event::Snapshot(Snapshot::Presentation(hint)) => hint,
             Event::Snapshot(Snapshot::Withdraw(Domain::Presentation)) | Event::Closed => {
@@ -80,6 +94,7 @@ impl Producer for PageProducer {
 }
 
 pub struct Source {
+    pub page: PageState,
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
     recycled: Arc<Mutex<Vec<Vec<u8>>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
@@ -91,6 +106,17 @@ pub struct Source {
 }
 impl Source {
     pub fn bind(name: &str, width: u32, height: u32) -> Result<(Self, String)> {
+        Self::bind_page(name, width, height, None)
+    }
+
+    pub fn bind_page(
+        name: &str,
+        width: u32,
+        height: u32,
+        page_path: Option<&std::path::Path>,
+    ) -> Result<(Self, String)> {
+        let load_policy = LoadPolicy::new(page_path)?;
+        let page = PageState::default();
         crate::protocol::validate_size(width, height)?;
         let endpoint = Endpoint::new(Scope::User, name, Transport::LocalStream)?;
         let path = endpoint.render()?;
@@ -122,6 +148,8 @@ impl Source {
                 ..Config::default()
             },
             PageProducer {
+                page: page.clone(),
+                load_policy,
                 recycled: recycled.clone(),
                 presentation: presentation.clone(),
                 wake: wake.clone(),
@@ -139,6 +167,7 @@ impl Source {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         Ok((
             Self {
+                page,
                 wake,
                 input_sender,
                 recycled,
@@ -189,6 +218,14 @@ impl Source {
             }
         }
         Ok(())
+    }
+
+    pub fn helper_stopped(&self) {
+        self.latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.page.helper_stopped();
     }
 
     pub fn presentation(&self) -> Option<jackstay::affordances::Presentation> {
@@ -285,13 +322,15 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         .endpoint
         .clone()
         .unwrap_or_else(|| format!("luchs-{}", std::process::id()));
-    let (mut source, path) = Source::bind(&name, cli.size.0, cli.size.1)?;
+    let (mut source, path) =
+        Source::bind_page(&name, cli.size.0, cli.size.1, cli.local_page().as_deref())?;
     // Capture the baseline before exposing readiness or starting the helper;
     // an edit after startup must not become the baseline and miss its reload.
     let watched = cli.local_page().filter(|_| cli.watch);
     let mut modified = watched.as_deref().and_then(modification_time);
     let changed = Arc::new(AtomicBool::new(false));
     let activity = changed.clone();
+    let page = source.page.clone();
     let mut helper = Helper::spawn_with_state(&mut cli.helper_command()?, move |state| {
         if state
             .get("capture_changed")
@@ -300,6 +339,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         {
             activity.store(true, Ordering::Release);
         }
+        page.helper_state(state);
     })?;
     source.attach_input(&helper);
     *source.wake.lock().unwrap() = Some(helper.wake_handle());
@@ -313,6 +353,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     let mut received = 0;
     let mut last_reload_failure = None;
     let mut command_socket_closed = false;
+    let mut pending_verb: Option<crate::helper::PendingCommand> = None;
     while !stop.load(Ordering::Relaxed) {
         // Acks, page activity and presentation callbacks interrupt this wait.
         // The 250 ms ceiling services file-watch and signal flags even hidden.
@@ -343,6 +384,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
+                source.page.helper_stopped();
                 helper.finish()?;
                 stats.poll(&mut pending_capture, &mut policy)?;
                 if received == 0 {
@@ -381,6 +423,19 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
                 fingerprint = None;
             }
             policy.presentation(hint.visible, scale, Instant::now());
+        }
+        if pending_verb
+            .as_ref()
+            .is_some_and(|p| p.poll().is_some() || p.expired())
+        {
+            pending_verb = None;
+        }
+        if pending_verb.is_none() && !command_socket_closed && !helper.ended() {
+            if let Some(command) = source.page.command() {
+                pending_verb =
+                    Some(helper.send_json_command(command, crate::helper::COMMAND_TIMEOUT)?);
+                policy.wake(Instant::now());
+            }
         }
         stats.poll(&mut pending_capture, &mut policy)?;
         if pending_capture.is_none()

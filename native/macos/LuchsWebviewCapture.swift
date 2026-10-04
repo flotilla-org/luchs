@@ -247,8 +247,14 @@ private struct HelperCommand: Decodable {
     let button: Int?, press: UInt64?, keyCode: UInt16?, modifiers: UInt32?
     let logical: String?, text: String?, scope: String?
     let cooperative: Bool?, isRepeat: Bool?
+    let url: String?
+    let axis: String?
+    let position: Double?
+    let step: String?
+    let direction: String?
     enum CodingKeys: String, CodingKey {
         case id, type, scale, visible, x, y, dx, dy, button, press, modifiers, logical, text, scope, cooperative
+        case url, axis, position, step, direction
         case pointDx = "point_dx", pointDy = "point_dy", keyCode = "key_code", isRepeat = "repeat"
     }
 }
@@ -294,6 +300,18 @@ private func emitAck(_ id: UInt64, outcome: String, detail: String? = nil, captu
     }
 }
 
+private func emitState(_ object: [String: Any]) {
+    guard let json = try? JSONSerialization.data(withJSONObject: object), json.count + 1 <= maxControlBytes else {
+        debugLog("ignoring oversized or invalid page state")
+        return
+    }
+    var record = littleEndian(UInt32(json.count + 1))
+    record.append(3)
+    record.append(json)
+    let bytes = record
+    writer.async { writeData(bytes) }
+}
+
 private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     // A local file, or an http(s) page. The default website data store is
     // persistent for this binary (under ~/Library/WebKit), so a login made in
@@ -311,6 +329,8 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     // flow that posts its result back to the opener completes.
     private var popups: [WKWebView] = []
     private var activeView: WKWebView? { popups.last ?? webView }
+    private var observations: [NSKeyValueObservation] = []
+    private var navigationFinished = false
     private var loaded = false
     private var everLoadedMain = false
     private let snapshotConfiguration = WKSnapshotConfiguration()
@@ -349,6 +369,9 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             WKUserScript(source: consoleForwarderSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         configuration.userContentController.add(self, name: "luchsConsole")
         configuration.userContentController.add(self, name: "luchsActivity")
+        configuration.userContentController.add(self, name: "luchsState")
+        configuration.userContentController.addUserScript(
+            WKUserScript(source: pageAffordancesScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         configuration.userContentController.addUserScript(
             WKUserScript(source: activityScriptSource, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         configuration.userContentController.addUserScript(
@@ -374,6 +397,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         // above fullscreen apps, so it is never occluded and never seen. The
         // capture reads the view through takeSnapshot, not the screen.
         captureWindow.alphaValue = 0.0
+        captureWindow.acceptsMouseMovedEvents = true
         captureWindow.ignoresMouseEvents = true
         captureWindow.hasShadow = false
         captureWindow.level = .screenSaver
@@ -387,6 +411,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
         self.webView = view
         self.window = captureWindow
+        observePage(view)
 
         startInputReader()
         if pageURL.isFileURL {
@@ -407,6 +432,12 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let body = message.body as? [String: Any] else { return }
+        if message.name == "luchsState" {
+            guard message.frameInfo.isMainFrame, message.webView === activeView,
+                  let domain = body["domain"] as? String, ["cursor", "scroll"].contains(domain) else { return }
+            emitState(body)
+            return
+        }
         if message.name == "luchsActivity" {
             reportActivity()
             return
@@ -418,13 +449,20 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         debugLog("navigation start \(webView.url?.absoluteString ?? "?")")
-        if webView === activeView { loaded = false }
+        if webView === activeView {
+            loaded = false
+            resetDocumentState()
+        }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         debugLog("navigation finish \(webView.url?.absoluteString ?? "?")")
         if webView === self.webView { everLoadedMain = true }
-        if webView === activeView { loaded = true }
+        if webView === activeView {
+            loaded = true
+            navigationFinished = true
+            publishPageState()
+        }
         reportActivity()
     }
 
@@ -440,6 +478,8 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         popup.uiDelegate = self
         container.addSubview(popup)
         popups.append(popup)
+        loaded = false
+        observePage(popup)
         debugLog("popup \(popups.count) opened for \(navigationAction.request.url?.absoluteString ?? "?")")
         return popup
     }
@@ -448,6 +488,11 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         guard let index = popups.firstIndex(of: webView) else { return }
         popups.remove(at: index)
         webView.removeFromSuperview()
+        if let view = activeView {
+            loaded = !view.isLoading
+            observePage(view)
+            view.evaluateJavaScript("window.__luchsPublishPageState && window.__luchsPublishPageState()", completionHandler: nil)
+        }
         debugLog("popup \(index + 1) closed by the page; \(popups.isEmpty ? "main view" : "popup \(popups.count)") is active")
     }
 
@@ -473,6 +518,39 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             loaded = true
             reportActivity()
         }
+    }
+
+    private func observePage(_ view: WKWebView) {
+        // One observer set owns the active view. Replacement invalidates the
+        // previous set; popup closure reattaches it to the newly active view.
+        observations = [
+            view.observe(\.title, options: [.new]) { [weak self] _, _ in self?.publishPageState() },
+            view.observe(\.url, options: [.new]) { [weak self] _, _ in self?.publishPageState() },
+            view.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in self?.publishPageState() },
+            view.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in self?.publishPageState() },
+            view.observe(\.isLoading, options: [.new]) { [weak self] _, _ in self?.publishPageState() }
+        ]
+        publishPageState()
+        resetDocumentState()
+    }
+
+    private func publishPageState() {
+        guard let view = activeView else { return }
+        // Advisory helper readiness: emittedFrames counts socket writes. Rust
+        // additionally gates this on publication through the producer toolkit.
+        // It stays true after the first completed navigation; later loads use
+        // navigation.loading to describe progress without hiding the window.
+        emitState(["domain": "window", "body": ["title": view.title as Any? ?? NSNull(),
+            "requested_size": NSNull(), "ready": navigationFinished && emittedFrames > 0]])
+        emitState(["domain": "navigation", "body": ["url": view.url?.absoluteString as Any? ?? NSNull(),
+            "title": view.title as Any? ?? NSNull(), "can_go_back": view.canGoBack,
+            "can_go_forward": view.canGoForward, "loading": view.isLoading, "capabilities": [:]]])
+    }
+
+    private func resetDocumentState() {
+        emitState(["domain": "cursor", "body": ["shape": "default"]])
+        let axis: [String: Any] = ["scrollable": false, "content_length": 0, "viewport_length": 0, "position": 0]
+        emitState(["domain": "scroll", "body": ["x": axis, "y": axis, "capabilities": [:]]])
     }
 
     private func startInputReader() {
@@ -537,6 +615,51 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             emitAck(command.id, outcome: "executed")
         case "ping":
             emitAck(command.id, outcome: "executed")
+        case "navigation.rejected":
+            debugLog("rejected navigation.load: \(command.url ?? "missing URL")")
+            emitAck(command.id, outcome: "executed")
+        case "navigation.back", "navigation.forward", "navigation.reload", "navigation.stop", "navigation.load":
+            guard let view = activeView else {
+                emitAck(command.id, outcome: "failed", detail: "active view unavailable")
+                return
+            }
+            switch command.type {
+            case "navigation.back": view.goBack()
+            case "navigation.forward": view.goForward()
+            case "navigation.reload": view.reloadFromOrigin()
+            case "navigation.stop": view.stopLoading()
+            default:
+                guard let value = command.url, let url = allowedNavigationURL(value, startupPage: pageURL) else {
+                    debugLog("rejected navigation.load: \(command.url ?? "missing URL")")
+                    emitAck(command.id, outcome: "executed")
+                    return
+                }
+                if url.isFileURL {
+                    view.loadFileURL(url, allowingReadAccessTo: pageURL.deletingLastPathComponent())
+                } else { view.load(URLRequest(url: url)) }
+            }
+            emitAck(command.id, outcome: "executed")
+        case "scroll.set_position", "scroll.scroll_by_step":
+            guard let view = activeView, let axis = command.axis, ["x", "y"].contains(axis),
+                  command.type != "scroll.set_position" || command.position?.isFinite == true,
+                  command.type != "scroll.scroll_by_step" ||
+                    (["small", "large"].contains(command.step ?? "") && ["increment", "decrement"].contains(command.direction ?? "")) else {
+                emitAck(command.id, outcome: "failed", detail: "invalid scroll command")
+                return
+            }
+            var object: [String: Any] = ["type": command.type, "axis": axis]
+            if let position = command.position { object["position"] = position }
+            if let step = command.step { object["step"] = step }
+            if let direction = command.direction { object["direction"] = direction }
+            guard let data = try? JSONSerialization.data(withJSONObject: object), let json = String(data: data, encoding: .utf8) else {
+                emitAck(command.id, outcome: "failed", detail: "could not encode scroll command")
+                return
+            }
+            view.evaluateJavaScript("window.__luchsScrollCommand && window.__luchsScrollCommand(\(json))") { _, error in
+                if let error {
+                    emitAck(command.id, outcome: "failed", detail: error.localizedDescription)
+                } else { emitAck(command.id, outcome: "executed") }
+            }
         case "reload":
             guard let mainView = webView else {
                 emitAck(command.id, outcome: "failed", detail: "main view unavailable")
@@ -920,6 +1043,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.emittedFrames += 1
+                if self.emittedFrames == 1 { self.publishPageState() }
                 emitAck(command.id, outcome: "executed", capture: ["published": true,
                     "snapshot_ns": UInt64(snapshotSeconds * 1e9), "publish_ns": UInt64(elapsed * 1e9)])
                 if self.frameCount > 0 && self.emittedFrames >= self.frameCount {
