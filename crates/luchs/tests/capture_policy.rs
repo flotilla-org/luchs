@@ -21,6 +21,7 @@ fn exact_idle_threshold_and_command_wake() {
     let mut policy = CapturePolicy::new(30, now);
     policy.completed(false, now + IDLE_AFTER);
     assert!(!policy.due(now + IDLE_AFTER + IDLE_INTERVAL - Duration::from_nanos(1)));
+    assert_eq!(policy.wait(now + IDLE_AFTER), IDLE_INTERVAL);
     assert!(policy.due(now + IDLE_AFTER + IDLE_INTERVAL));
     policy.wake(now + IDLE_AFTER);
     assert!(policy.due(now + IDLE_AFTER));
@@ -194,7 +195,7 @@ while True:
     hints
         .publish(Presentation {
             visible: false,
-            scale: 2.,
+            scale: 1e9,
             ..Default::default()
         })
         .unwrap();
@@ -203,6 +204,14 @@ while True:
             .iter()
             .any(|v| v["type"] == "presentation" && v["visible"] == false)
     });
+    let hint = events(&log)
+        .into_iter()
+        .find(|v| v["type"] == "presentation" && v["visible"] == false)
+        .unwrap();
+    assert_eq!(
+        hint["scale"], 1.,
+        "invalid scale must preserve previous scale while hiding"
+    );
     std::thread::sleep(Duration::from_millis(100));
     let count = events(&log).len();
     std::thread::sleep(Duration::from_millis(600));

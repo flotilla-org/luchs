@@ -16,6 +16,9 @@ All lengths use unsigned 32-bit little-endian integers. JSON uses UTF-8 and
 contains no required trailing newline. A length excludes its own four bytes.
 Readers must accept split reads and multiple records in one read. Clean EOF
 occurs only between records; a partial prefix or payload is a protocol failure.
+A peer reset at a record boundary is treated as EOF, including on Linux when a
+helper exits with an unread command. Complete final frames are drained and the
+helper's exit status is still checked.
 
 | Direction | Envelope | Limit |
 | --- | --- | --- |
@@ -51,6 +54,12 @@ that thread. A serial background socket writer keeps records from interleaving
 and keeps blocking writes off WebKit's main thread. The command reader admits
 one command at a time and waits for its acknowledgement to drain; a capture's
 bitmap stays borrowed until its write completes. This bounds queued work.
+While navigation is loading, capture acks immediately without a snapshot or
+report, so it cannot hold ping, reload or presentation behind page loading.
+Navigation completion reports activity and wakes capture. The existing initial
+navigation-failure handlers terminate with a diagnostic; subsequent failures
+remain logged. A backing-scale or navigation change during a snapshot discards
+that transient result and wakes a retry.
 An `executed` ack confirms actual application of the command; enqueueing work
 for another thread is not execution.
 
@@ -161,7 +170,7 @@ A successful capture ack adds an optional report without changing its outcome:
 
 `published` means the helper sent a changed frame. Snapshot time measures the
 WebKit API latency; publish time includes drawing, hashing and draining a changed
-frame to the socket. Skipped frames have zero publish time. A hidden capture ack
+frame to the socket. Skipped frames have zero publish time. A hidden or loading capture ack
 has no report because no snapshot was taken. `--stats` reports completed snapshots,
 Jackstay publications, unchanged skips and the mean times at exit. An in-flight
 capture interrupted by shutdown is not counted as completed.
@@ -170,18 +179,24 @@ The helper compares an FNV-1a fingerprint of native pixels with its last sent
 frame. A match emits no frame record. Rust also fingerprints dimensions, stride
 and pixels before Jackstay publication, guarding against renderer duplicates.
 After one second without a changed frame or wake, captures back off from `--fps`
-(default 30) to 2 fps. A changed frame restores full rate. Reload and presentation
+(default 30) to 2 fps. Deadlines run from snapshot completion, so the effective
+frame rate is lower than `--fps` by snapshot and publish latency. The Rust loop
+sleeps until the next capture or 250 ms watch/signal deadline; acks, page activity
+and presentation callbacks interrupt its condition-variable wait immediately.
+A changed frame restores full rate. Reload and presentation
 commands wake capture; every non-capture helper command also reports a wake.
 Page mutations, editing, selection, focus, scroll and resize report
 `{"capture_changed":true}` on the existing state tag. Active CSS animations report
-activity from a page rAF probe; an idle static page's probe sends nothing. The
+activity from a page rAF probe started by animation/transition events or DOM
+mutations. The probe stops when no animation is running, so static pages have
+no continuous animation-probe work. The
 caret updates from page events, with a deferred rAF after native default actions.
 Canvas/video changes without a DOM or animation signal are discovered by the idle
 probe, within its 500 ms interval, then restore full rate.
 
 The toolkit's `affordance()` callback forwards host presentation hints. Last
 received hints win; withdrawal or channel closure restores defaults. An oversized
-scale hint is logged and ignored. `visible=false` stops capture requests and
+scale hint is logged and retains the previous scale; its visibility still applies. `visible=false` stops capture requests and
 suppresses queued publications while leaving the WebKit window ordered in, so
 its page clock keeps running. `visible=true` requests an immediate capture and
 invalidates the previous fingerprint so an unchanged image can be presented
@@ -207,7 +222,7 @@ scripts/build-helper.sh
 cargo test --locked --test live_macos -- --ignored --nocapture
 ```
 
-The tests check native ping/reload acks, a full-range u64 ID, zero-status exit on
+The tests check slow-loading capture/ping/presentation responsiveness and initial navigation failure, native ping/reload acks, a full-range u64 ID, zero-status exit on
 socket EOF, and verify that `--watch` publishes
 changed page pixels through the real CLI, Swift helper, and Jackstay producer.
 See [live macOS evidence](live-macos.md) for the recorded run.

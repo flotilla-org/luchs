@@ -194,26 +194,34 @@ private func writeData(_ data: Data) {
     data.withUnsafeBytes { if let base = $0.baseAddress { writeBytes(base, $0.count) } }
 }
 
-// Mutations and native edit/selection events wake capture. CSS animations also
-// signal activity; a static page's rAF probe never sends a wake on its own.
+// Mutations and native edit/selection events wake capture. Probe animation
+// activity only while something is running; static pages have no rAF loop.
 private let activityScriptSource = """
 (() => {
-  let last = 0;
+  let last = -Infinity, probing = false;
   const changed = () => {
     const now = performance.now();
     if (now - last < 30) return;
     last = now;
     window.webkit.messageHandlers.luchsActivity.postMessage({capture_changed: true});
   };
-  new MutationObserver(changed).observe(document, {subtree:true, childList:true, attributes:true, characterData:true});
+  const animations = () => {
+    if (document.getAnimations().some(a => a.playState === "running")) {
+      changed();
+      requestAnimationFrame(animations);
+    } else { probing = false; }
+  };
+  const probe = () => {
+    if (!probing) { probing = true; requestAnimationFrame(animations); }
+  };
+  new MutationObserver(() => { changed(); probe(); }).observe(document, {subtree:true, childList:true, attributes:true, characterData:true});
   for (const name of ["input", "change", "selectionchange", "focusin", "focusout", "scroll", "resize"]) {
     window.addEventListener(name, changed, true);
   }
-  const animations = () => {
-    if (document.getAnimations().some(a => a.playState === "running")) changed();
-    requestAnimationFrame(animations);
-  };
-  requestAnimationFrame(animations);
+  for (const name of ["animationstart", "transitionrun"]) {
+    window.addEventListener(name, () => { changed(); probe(); }, true);
+  }
+  probe();
 })();
 """
 
@@ -294,7 +302,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     private var popups: [WKWebView] = []
     private var activeView: WKWebView? { popups.last ?? webView }
     private var loaded = false
-    private var pendingCapture: HelperCommand?
+    private var everLoadedMain = false
     private let snapshotConfiguration = WKSnapshotConfiguration()
     private var configuredScale = 0.0
     private var configuredBacking = 0.0
@@ -399,15 +407,14 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         debugLog("navigation start \(webView.url?.absoluteString ?? "?")")
+        if webView === activeView { loaded = false }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         debugLog("navigation finish \(webView.url?.absoluteString ?? "?")")
-        loaded = true
-        if let command = pendingCapture {
-            pendingCapture = nil
-            capture(command)
-        }
+        if webView === self.webView { everLoadedMain = true }
+        if webView === activeView { loaded = true }
+        reportActivity()
     }
 
     // window.open and target=_blank get a real second view (without a
@@ -448,8 +455,12 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         let cancelled = (error as NSError).domain == NSURLErrorDomain && (error as NSError).code == NSURLErrorCancelled
         let view = webView === self.webView ? "main view" : "popup"
         debugLog("navigation failed in \(view): \(error.localizedDescription)")
-        if webView === self.webView && !loaded && !cancelled {
+        if webView === self.webView && !everLoadedMain && !cancelled {
             fail("navigation failed: \(error.localizedDescription)")
+        }
+        if webView === activeView && everLoadedMain && !cancelled {
+            loaded = true
+            reportActivity()
         }
     }
 
@@ -494,7 +505,9 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         if command.type != "capture" { reportActivity() }
         switch command.type {
         case "capture":
-            if !loaded { pendingCapture = command } else { capture(command) }
+            // Never park the command reader behind page loading. Navigation
+            // completion wakes Rust; ping, reload and visibility remain usable.
+            if !loaded { emitAck(command.id, outcome: "executed") } else { capture(command) }
         case "presentation":
             guard let scale = command.scale, let visible = command.visible,
                   scale.isFinite, scale > 0 else {
@@ -752,8 +765,22 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         let start = ProcessInfo.processInfo.systemUptime
         webView.takeSnapshot(with: snapshot) { [weak self] image, error in
             guard let self else { return }
-            if let error { fail("snapshot failed: \(error.localizedDescription)") }
-            guard let image else { fail("snapshot returned no image") }
+            // A display-scale or navigation change can invalidate an in-flight
+            // snapshot. Retry through the scheduler rather than terminating.
+            if (self.window?.backingScaleFactor ?? 1) != backing || !self.loaded {
+                self.configuredBacking = 0
+                emitAck(command.id, outcome: "executed")
+                self.reportActivity()
+                return
+            }
+            if let error {
+                emitAck(command.id, outcome: "failed", detail: "snapshot failed: \(error.localizedDescription)")
+                return
+            }
+            guard let image else {
+                emitAck(command.id, outcome: "failed", detail: "snapshot returned no image")
+                return
+            }
             let elapsed = ProcessInfo.processInfo.systemUptime - start
             self.emit(image, width: requestedWidth, height: requestedHeight, command: command, snapshotSeconds: elapsed)
         }
@@ -792,7 +819,8 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         let publishStart = ProcessInfo.processInfo.systemUptime
         guard let representation = image.representations.first,
               representation.pixelsWide == width, representation.pixelsHigh == height else {
-            fail("snapshot representation does not match requested pixel size")
+            emitAck(command.id, outcome: "failed", detail: "snapshot representation does not match requested pixel size")
+            return
         }
         prepareBitmap(image, width: width, height: height)
         guard let bitmap, let context, let graphicsContext else { fail("bitmap unavailable") }
@@ -847,6 +875,8 @@ private enum LuchsWebviewCapture {
         let width = args.count >= 3 ? (Int(args[2]) ?? defaultWidth) : defaultWidth
         let height = args.count >= 4 ? (Int(args[3]) ?? defaultHeight) : defaultHeight
         let frameCount = args.count >= 5 ? (Int(args[4]) ?? defaultFrameCount) : defaultFrameCount
+        // Retain the positional fps argument for older launchers. Rust now
+        // schedules capture commands; the helper only validates this argument.
         let fps = args.count >= 6 ? (Int(args[5]) ?? defaultFps) : defaultFps
         guard width > 0 && height > 0 && width <= maxFrameBytes / 4 && height <= maxFrameBytes / 4 / width && frameCount >= 0 && fps > 0 else {
             fail("width, height, and fps must be positive; BGRA pixels must fit 64 MiB; frame_count must be zero or positive")

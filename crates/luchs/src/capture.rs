@@ -29,6 +29,13 @@ impl CapturePolicy {
     pub fn due(&self, now: Instant) -> bool {
         self.visible && now >= self.next
     }
+    pub fn wait(&self, now: Instant) -> Duration {
+        if self.visible {
+            self.next.saturating_duration_since(now)
+        } else {
+            IDLE_INTERVAL
+        }
+    }
     pub fn completed(&mut self, published: bool, now: Instant) {
         if published {
             self.active = now;

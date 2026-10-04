@@ -29,6 +29,7 @@ use std::{
 struct Observation {
     recycled: Arc<Mutex<Vec<Vec<u8>>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
+    wake: Arc<Mutex<Option<crate::helper::Wake>>>,
     logical_size: (f64, f64),
     latest: Arc<Mutex<Option<jackstay_producer::Frame>>>,
 }
@@ -64,10 +65,14 @@ impl Producer for Observation {
             _ => return,
         };
         *self.presentation.lock().unwrap() = Some(hint);
+        if let Some(wake) = self.wake.lock().unwrap().as_ref() {
+            wake.notify();
+        }
     }
 }
 
 pub struct Source {
+    wake: Arc<Mutex<Option<crate::helper::Wake>>>,
     recycled: Arc<Mutex<Vec<Vec<u8>>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     source: jackstay_producer::Source,
@@ -83,6 +88,7 @@ impl Source {
         let latest = Arc::new(Mutex::new(None));
         let recycled = Arc::new(Mutex::new(Vec::with_capacity(4)));
         let presentation = Arc::new(Mutex::new(None));
+        let wake = Arc::new(Mutex::new(None));
         let source = Builder::new(
             endpoint,
             ArenaConfig {
@@ -109,6 +115,7 @@ impl Source {
             Observation {
                 recycled: recycled.clone(),
                 presentation: presentation.clone(),
+                wake: wake.clone(),
                 logical_size: (f64::from(width), f64::from(height)),
                 latest: latest.clone(),
             },
@@ -121,6 +128,7 @@ impl Source {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         Ok((
             Self {
+                wake,
                 recycled,
                 presentation,
                 source,
@@ -273,6 +281,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             activity.store(true, Ordering::Release);
         }
     })?;
+    *source.wake.lock().unwrap() = Some(helper.wake_handle());
     let mut policy = CapturePolicy::new(cli.fps, Instant::now());
     let mut pending_capture: Option<crate::helper::PendingCommand> = None;
     let mut fingerprint = None;
@@ -282,10 +291,23 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     let mut last_poll = Instant::now();
     let mut received = 0;
     let mut last_reload_failure = None;
+    let mut command_socket_closed = false;
     while !stop.load(Ordering::Relaxed) {
-        match helper.receive(Duration::from_millis(5)) {
+        // Acks, page activity and presentation callbacks interrupt this wait.
+        // The 250 ms ceiling services file-watch and signal flags even hidden.
+        let watch_wait = Duration::from_millis(250).saturating_sub(last_poll.elapsed());
+        let timeout = if let Some(command) = pending_capture.as_ref() {
+            command.remaining().min(watch_wait)
+        } else if command_socket_closed {
+            watch_wait
+        } else {
+            policy.wait(Instant::now()).min(watch_wait)
+        };
+        match helper.receive_event(timeout) {
             Ok(frame) => {
                 let frame = frame?;
+                // Defend publication against duplicate frames from alternate or
+                // misbehaving helpers; native Swift already skips its own duplicates.
                 let mut hash = DefaultHasher::new();
                 (frame.header.width, frame.header.height, frame.header.stride).hash(&mut hash);
                 frame.pixels.hash(&mut hash);
@@ -313,28 +335,45 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             policy.wake(Instant::now());
         }
         if let Some(hint) = source.presentation() {
-            // Reject a hint that cannot fit a capture buffer before sending it.
+            // Keep visibility authoritative even if the proposed scale is too large.
             let width = (cli.size.0 as f64 * hint.scale).round();
             let height = (cli.size.1 as f64 * hint.scale).round();
-            if width >= 1.0
+            let scale = if width >= 1.0
                 && height >= 1.0
                 && width * height * 4.0 <= crate::protocol::MAX_FRAME_BYTES as f64
             {
-                let outcome = helper.send_json_command(serde_json::json!({"type": "presentation", "visible": hint.visible, "scale": hint.scale}), crate::helper::COMMAND_TIMEOUT)?.wait();
-                if outcome != CommandOutcome::Executed {
-                    return Err(format!("renderer presentation: {outcome:?}").into());
-                }
-                if hint.visible && (!policy.visible || hint.scale != policy.scale) {
-                    fingerprint = None;
-                }
-                policy.presentation(hint.visible, hint.scale, Instant::now());
+                hint.scale
             } else {
                 eprintln!("luchs: ignoring scale hint beyond capture limits");
+                policy.scale
+            };
+            let outcome = helper.send_json_command(serde_json::json!({"type": "presentation", "visible": hint.visible, "scale": scale}), crate::helper::COMMAND_TIMEOUT)?.wait();
+            if outcome != CommandOutcome::Executed {
+                return Err(format!("renderer presentation: {outcome:?}").into());
             }
+            if hint.visible && (!policy.visible || scale != policy.scale) {
+                fingerprint = None;
+            }
+            policy.presentation(hint.visible, scale, Instant::now());
         }
         stats.poll(&mut pending_capture, &mut policy)?;
-        if pending_capture.is_none() && !helper.ended() && policy.due(Instant::now()) {
-            pending_capture = Some(helper.send_command("capture", Duration::from_secs(10))?);
+        if pending_capture.is_none()
+            && !command_socket_closed
+            && !helper.ended()
+            && policy.due(Instant::now())
+        {
+            match helper.send_command("capture", Duration::from_secs(10)) {
+                Ok(command) => pending_capture = Some(command),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    command_socket_closed = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         if last_poll.elapsed() >= Duration::from_millis(250) {
             if let Some(path) = &watched {

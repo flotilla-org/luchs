@@ -405,3 +405,98 @@ fn stdout_is_unused_and_cannot_corrupt_socket_framing() {
     ));
     assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"bgra");
 }
+
+#[test]
+fn idle_event_wait_sleeps_and_host_ack_and_state_wake_it() {
+    let mut helper = python(
+        r#"
+a = raw_command()
+ack(a)
+time.sleep(.1)
+control(3, {'capture_changed': True})
+raw_command()
+"#,
+    );
+    let start = Instant::now();
+    assert!(matches!(
+        helper.receive_event(Duration::from_millis(500)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(
+        start.elapsed() >= Duration::from_millis(450),
+        "idle receive kept waking"
+    );
+    let wake = helper.wake_handle();
+    let notify = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        wake.notify();
+    });
+    let start = Instant::now();
+    assert!(matches!(
+        helper.receive_event(TIMEOUT),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "presentation did not interrupt sleep"
+    );
+    notify.join().unwrap();
+    let pending = helper.send_command("ping", TIMEOUT).unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        helper.receive_event(TIMEOUT),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(pending.wait(), CommandOutcome::Executed);
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "ack did not wake scheduler"
+    );
+    let start = Instant::now();
+    assert!(matches!(
+        helper.receive_event(TIMEOUT),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(
+        start.elapsed() < Duration::from_millis(300),
+        "page activity did not wake scheduler"
+    );
+}
+
+#[test]
+fn inherited_socket_survives_closed_parent_stdio() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "child_closed_stdio"])
+        .env("LUCHS_CLOSED_STDIO_CHILD", "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "closed-stdio helper transport failed: {status}"
+    );
+}
+
+#[test]
+#[ignore = "spawned by inherited_socket_survives_closed_parent_stdio"]
+fn child_closed_stdio() {
+    assert_eq!(std::env::var("LUCHS_CLOSED_STDIO_CHILD").unwrap(), "1");
+    // Isolated process: force socketpair to allocate descriptors 0 and 1.
+    unsafe {
+        for fd in 0..=2 {
+            libc::close(fd);
+        }
+    }
+    let mut helper = python(
+        r#"
+assert transport.fileno() > 2
+cmd = raw_command()
+frame()
+ack(cmd)
+"#,
+    );
+    let pending = helper.send_command("ping", TIMEOUT).unwrap();
+    assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"rgba");
+    assert_eq!(pending.wait(), CommandOutcome::Executed);
+    helper.finish().unwrap();
+    std::process::exit(0);
+}

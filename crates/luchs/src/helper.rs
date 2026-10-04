@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, BufReader, Read, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     panic::{AssertUnwindSafe, catch_unwind},
@@ -54,6 +54,7 @@ struct StreamState {
     ignored_acks: u64,
     error: Option<io::Error>,
     ended: bool,
+    wake_pending: bool,
     pending: HashMap<u64, AckWaiter>,
 }
 
@@ -61,6 +62,17 @@ struct StreamState {
 struct Shared {
     state: Mutex<StreamState>,
     ready: Condvar,
+}
+
+/// Interrupt the event-aware receive wait after a host-side presentation change.
+#[derive(Clone)]
+pub struct Wake(Arc<Shared>);
+impl Wake {
+    pub fn notify(&self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.wake_pending = true;
+        self.0.ready.notify_all();
+    }
 }
 
 /// A per-id waiter. Dropping or timing it out releases its bounded slot; a
@@ -81,8 +93,12 @@ impl PendingCommand {
         self.ack.try_recv().ok()
     }
 
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
     pub fn expired(&self) -> bool {
-        Instant::now() >= self.deadline
+        self.remaining().is_zero()
     }
 
     pub fn wait(self) -> CommandOutcome {
@@ -134,6 +150,16 @@ impl Helper {
         let (socket, inherited) = UnixStream::pair()?;
         socket.set_nonblocking(true)?;
         let input = socket.try_clone()?;
+        // Stdio setup may overwrite descriptors 0..=2 before pre_exec runs.
+        // Duplicate above that range even when the launching process closed stdio.
+        let inherited = {
+            // SAFETY: fcntl duplicates a live descriptor; UnixStream owns the result.
+            let fd = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { UnixStream::from_raw_fd(fd) }
+        };
         let fd = inherited.as_raw_fd();
         command.env("LUCHS_HELPER_FD", fd.to_string());
         // SAFETY: only async-signal-safe fcntl runs between fork and exec. The
@@ -185,6 +211,8 @@ impl Helper {
                                 state.ignored_acks = state.ignored_acks.saturating_add(1);
                             }
                         }
+                        state.wake_pending = true;
+                        stream.ready.notify_all();
                     }
                     Ok(Some(Record::State(event))) => {
                         if catch_unwind(AssertUnwindSafe(|| state_event(event))).is_err() {
@@ -195,6 +223,7 @@ impl Helper {
                             );
                             break;
                         }
+                        Wake(stream.clone()).notify();
                     }
                     result => {
                         end_stream(&stream, &process, result.err());
@@ -212,7 +241,25 @@ impl Helper {
         })
     }
 
+    pub fn wake_handle(&self) -> Wake {
+        Wake(self.shared.clone())
+    }
+
     pub fn receive(&self, timeout: Duration) -> Result<io::Result<Frame>, RecvTimeoutError> {
+        self.receive_inner(timeout, false)
+    }
+
+    /// Return Timeout early for an ack, state or host notification, so the
+    /// scheduler can re-evaluate deadlines without polling between captures.
+    pub fn receive_event(&self, timeout: Duration) -> Result<io::Result<Frame>, RecvTimeoutError> {
+        self.receive_inner(timeout, true)
+    }
+
+    fn receive_inner(
+        &self,
+        timeout: Duration,
+        events: bool,
+    ) -> Result<io::Result<Frame>, RecvTimeoutError> {
         let deadline = Instant::now() + timeout;
         let mut state = self.shared.state.lock().unwrap();
         loop {
@@ -224,6 +271,9 @@ impl Helper {
             }
             if state.ended {
                 return Err(RecvTimeoutError::Disconnected);
+            }
+            if events && std::mem::take(&mut state.wake_pending) {
+                return Err(RecvTimeoutError::Timeout);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -298,6 +348,14 @@ impl Helper {
             &bytes,
             deadline,
         ) {
+            // A peer that exits with unread commands can reset the socket on
+            // Linux. Let the reader drain complete final frames and verify exit.
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ) {
+                return Err(error);
+            }
             // A partial command cannot be retried on the same byte stream.
             end_stream(
                 &self.shared,

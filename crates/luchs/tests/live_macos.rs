@@ -31,6 +31,19 @@ fn page(path: &std::path::Path, color: &str) {
     .unwrap();
 }
 
+fn request_frame(helper: &mut Helper) -> luchs::protocol::Frame {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        assert_eq!(helper.command("capture", TIMEOUT), CommandOutcome::Executed);
+        match helper.receive(Duration::from_millis(100)) {
+            Ok(frame) => return frame.unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("renderer stopped: {error}"),
+        }
+        assert!(Instant::now() < deadline, "no native frame");
+    }
+}
+
 #[test]
 #[ignore = "requires built Swift helper and a live macOS desktop"]
 fn native_ping_reload_and_watch() {
@@ -46,9 +59,7 @@ fn native_ping_reload_and_watch() {
             .args(["32", "32", "0", "15"]),
     )
     .unwrap();
-    let pending = helper.send_command("capture", TIMEOUT).unwrap();
-    let initial = helper.receive(TIMEOUT).unwrap().unwrap();
-    assert_eq!(pending.wait(), CommandOutcome::Executed);
+    let initial = request_frame(&mut helper);
     assert_eq!(initial.header.width, 32);
     assert_eq!(&initial.pixels[..4], &[0, 0, 255, 255]);
     assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Executed);
@@ -224,9 +235,7 @@ fn native_skip_scale_and_hidden_capture() {
             .args(["32", "32", "0", "30"]),
     )
     .unwrap();
-    let pending = helper.send_command("capture", TIMEOUT).unwrap();
-    assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().header.width, 32);
-    assert_eq!(pending.wait(), CommandOutcome::Executed);
+    assert_eq!(request_frame(&mut helper).header.width, 32);
     assert_eq!(helper.command("capture", TIMEOUT), CommandOutcome::Executed);
     assert!(matches!(
         helper.receive(Duration::from_millis(100)),
@@ -290,10 +299,79 @@ fn native_fractional_scale_preserves_odd_pixel_sizes() {
                 .wait(),
             CommandOutcome::Executed
         );
-        let pending = helper.send_command("capture", TIMEOUT).unwrap();
-        let frame = helper.receive(TIMEOUT).unwrap().unwrap();
+        let frame = request_frame(&mut helper);
         assert_eq!((frame.header.width, frame.header.height), expected);
         assert_eq!(&frame.pixels[..4], &[0, 0, 255, 255]);
-        assert_eq!(pending.wait(), CommandOutcome::Executed);
     }
+}
+
+#[test]
+#[ignore = "requires built Swift helper and a live macOS desktop"]
+fn native_capture_during_slow_load_does_not_block_commands() {
+    use std::{io::Read, net::TcpListener, sync::mpsc};
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", server.local_addr().unwrap());
+    let (ready, waiting) = mpsc::channel();
+    let serve = std::thread::spawn(move || {
+        // WebKit can open and abandon a speculative connection before GET.
+        let _socket = loop {
+            let (mut socket, _) = server.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = [0; 4096];
+            if matches!(socket.read(&mut request), Ok(n) if n > 0) {
+                break socket;
+            }
+        };
+        ready.send(()).unwrap();
+        // Leave navigation outstanding, then close without an HTTP response.
+        std::thread::sleep(Duration::from_secs(2));
+    });
+    let renderer =
+        std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
+    let mut helper = Helper::spawn(
+        Command::new(renderer)
+            .arg(url)
+            .args(["32", "32", "0", "30"]),
+    )
+    .unwrap();
+    waiting.recv_timeout(TIMEOUT).unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        helper.command("capture", Duration::from_secs(1)),
+        CommandOutcome::Executed
+    );
+    assert_eq!(
+        helper.command("ping", Duration::from_secs(1)),
+        CommandOutcome::Executed
+    );
+    assert_eq!(helper.reload().unwrap(), CommandOutcome::Executed);
+    assert_eq!(
+        helper
+            .send_json_command(
+                serde_json::json!({"type":"presentation", "scale":1., "visible":false}),
+                Duration::from_secs(1)
+            )
+            .unwrap()
+            .wait(),
+        CommandOutcome::Executed
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "loading stalled later commands"
+    );
+    serve.join().unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while !helper.ended() {
+        assert!(
+            Instant::now() < deadline,
+            "navigation failure left helper stuck"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        helper.finish().is_err(),
+        "first navigation failure must report an error"
+    );
 }

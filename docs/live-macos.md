@@ -215,3 +215,22 @@ These runs establish the removal of repeated static publications and the lower
 idle snapshot rate. Direct arena writing and its copy-count measurement remain
 #13's work. Small command/ack JSON and WebKit's own snapshot objects still
 allocate; full-frame bitmap and receive buffers are reused after warm-up.
+
+### Review regressions
+
+The review follow-up replaces the 5 ms Rust receive poll with a deadline wait
+interrupted by acknowledgement, state and presentation notifications. A fake
+helper test verifies a 500 ms quiet wait, then prompt host, ack and page wakes.
+The production watch/signal ceiling is 250 ms. Another subprocess test starts
+with descriptors 0, 1 and 2 closed and verifies the inherited socket still
+carries frames and acknowledgements. Visibility also applies when a requested
+scale exceeds the capture limit.
+
+The live macOS suite includes an HTTP server that deliberately leaves loading
+unfinished for two seconds. Capture acknowledges without taking a snapshot;
+ping, reload and presentation still complete within one second. Closing that
+server without a response exercises the existing initial navigation failure
+handlers and confirms that the helper exits with a diagnostic. Static pages now
+stop the animation activity probe instead of running `getAnimations()` on every
+animation frame. Snapshot completion also checks the window backing scale and
+navigation state, discarding an invalidated snapshot and requesting a retry.

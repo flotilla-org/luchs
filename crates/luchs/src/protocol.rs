@@ -96,6 +96,9 @@ pub fn read_record_reusing(
             Ok(0) => return Ok(None),
             Ok(_) => break,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // Unix peers closing with unread commands may reset the connection.
+            // This is EOF only at a record boundary; partial records still fail.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
             Err(error) => return Err(error),
         }
     }
