@@ -1,43 +1,180 @@
 use std::{
+    collections::{HashMap, VecDeque},
     io::{self, BufReader, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    sync::{
+        Arc, Condvar, Mutex,
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use crate::protocol::{Frame, read_frame};
+use crate::protocol::{Ack, AckOutcome, Frame, Record, encode_command, read_record};
+use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
+    fs::{OFlags, fcntl_getfl, fcntl_setfl},
+};
 
-/// Owns every child resource, including the bounded stdout reader.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+pub const MAX_PENDING_COMMANDS: usize = 64;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Executed,
+    Unsupported,
+    Failed(Option<String>),
+    Uncertain,
+}
+
+impl CommandOutcome {
+    pub fn execution_outcome(&self) -> jackstay::input::Outcome {
+        use jackstay::input::Outcome;
+        match self {
+            Self::Executed => Outcome::Executed,
+            Self::Unsupported => Outcome::Unsupported,
+            Self::Failed(_) => Outcome::Rejected,
+            Self::Uncertain => Outcome::Uncertain,
+        }
+    }
+}
+
+struct AckWaiter {
+    send: SyncSender<Ack>,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+struct StreamState {
+    frames: VecDeque<Frame>,
+    dropped_frames: u64,
+    ignored_acks: u64,
+    error: Option<io::Error>,
+    ended: bool,
+    pending: HashMap<u64, AckWaiter>,
+}
+
+#[derive(Default)]
+struct Shared {
+    state: Mutex<StreamState>,
+    ready: Condvar,
+}
+
+/// A per-id waiter. Dropping or timing it out releases its bounded slot; a
+/// later ack cannot change the returned outcome or satisfy another command.
+pub struct PendingCommand {
+    id: u64,
+    ack: Receiver<Ack>,
+    shared: Arc<Shared>,
+    deadline: Instant,
+}
+
+impl PendingCommand {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn wait(self) -> CommandOutcome {
+        // The reader timestamps acceptance against this same deadline. A queued
+        // ack accepted in time stays valid even if wait() is called later;
+        // recv_timeout bounds how long we wait for an ack not yet received.
+        match self
+            .ack
+            .recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(ack) => match ack.outcome {
+                AckOutcome::Executed => CommandOutcome::Executed,
+                AckOutcome::Unsupported => CommandOutcome::Unsupported,
+                AckOutcome::Failed => CommandOutcome::Failed(ack.detail),
+            },
+            Err(_) => CommandOutcome::Uncertain,
+        }
+    }
+}
+
+impl Drop for PendingCommand {
+    fn drop(&mut self) {
+        self.shared.state.lock().unwrap().pending.remove(&self.id);
+    }
+}
+
+/// Owns the process and a single stdout demultiplexer. Frames never block ack
+/// dispatch: the bounded two-frame mailbox drops the oldest on overflow.
 pub struct Helper {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
-    frames: Option<Receiver<io::Result<Frame>>>,
+    shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
+    next_id: u64,
 }
 
 impl Helper {
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_with_state(command, |_| {})
+    }
+
+    /// The callback runs on the reader thread and must return promptly. State
+    /// is an opaque JSON object until the affordance slice defines its schema.
+    /// A callback panic terminates/reaps the helper and reports a stream error.
+    pub fn spawn_with_state(
+        command: &mut Command,
+        mut state_event: impl FnMut(serde_json::Map<String, serde_json::Value>) + Send + 'static,
+    ) -> io::Result<Self> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
-        let stdin = child.stdin.take();
-        let (send, frames) = mpsc::sync_channel(1);
+        let stdin = child.stdin.take().expect("piped stdin");
+        // Bound command writes too, including a helper that stops reading stdin.
+        if let Err(error) =
+            fcntl_getfl(&stdin).and_then(|flags| fcntl_setfl(&stdin, flags | OFlags::NONBLOCK))
+        {
+            kill_and_reap(&mut child);
+            return Err(error.into());
+        }
+        let child = Arc::new(Mutex::new(child));
+        let shared = Arc::new(Shared::default());
+        let stream = shared.clone();
+        let process = child.clone();
         let reader = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                match read_frame(&mut reader) {
-                    Ok(Some(frame)) => {
-                        if send.send(Ok(frame)).is_err() {
+                match read_record(&mut reader) {
+                    Ok(Some(Record::Frame(frame))) => {
+                        let mut state = stream.state.lock().unwrap();
+                        if state.frames.len() == 2 {
+                            state.frames.pop_front();
+                            state.dropped_frames = state.dropped_frames.saturating_add(1);
+                        }
+                        state.frames.push_back(frame);
+                        stream.ready.notify_one();
+                    }
+                    Ok(Some(Record::Ack(ack))) => {
+                        let mut state = stream.state.lock().unwrap();
+                        match state.pending.remove(&ack.id) {
+                            Some(waiter) if Instant::now() <= waiter.deadline => {
+                                let _ = waiter.send.try_send(ack);
+                            }
+                            _ => {
+                                state.ignored_acks = state.ignored_acks.saturating_add(1);
+                            }
+                        }
+                    }
+                    Ok(Some(Record::State(event))) => {
+                        if catch_unwind(AssertUnwindSafe(|| state_event(event))).is_err() {
+                            end_stream(
+                                &stream,
+                                &process,
+                                Some(io::Error::other("state callback panicked")),
+                            );
                             break;
                         }
                     }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = send.send(Err(error));
+                    result => {
+                        end_stream(&stream, &process, result.err());
                         break;
                     }
                 }
@@ -45,32 +182,100 @@ impl Helper {
         });
         Ok(Self {
             child,
-            stdin,
-            frames: Some(frames),
+            stdin: Some(stdin),
+            shared,
             reader: Some(reader),
+            next_id: 1,
         })
     }
 
     pub fn receive(&self, timeout: Duration) -> Result<io::Result<Frame>, RecvTimeoutError> {
-        self.frames
-            .as_ref()
-            .expect("running helper")
-            .recv_timeout(timeout)
+        let deadline = Instant::now() + timeout;
+        let mut state = self.shared.state.lock().unwrap();
+        loop {
+            if let Some(error) = state.error.take() {
+                return Ok(Err(error));
+            }
+            if let Some(frame) = state.frames.pop_front() {
+                return Ok(Ok(frame));
+            }
+            if state.ended {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            state = self.shared.ready.wait_timeout(state, left).unwrap().0;
+        }
     }
 
-    pub fn reload(&mut self) -> io::Result<()> {
-        self.stdin
-            .as_mut()
-            .expect("running helper")
-            .write_all(b"{\"type\":\"reload\"}\n")
+    pub fn dropped_frames(&self) -> u64 {
+        self.shared.state.lock().unwrap().dropped_frames
+    }
+
+    /// Counts unmatched and late acks, including helper duplicate replies.
+    pub fn ignored_acks(&self) -> u64 {
+        self.shared.state.lock().unwrap().ignored_acks
+    }
+
+    pub fn send_command(&mut self, kind: &str, timeout: Duration) -> io::Result<PendingCommand> {
+        let id = self.next_id;
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("command ids exhausted"))?;
+        let bytes = encode_command(id, kind)?;
+        let (send, ack) = mpsc::sync_channel(1);
+        let deadline = Instant::now() + timeout;
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            if state.ended {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "helper stopped"));
+            }
+            if state.pending.len() >= MAX_PENDING_COMMANDS {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "too many pending commands",
+                ));
+            }
+            state.pending.insert(id, AckWaiter { send, deadline });
+        }
+        self.next_id = next;
+        let pending = PendingCommand {
+            id,
+            ack,
+            shared: self.shared.clone(),
+            deadline,
+        };
+        if let Err(error) = write_command(
+            self.stdin.as_mut().expect("running helper"),
+            &bytes,
+            deadline,
+        ) {
+            // A partial command cannot be retried on the same byte stream.
+            end_stream(
+                &self.shared,
+                &self.child,
+                Some(io::Error::new(error.kind(), error.to_string())),
+            );
+            return Err(error);
+        }
+        Ok(pending)
+    }
+
+    pub fn command(&mut self, kind: &str, timeout: Duration) -> CommandOutcome {
+        self.send_command(kind, timeout)
+            .map_or(CommandOutcome::Uncertain, PendingCommand::wait)
+    }
+
+    pub fn reload(&mut self) -> io::Result<CommandOutcome> {
+        Ok(self.send_command("reload", COMMAND_TIMEOUT)?.wait())
     }
 
     pub fn finish(&mut self) -> io::Result<()> {
-        // EOF can precede process exit slightly, but a helper closing stdout and
-        // hanging must not make shutdown wait forever.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if let Some(status) = self.child.try_wait()? {
+            if let Some(status) = self.child.lock().unwrap().try_wait()? {
                 return if status.success() {
                     Ok(())
                 } else {
@@ -85,24 +290,79 @@ impl Helper {
     }
 }
 
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn end_stream(shared: &Shared, process: &Mutex<Child>, error: Option<io::Error>) {
+    if error.is_some() {
+        // Fail immediately even when nobody is receiving frames or awaiting acks.
+        kill_and_reap(&mut process.lock().unwrap());
+    }
+    let mut state = shared.state.lock().unwrap();
+    // EOF can race a command-write failure; never erase its root cause.
+    if error.is_some() {
+        state.error = error;
+    }
+    state.ended = true;
+    state.pending.clear();
+    shared.ready.notify_all();
+}
+
+fn write_command(stdin: &mut ChildStdin, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "command write timed out",
+            ));
+        }
+        match stdin.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "helper stdin closed",
+                ));
+            }
+            Ok(len) => bytes = &bytes[len..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // Keep each wait representable on platforms with millisecond
+                // poll limits, while the outer loop enforces the full deadline.
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(1));
+                let timeout = Timespec::try_from(remaining).expect("at most one second");
+                let mut fds = [PollFd::new(&*stdin, PollFlags::OUT)];
+                if let Err(error) = poll(&mut fds, Some(&timeout)) {
+                    if error != rustix::io::Errno::INTR {
+                        return Err(error.into());
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 impl Drop for Helper {
     fn drop(&mut self) {
-        // Unblock a reader waiting to send before terminating/reaping the child.
-        self.frames.take();
         self.stdin.take();
-        if matches!(self.child.try_wait(), Ok(None)) {
-            // SAFETY: the unreaped child owns this PID. SIGTERM also terminates
-            // the unchanged Swift helper, whose stdin EOF is not a quit command.
+        let mut child = self.child.lock().unwrap();
+        if matches!(child.try_wait(), Ok(None)) {
+            // SAFETY: the unreaped child owns this PID.
             unsafe {
-                libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
             }
             let deadline = Instant::now() + Duration::from_millis(500);
-            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_and_reap(&mut child);
+        drop(child);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }

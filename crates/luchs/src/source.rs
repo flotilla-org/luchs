@@ -1,5 +1,10 @@
 //! Helper frames and observation-only callbacks for the native producer toolkit.
-use crate::{Result, cli::Cli, helper::Helper, protocol::Frame};
+use crate::{
+    Result,
+    cli::Cli,
+    helper::{CommandOutcome, Helper},
+    protocol::Frame,
+};
 use jackstay::{
     acquisition::arena::{ArenaConfig, FrameDescriptor},
     input::{Config, Outcome, Work},
@@ -163,6 +168,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     eprintln!("luchs: source ready: {path}");
     let mut last_poll = Instant::now();
     let mut received = 0;
+    let mut last_reload_failure = None;
     while !stop.load(Ordering::Relaxed) {
         match helper.receive(Duration::from_millis(50)) {
             Ok(frame) => {
@@ -183,14 +189,35 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
                 let now = modification_time(path);
                 // Keep the last known time across an atomic-save disappearance.
                 if now.is_some() && now != modified {
-                    helper.reload()?;
-                    modified = now;
+                    match helper.reload()? {
+                        CommandOutcome::Executed => {
+                            modified = now;
+                            last_reload_failure = None;
+                        }
+                        CommandOutcome::Unsupported => {
+                            return Err("renderer reload: unsupported".into());
+                        }
+                        outcome => {
+                            if last_reload_failure.as_ref() != Some(&outcome) {
+                                eprintln!("luchs: renderer reload: {outcome:?}; retrying");
+                                last_reload_failure = Some(outcome);
+                            }
+                        }
+                    }
                 }
             }
             last_poll = Instant::now();
         }
     }
     eprintln!("luchs: stopped after {received} frames");
+    let dropped = helper.dropped_frames();
+    if dropped > 0 {
+        eprintln!("luchs: helper dropped {dropped} frames");
+    }
+    let ignored = helper.ignored_acks();
+    if ignored > 0 {
+        eprintln!("luchs: helper ignored {ignored} unmatched or late acks");
+    }
     match source.stop() {
         // Zero-capability input never acquires held state. Rejecting cleanup is
         // expected for this observation-only producer, not a failed CLI run.
