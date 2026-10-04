@@ -122,8 +122,11 @@ impl Source {
         // EOF can follow the final helper frame immediately. Let the pump take
         // that frame before stopping; joining it completes that publication.
         // The pinned toolkit pump calls frame() unconditionally, even without
-        // peers. is_finished() also breaks the wait after a fatal pump error.
-        while !self.source.is_finished()
+        // peers. Bound this flush to one second in case that contract changes;
+        // ordered toolkit shutdown still runs if the final frame is skipped.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline
+            && !self.source.is_finished()
             && self
                 .latest
                 .lock()
@@ -149,11 +152,13 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("luchs-{}", std::process::id()));
     let (mut source, path) = Source::bind(&name, cli.size.0, cli.size.1)?;
+    // Capture the baseline before exposing readiness or starting the helper;
+    // an edit after startup must not become the baseline and miss its reload.
+    let watched = cli.local_page().filter(|_| cli.watch);
+    let mut modified = watched.as_deref().and_then(modification_time);
     let mut helper = Helper::spawn(&mut cli.helper_command()?)?;
     println!("{path}");
     eprintln!("luchs: source ready: {path}");
-    let watched = cli.local_page().filter(|_| cli.watch);
-    let mut modified = watched.as_deref().and_then(modification_time);
     let mut last_poll = Instant::now();
     let mut received = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -187,6 +192,8 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     match source.stop() {
         // Zero-capability input never acquires held state. Rejecting cleanup is
         // expected for this observation-only producer, not a failed CLI run.
+        // jackstay-producer at ed785976 returns io::Error without a typed
+        // cleanup variant. This exact message is pinned by the CLI test.
         Err(error) if error.to_string() == "input cleanup failed" => {
             eprintln!("luchs: shutdown: {error}");
         }

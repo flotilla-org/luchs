@@ -84,8 +84,11 @@ content, an inherited limitation. A live macOS desktop session is required.
 
 The Swift viewport stays fixed for a run. The Rust protocol accepts changes in
 frame dimensions or stride and reconfigures the Jackstay CPU allocation before
-publishing the replacement. A capacity-paused replacement waits for retirement;
-it never overwrites leased pixels. Frames are limited to 64 MiB and the producer's
+publishing the replacement. The toolkit manages capacity-paused replacements,
+retrying reconfiguration on later helper frames as old allocations retire;
+it never overwrites leased pixels. The callback keeps only the latest helper
+frame, so intermediate frames may be skipped. Shutdown allows up to one second
+for the final queued frame before starting ordered toolkit teardown. Frames are limited to 64 MiB and the producer's
 allocation budget is 1 GiB. SIGINT, SIGTERM, EOF and errors all close the endpoint
 and stop/reap the helper. The toolkit drains for up to five seconds; consumers
 must retire their mappings and leases when media closes. Drain or input cleanup
