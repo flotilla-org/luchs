@@ -168,6 +168,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     eprintln!("luchs: source ready: {path}");
     let mut last_poll = Instant::now();
     let mut received = 0;
+    let mut last_reload_failure = None;
     while !stop.load(Ordering::Relaxed) {
         match helper.receive(Duration::from_millis(50)) {
             Ok(frame) => {
@@ -191,12 +192,16 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
                     match helper.reload()? {
                         CommandOutcome::Executed => {
                             modified = now;
+                            last_reload_failure = None;
                         }
                         CommandOutcome::Unsupported => {
                             return Err("renderer reload: unsupported".into());
                         }
                         outcome => {
-                            eprintln!("luchs: renderer reload: {outcome:?}; retrying");
+                            if last_reload_failure.as_ref() != Some(&outcome) {
+                                eprintln!("luchs: renderer reload: {outcome:?}; retrying");
+                                last_reload_failure = Some(outcome);
+                            }
                         }
                     }
                 }

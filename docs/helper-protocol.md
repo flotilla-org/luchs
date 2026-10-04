@@ -100,7 +100,7 @@ each command. `execution_outcome()` maps `executed` to Jackstay `Executed`,
 `unsupported` to `Unsupported`, `failed` to `Rejected`, and timeout/disconnection
 to `Uncertain`. The CLI uses a one-second reload deadline. Unsupported reload
 is fatal because it means the helper cannot implement watch. Failed or uncertain
-reloads log a diagnostic and retain the last successfully handled modification
+reloads log a diagnostic when the failure outcome changes and retain the last successfully handled modification
 time, retrying on the next 250 ms poll even if the file has not changed again.
 Malformed output and command-write failures remain fatal.
 

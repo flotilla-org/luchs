@@ -356,6 +356,9 @@ else:
     ack(first, '{}')
 second = command()
 assert second['type'] == 'reload' and second['id'] != first['id']
+if '{}' == 'failed':
+    ack(second, 'failed')
+    second = command()
 ack(second)
 with open(log, 'a') as out: out.write('recovered\n')
 while True:
@@ -363,6 +366,7 @@ while True:
     except EOFError: break
 "#,
                 log.display(),
+                first_outcome,
                 first_outcome,
                 first_outcome
             )
@@ -432,5 +436,10 @@ while True:
         _ => "renderer reload: unsupported",
     };
     assert!(stderr.contains(expected), "{stderr}");
+    assert_eq!(
+        stderr.matches(expected).count(),
+        1,
+        "duplicate retry diagnostics: {stderr}"
+    );
     assert!(!std::path::Path::new(endpoint.trim()).exists());
 }
