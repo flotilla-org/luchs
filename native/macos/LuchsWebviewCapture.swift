@@ -160,6 +160,52 @@ private let caretScriptSource = """
 })();
 """
 
+// All stdout records are emitted on the main thread, so pixels and control
+// records cannot interleave. Lengths include the tag; all integers are LE.
+private let maxControlBytes = 128 * 1024
+private let maxFrameBytes = 64 * 1024 * 1024
+
+private struct HelperCommand: Decodable {
+    let id: UInt64
+    let type: String
+}
+
+private func littleEndian(_ value: UInt32) -> Data {
+    var value = value.littleEndian
+    return withUnsafeBytes(of: &value) { Data($0) }
+}
+
+private func readExactly(_ count: Int, allowEOF: Bool = false) -> Data? {
+    var result = Data()
+    while result.count < count {
+        let chunk: Data
+        do {
+            chunk = try FileHandle.standardInput.read(upToCount: count - result.count) ?? Data()
+        } catch {
+            fail("command read failed: \(error.localizedDescription)")
+        }
+        if chunk.isEmpty {
+            if allowEOF && result.isEmpty { return nil }
+            fail("truncated command record")
+        }
+        result.append(chunk)
+    }
+    return result
+}
+
+private func emitAck(_ id: UInt64, outcome: String, detail: String? = nil) {
+    precondition(Thread.isMainThread)
+    var object: [String: Any] = ["id": id, "outcome": outcome]
+    if let detail { object["detail"] = detail }
+    guard let json = try? JSONSerialization.data(withJSONObject: object), json.count + 1 <= maxControlBytes else {
+        fail("could not encode acknowledgement")
+    }
+    var record = littleEndian(UInt32(json.count + 1))
+    record.append(2)
+    record.append(json)
+    FileHandle.standardOutput.write(record)
+}
+
 private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     // A local file, or an http(s) page. The default website data store is
     // persistent for this binary (under ~/Library/WebKit), so a login made in
@@ -322,193 +368,64 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     private func startInputReader() {
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            while let line = readLine() {
-                guard !line.isEmpty else { continue }
-                DispatchQueue.main.async { [weak self] in
-                    self?.handleInputLine(line)
+            // Only one command is queued at a time. Waiting for main-thread
+            // handling bounds memory even if the parent floods stdin.
+            while let prefix = readExactly(4, allowEOF: true) {
+                let size = prefix.enumerated().reduce(UInt32(0)) { value, byte in
+                    value | (UInt32(byte.element) << (8 * byte.offset))
+                }
+                guard size > 0 && size <= UInt32(maxControlBytes) else {
+                    fail("invalid command record length")
+                }
+                guard let data = readExactly(Int(size)),
+                      let command = try? JSONDecoder().decode(HelperCommand.self, from: data),
+                      !command.type.isEmpty else {
+                    fail("invalid command JSON")
+                }
+                DispatchQueue.main.sync { [weak self] in
+                    guard let self else { fail("command controller stopped") }
+                    self.handleCommand(command)
                 }
             }
+            DispatchQueue.main.async { NSApplication.shared.terminate(nil) }
         }
     }
 
-    private func handleInputLine(_ line: String) {
-        if traceInput { debugLog("input line \(line)") }
-        guard let mainView = self.webView, let webView = activeView else { return }
-        guard let data = line.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let message = object as? [String: Any],
-              let type = message["type"] as? String,
-              !type.isEmpty else {
-            return
-        }
-        if type == "reload" {
-            // The page file changed (luchs --watch). A plain load of the same
-            // file URL can be served from WebKit's cache, so bypass it.
-            if pageURL.isFileURL, let html = try? String(contentsOf: pageURL, encoding: .utf8) {
-                mainView.loadHTMLString(html, baseURL: pageURL)
+    private func handleCommand(_ command: HelperCommand) {
+        precondition(Thread.isMainThread)
+        switch command.type {
+        case "ping":
+            emitAck(command.id, outcome: "executed")
+        case "reload":
+            guard let mainView = webView else {
+                emitAck(command.id, outcome: "failed", detail: "main view unavailable")
+                return
+            }
+            if pageURL.isFileURL {
+                do {
+                    let html = try String(contentsOf: pageURL, encoding: .utf8)
+                    mainView.loadHTMLString(html, baseURL: pageURL)
+                } catch {
+                    emitAck(command.id, outcome: "failed", detail: "could not read local page")
+                    return
+                }
             } else {
                 mainView.reloadFromOrigin()
             }
-            return
+            // Executed means the reload request was applied to WKWebView. A
+            // subsequent navigation failure is distinct from command failure.
+            emitAck(command.id, outcome: "executed")
+        default:
+            // The old SDL stdin vocabulary has no entry point. Input commands
+            // will be added by #2 and must use native NSEvent delivery.
+            emitAck(command.id, outcome: "unsupported")
         }
-        if nativeInput {
-            deliverNative(message, type: type, to: webView)
-            return
-        }
-        let jsonData = (try? JSONSerialization.data(withJSONObject: message)) ?? Data("{}".utf8)
-        let json = String(data: jsonData, encoding: .utf8) ?? "{}"
-        let script = """
-        (() => {
-          const event = \(json);
-          const x = Number.isFinite(event.x) ? event.x : 0;
-          const y = Number.isFinite(event.y) ? event.y : 0;
-          const target = document.elementFromPoint(x, y) || document.body || document.documentElement;
-          const common = { bubbles: true, cancelable: true, view: window };
-          const focusedTarget = () => {
-            const active = document.activeElement;
-            return active && active !== document.body ? active : document;
-          };
-          if (window.__luchsEnsureCaret) window.__luchsEnsureCaret();
-          const keyName = (keyCode) => {
-            if (keyCode === 8) return "Backspace";
-            if (keyCode === 9) return "Tab";
-            if (keyCode === 13) return "Enter";
-            if (keyCode === 27) return "Escape";
-            if (keyCode === 127) return "Delete";
-            if (keyCode === 1073741904) return "ArrowLeft";
-            if (keyCode === 1073741903) return "ArrowRight";
-            if (keyCode === 1073741906) return "ArrowUp";
-            if (keyCode === 1073741905) return "ArrowDown";
-            if (keyCode === 1073741898) return "Home";
-            if (keyCode === 1073741901) return "End";
-            if (keyCode >= 32 && keyCode <= 126) return String.fromCharCode(keyCode);
-            return "";
-          };
-          const editableValueControl = (element) => {
-            if (!element || element.disabled || element.readOnly) return false;
-            if (element instanceof HTMLTextAreaElement) return true;
-            if (!(element instanceof HTMLInputElement)) return false;
-            const type = (element.type || "text").toLowerCase();
-            return ["text", "search", "url", "tel", "email", "password"].includes(type);
-          };
-          const clampSelection = (active, value) => Math.max(0, Math.min(active.value.length, value));
-          const setCursor = (active, value) => {
-            if (!active.setSelectionRange) return;
-            const cursor = clampSelection(active, value);
-            active.setSelectionRange(cursor, cursor);
-            if (window.__luchsUpdateCaret) window.__luchsUpdateCaret();
-          };
-          const editInput = (active, inputType, start, end, replacement) => {
-            replacement = String(replacement ?? "");
-            const before = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType, data: replacement || null });
-            if (!active.dispatchEvent(before)) return;
-            active.value = active.value.slice(0, start) + replacement + active.value.slice(end);
-            if (active.setSelectionRange) {
-              const cursor = start + replacement.length;
-              active.setSelectionRange(cursor, cursor);
-            }
-            active.dispatchEvent(new InputEvent("input", { bubbles: true, inputType, data: replacement || null }));
-            if (window.__luchsUpdateCaret) window.__luchsUpdateCaret();
-          };
-          const applyKeyDefault = (keyCode) => {
-            const active = document.activeElement;
-            if (!editableValueControl(active)) return;
-            const start = active.selectionStart ?? active.value.length;
-            const end = active.selectionEnd ?? start;
-            if (keyCode === 8) {
-              if (start !== end) {
-                editInput(active, "deleteContentBackward", start, end, "");
-              } else if (start > 0) {
-                editInput(active, "deleteContentBackward", start - 1, start, "");
-              }
-            } else if (keyCode === 127) {
-              if (start !== end) {
-                editInput(active, "deleteContentForward", start, end, "");
-              } else if (start < active.value.length) {
-                editInput(active, "deleteContentForward", start, start + 1, "");
-              }
-            } else if (keyCode === 13 && active instanceof HTMLTextAreaElement) {
-              editInput(active, "insertLineBreak", start, end, String.fromCharCode(10));
-            } else if (keyCode === 1073741904 || keyCode === 1073741906) {
-              setCursor(active, start !== end ? start : start - 1);
-            } else if (keyCode === 1073741903 || keyCode === 1073741905) {
-              setCursor(active, start !== end ? end : end + 1);
-            } else if (keyCode === 1073741898) {
-              setCursor(active, 0);
-            } else if (keyCode === 1073741901) {
-              setCursor(active, active.value.length);
-            }
-          };
-          const scrollableAt = (start, deltaX, deltaY) => {
-            let node = start;
-            while (node && node !== document.documentElement) {
-              if (node instanceof Element) {
-                const style = getComputedStyle(node);
-                const canScrollY = Math.abs(deltaY) > 0 && /(auto|scroll|overlay)/.test(style.overflowY) && node.scrollHeight > node.clientHeight;
-                const canScrollX = Math.abs(deltaX) > 0 && /(auto|scroll|overlay)/.test(style.overflowX) && node.scrollWidth > node.clientWidth;
-                if (canScrollY || canScrollX) return node;
-              }
-              node = node.parentElement;
-            }
-            return document.scrollingElement || document.documentElement;
-          };
-          const applyWheelDefault = (start, deltaX, deltaY) => {
-            const scroller = scrollableAt(start, deltaX, deltaY);
-            if (!scroller) return;
-            scroller.scrollLeft += deltaX;
-            scroller.scrollTop += deltaY;
-          };
-          if (event.type === "mouse_move") {
-            target.dispatchEvent(new MouseEvent("mousemove", { ...common, clientX: x, clientY: y }));
-          } else if (event.type === "mouse_down" || event.type === "mouse_up") {
-            const button = Math.max(0, Number(event.button || 1) - 1);
-            const name = event.type === "mouse_down" ? "mousedown" : "mouseup";
-            if (event.type === "mouse_down" && target.focus) { target.focus(); }
-            target.dispatchEvent(new MouseEvent(name, { ...common, clientX: x, clientY: y, button }));
-            if (event.type === "mouse_up") {
-              target.dispatchEvent(new MouseEvent("click", { ...common, clientX: x, clientY: y, button }));
-            }
-          } else if (event.type === "wheel") {
-            const deltaX = -Number(event.dx || 0) * 40;
-            const deltaY = -Number(event.dy || 0) * 40;
-            const wheel = new WheelEvent("wheel", { ...common, clientX: x, clientY: y, deltaX, deltaY });
-            if (target.dispatchEvent(wheel)) {
-              applyWheelDefault(target, deltaX, deltaY);
-            }
-          } else if (event.type === "key_down" || event.type === "key_up") {
-            const name = event.type === "key_down" ? "keydown" : "keyup";
-            const keyCode = Number(event.keycode || 0);
-            const keyboard = new KeyboardEvent(name, { ...common, key: keyName(keyCode), keyCode, which: keyCode, repeat: !!event.repeat });
-            if (focusedTarget().dispatchEvent(keyboard) && event.type === "key_down") {
-              applyKeyDefault(keyCode);
-            }
-          } else if (event.type === "text") {
-            const text = String(event.text || "");
-            const active = document.activeElement;
-            if (editableValueControl(active)) {
-              const start = active.selectionStart ?? active.value.length;
-              const end = active.selectionEnd ?? start;
-              editInput(active, "insertText", start, end, text);
-            } else {
-              const before = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text });
-              if (!document.dispatchEvent(before)) return;
-              document.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
-            }
-          }
-          if (window.__luchsUpdateCaret) window.__luchsUpdateCaret();
-        })()
-        """
-        webView.evaluateJavaScript(script, completionHandler: nil)
     }
-
 
     // MARK: Native input
 
-    // Input arrives as NSEvents at the web view, so WebKit's own handling
-    // does what the JS bridge approximated: hit testing into iframes,
-    // focus, text insertion into any editor, shortcuts. LUCHS_INPUT=bridge
-    // selects the bridge instead.
-    private let nativeInput = ProcessInfo.processInfo.environment["LUCHS_INPUT"] != "bridge"
+    // Native responder delivery retained for the input slice. JavaScript
+    // event synthesis and the LUCHS_INPUT=bridge switch have been removed.
     private let traceInput = ProcessInfo.processInfo.environment["LUCHS_INPUT_TRACE"] == "1"
 
     // Straight to the active view's responder methods rather than through
@@ -764,8 +681,14 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
 
-        let header = "LUCHS_RAW_FRAME {\"format\":\"rgba8\",\"width\":\(width),\"height\":\(height),\"stride\":\(stride),\"len\":\(pixels.count)}\n"
-        FileHandle.standardOutput.write(Data(header.utf8))
+        precondition(Thread.isMainThread)
+        let header = "{\"format\":\"rgba8\",\"width\":\(width),\"height\":\(height),\"stride\":\(stride),\"len\":\(pixels.count)}"
+        let json = Data(header.utf8)
+        var envelope = littleEndian(UInt32(1 + 4 + json.count + pixels.count))
+        envelope.append(1)
+        envelope.append(littleEndian(UInt32(json.count)))
+        envelope.append(json)
+        FileHandle.standardOutput.write(envelope)
         pixels.withUnsafeBufferPointer { buffer in
             FileHandle.standardOutput.write(Data(buffer: buffer))
         }
@@ -791,8 +714,8 @@ private enum LuchsWebviewCapture {
         let height = args.count >= 4 ? (Int(args[3]) ?? defaultHeight) : defaultHeight
         let frameCount = args.count >= 5 ? (Int(args[4]) ?? defaultFrameCount) : defaultFrameCount
         let fps = args.count >= 6 ? (Int(args[5]) ?? defaultFps) : defaultFps
-        guard width > 0 && height > 0 && frameCount >= 0 && fps > 0 else {
-            fail("width, height, and fps must be positive; frame_count must be zero or positive")
+        guard width > 0 && height > 0 && width <= maxFrameBytes / 4 && height <= maxFrameBytes / 4 / width && frameCount >= 0 && fps > 0 else {
+            fail("width, height, and fps must be positive; RGBA pixels must fit 64 MiB; frame_count must be zero or positive")
         }
 
         let page = args[1]

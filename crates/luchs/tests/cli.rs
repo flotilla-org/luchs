@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     io::{BufRead, BufReader, Read},
     os::unix::fs::PermissionsExt,
@@ -57,15 +59,21 @@ fn sigterm_cleanup(optional_controls: bool) {
     std::fs::write(
         &helper,
         format!(
-            r#"#!/bin/sh
-echo $$ > '{}'
-printf '%s\n' "$1 $2 $3 $4 $5" > "$LUCHS_CONSOLE_LOG"
-printf 'LUCHS_RAW_FRAME {{"format":"rgba8","width":1,"height":1,"stride":4,"len":4}}\nrgba'
-while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$LUCHS_CONSOLE_LOG"
-done
+            "#!/usr/bin/env python3\n{}\n{}",
+            common::PYTHON_PROTOCOL,
+            format_args!(
+                r#"
+with open('{}', 'w') as out: out.write(str(os.getpid()))
+with open(os.environ['LUCHS_CONSOLE_LOG'], 'w') as out: out.write(' '.join(sys.argv[1:]) + '\n')
+frame()
+while True:
+    try: cmd = command()
+    except EOFError: break
+    ack(cmd)
+    with open(os.environ['LUCHS_CONSOLE_LOG'], 'a') as out: out.write(json.dumps(cmd) + '\n')
 "#,
-            pid.display()
+                pid.display()
+            )
         ),
     )
     .unwrap();
@@ -163,7 +171,7 @@ done
             .contains("not executed")
     );
     assert!(logged.contains("1 1 0 30"));
-    assert!(logged.contains("{\"type\":\"reload\"}"));
+    assert!(logged.contains("\"type\": \"reload\""));
     assert!(!std::path::Path::new(endpoint.trim()).exists());
     let helper_pid: i32 = std::fs::read_to_string(pid)
         .unwrap()
@@ -180,7 +188,14 @@ fn immediate_helper_eof_without_consumer_stops_successfully() {
     let dir = tempfile::tempdir().unwrap();
     let helper = dir.path().join("helper");
     // Fake only the renderer subprocess boundary.
-    std::fs::write(&helper, "#!/bin/sh\nprintf 'LUCHS_RAW_FRAME {\"format\":\"rgba8\",\"width\":1,\"height\":1,\"stride\":4,\"len\":4}\\nrgba'\n").unwrap();
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\n{}\n",
+            common::printf(&common::frame(1, b"rgba"))
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_luchs"))
         .arg("--helper")
@@ -234,7 +249,7 @@ fn invalid_helper_frame_drops_source_and_reaps_helper() {
         format!(
             r#"#!/bin/sh
 echo $$ > '{}'
-printf 'invalid helper header\n'
+printf '\001\000\000\000\143'
 while IFS= read -r line; do :; done
 "#,
             pid.display()
@@ -270,10 +285,7 @@ while IFS= read -r line; do :; done
         .read_to_string(&mut stderr)
         .unwrap();
     assert!(!status.success(), "{stderr}");
-    assert!(
-        stderr.contains("missing LUCHS_RAW_FRAME prefix"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("unknown helper record tag"), "{stderr}");
     let mut endpoint = String::new();
     child
         .stdout

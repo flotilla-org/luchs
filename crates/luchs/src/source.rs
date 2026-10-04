@@ -1,5 +1,10 @@
 //! Helper frames and observation-only callbacks for the native producer toolkit.
-use crate::{Result, cli::Cli, helper::Helper, protocol::Frame};
+use crate::{
+    Result,
+    cli::Cli,
+    helper::{CommandOutcome, Helper},
+    protocol::Frame,
+};
 use jackstay::{
     acquisition::arena::{ArenaConfig, FrameDescriptor},
     input::{Config, Outcome, Work},
@@ -183,7 +188,10 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
                 let now = modification_time(path);
                 // Keep the last known time across an atomic-save disappearance.
                 if now.is_some() && now != modified {
-                    helper.reload()?;
+                    match helper.reload()? {
+                        CommandOutcome::Executed => {}
+                        outcome => return Err(format!("renderer reload: {outcome:?}").into()),
+                    }
                     modified = now;
                 }
             }

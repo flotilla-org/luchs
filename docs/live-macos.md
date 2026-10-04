@@ -78,3 +78,29 @@ bootstrap v2 slice, is still open. After it lands, present
 `testdata/interactive.html` using that viewer on a live macOS desktop and append
 the tested revisions and results here. Automated tests exercise v2 media, optional
 controls, replacement, process death and SIGTERM with a live consumer.
+
+
+## Framed helper protocol (2026-10-04)
+
+Validated on the logged-in macOS 26.6 arm64 desktop with Apple Swift 6.4
+(swiftlang-6.4.0.34.1) and Rust 1.98.0. Jackstay remains pinned to
+`ed785976df1246d2d3ce3f0c41df91c02f38e20d` (ABI 0.12).
+
+```sh
+scripts/build-helper.sh
+cargo test --locked --test live_macos -- --ignored --nocapture
+```
+
+`native_ping_reload_and_watch` passed. It received real 32x32 WebKit frames,
+confirmed `ping` and `reload` returned `Executed`, and confirmed the old
+`mouse_down` command returned `Unsupported`. Rewriting a red page to blue and
+reloading changed the first captured pixel from `[255, 0, 0, 255]` to
+`[0, 0, 255, 255]`.
+
+The test then launched the real CLI with `--watch --size=32x32 --fps=15`,
+connected through bootstrap v2, and acquired both the original red pixels and
+blue pixels after editing the file. This exercises file polling, framed stdin,
+main-thread reload, ack demultiplexing, and publication through Jackstay. The
+CLI stopped successfully on SIGTERM after six frames and removed its endpoint.
+No SDL viewer was needed for this protocol acceptance check; the earlier v2
+presenter check remains separate.

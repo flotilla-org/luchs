@@ -11,8 +11,9 @@ Input admission and affordances belong to later slices. Every connection is
 observation-only, including one that requests optional input. No input
 capabilities are advertised. ABI 0.12 requires a nonzero typing mode,
 so cooperative admission is available but every operation returns unsupported;
-physical and source-text admission are unsupported. The helper retains its
-existing stdin protocol, but this core only sends reload commands. This producer
+physical and source-text admission are unsupported. The helper uses a
+[framed bidirectional protocol](docs/helper-protocol.md) with per-command acks;
+this core sends reload commands and reserves state events for the next slice. This producer
 never acquires held input state, yet rejects every work item, including cleanup.
 The toolkit reports `input cleanup failed` at shutdown if cooperative input was
 admitted because its cleanup was rejected. Luchs logs that specific error and exits successfully on
@@ -68,14 +69,15 @@ workers (including stalled handshakes and independent controls). Arena admission
 also depends on each consumer's holding credit.
 
 `--size=WxH` defaults to 800x600. `--watch` polls a local file's modification time
-every 250 ms and asks WebKit to reload without its cache; URLs load once.
+every 250 ms and asks WebKit to reload without its cache, waiting up to one
+second for its execution ack; URLs load once.
 `LUCHS_CONSOLE_LOG` names the helper's console/error/navigation log, otherwise
 the helper uses `/tmp/luchs-console-<helper-pid>.log`. Its stderr passes through
 to Luchs's stderr. `--renderer=native-webview` remains accepted for existing
 hosts, and a bare `--` separates options from the page. `--fps` defaults to 30;
 `--frames=N` bounds a smoke run, with zero meaning unbounded.
 
-The imported helper is unchanged. It uses the persistent website data store,
+The helper uses the persistent website data store,
 a transparent on-screen window so WebKit keeps its page clock running, Safari's
 user agent, popup views with their opener, and the existing caret script.
 Frames come from `takeSnapshot`, not screen capture. The helper emits
@@ -104,10 +106,12 @@ cargo +1.98.0 fmt --all --check
 ```
 
 CI runs these checks on macOS and Linux, plus helper compilation on macOS.
-Tests spawn fake helpers without WebKit and exercise the frame stream, invalid
-headers, truncation, reload, console environment, termination, source bootstrap,
-replacement and consumer process death. One ignored test is a child-process
-fixture invoked by the death test, not a skipped acceptance check.
+Tests spawn fake helpers without WebKit and exercise framed records, ack
+ordering and timeouts, state callbacks, bounds, reload, console environment,
+termination, source bootstrap, replacement and consumer process death. Command
+fixtures require `python3`. The ignored `live_macos` test requires a built Swift
+helper and a logged-in desktop; a separate ignored child-process fixture runs
+inside the consumer-death test.
 
 See [source history](docs/source-history.md) for the filtered import and commit
 map, and [live macOS evidence](docs/live-macos.md) for presenter validation.
