@@ -441,3 +441,21 @@ Both source runs stopped on SIGTERM, and their viewers logged completed
 affordances cleanup. Flotilla retains the live drag and cursor/title logs as
 raw-test-output artifacts; the scratch driver and visible helper are outside
 the repository.
+
+### Review follow-up
+
+HTTP and HTTPS navigation may target any host even when the startup page is
+local, as required by issue #3. The directory boundary applies only to file
+URLs; no optional remote-host allowlist was added. Swift readiness is advisory
+until Rust confirms producer publication. The command-size allowance names the
+26-byte maximum JSON command-ID field; the four-byte record prefix is outside
+the JSON limit.
+
+Review regressions add a parentless-startup-path error, Swift localhost-file
+acceptance and localhost/directory-symlink escape rejection, and replacement
+state arriving before the producer polls withdrawals. The latter checks that
+all four withdrawals precede fresh snapshots and queued old commands are cleared.
+
+The follow-up passed all 41 ordinary Rust tests, Clippy, formatting, helper
+compilation and Swift policy tests. The production live page-affordances test
+passed again after the review changes.

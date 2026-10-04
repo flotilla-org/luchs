@@ -175,7 +175,7 @@ Each page event publishes one complete domain body, never a delta:
 Rust supplies the navigation and scroll capability flags. The helper observes
 WKWebView title, URL, history and loading with KVO. Readiness latches after the
 first navigation finishes and a frame reaches the producer toolkit. The Rust
-bridge also gates readiness on frame publication. The active popup owns these
+bridge treats helper readiness as advisory and also gates it on frame publication. The active popup owns these
 domains until it closes, then the main view republishes its state.
 
 The main-frame script reads only `document.scrollingElement`, in CSS pixels.
@@ -199,8 +199,8 @@ CLI EOF preserves the final frame for its existing flush, then closes the source
 
 Rust parses host loads as URLs and canonicalizes file paths under the startup
 page directory. The helper independently validates schemes and symlink
-containment at the engine boundary. HTTP/HTTPS are allowed; remote startup
-pages grant no file authority. Rejected loads log to the helper console file.
+containment at the engine boundary. HTTP/HTTPS may target any host, including from a local startup page; remote
+startup pages grant no file authority. Rejected loads log to the helper console file.
 
 ## Rust dispatch and timeouts
 

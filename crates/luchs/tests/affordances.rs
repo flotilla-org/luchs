@@ -137,6 +137,61 @@ fn load_policy_accept_reject_table() {
 }
 
 #[test]
+fn startup_path_without_parent_returns_an_error() {
+    let error = match LoadPolicy::new(Some(std::path::Path::new("/"))) {
+        Err(error) => error,
+        Ok(_) => panic!("filesystem root has no parent"),
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn replacement_arriving_before_poll_still_withdraws_before_fresh_snapshots() {
+    let page = PageState::default();
+    let publish_domains = |title: &str| {
+        state(&page, "window", window(title, true));
+        state(&page, "navigation", navigation(title));
+        state(&page, "cursor", json!({"shape":"text"}));
+        state(&page, "scroll", scroll(20., true));
+    };
+    page.frame_published();
+    publish_domains("old");
+    assert_eq!(page.snapshots().len(), 4);
+    page.verb(
+        Verb {
+            domain: Domain::Navigation,
+            name: "reload".into(),
+            body: json!({}),
+        },
+        &LoadPolicy::new(None).unwrap(),
+    );
+    page.helper_stopped();
+    publish_domains("new");
+    assert!(page.command().is_none());
+    assert_eq!(
+        page.snapshots(),
+        [
+            Domain::Window,
+            Domain::Navigation,
+            Domain::Cursor,
+            Domain::Scroll
+        ]
+        .map(Snapshot::Withdraw)
+    );
+    let fresh = page.snapshots();
+    assert_eq!(fresh.len(), 4);
+    assert!(fresh.iter().any(
+        |s| matches!(s, Snapshot::Window(w) if w.title.as_deref() == Some("new") && !w.ready)
+    ));
+    assert!(
+        fresh
+            .iter()
+            .any(|s| matches!(s, Snapshot::Navigation(n) if n.title.as_deref() == Some("new")))
+    );
+    assert!(fresh.iter().all(|s| !matches!(s, Snapshot::Withdraw(_))));
+}
+
+#[test]
 fn normalization_readiness_unknown_verbs_and_bounded_queue() {
     let page = PageState::default();
     state(&page, "window", window("first", true));

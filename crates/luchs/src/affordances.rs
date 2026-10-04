@@ -9,7 +9,12 @@ use jackstay::affordances::{Axis, CURSORS, Domain, Navigation, Scroll, Snapshot,
 use serde_json::{Map, Value, json};
 use url::Url;
 
-/// Host URLs grant no authority outside the original local page directory.
+// Inserting a u64 command ID adds one comma, five bytes for `"id":`, and
+// at most 20 decimal digits. MAX_CONTROL_BYTES bounds JSON, not its u32 prefix.
+const COMMAND_ID_JSON_HEADROOM: usize = 26;
+
+/// HTTP(S) loads may target any host, including from a local startup page.
+/// File loads grant no authority outside the original local page directory.
 pub struct LoadPolicy {
     directory: Option<PathBuf>,
 }
@@ -18,8 +23,14 @@ impl LoadPolicy {
         Ok(Self {
             directory: page
                 .map(|page| {
-                    page.canonicalize()
-                        .map(|page| page.parent().unwrap().to_owned())
+                    page.canonicalize().and_then(|page| {
+                        page.parent().map(Path::to_owned).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "startup page has no parent directory",
+                            )
+                        })
+                    })
                 })
                 .transpose()?,
         })
@@ -194,7 +205,9 @@ impl PageState {
         };
         // URL normalization can expand UTF-8 into percent-encoded bytes. A
         // valid host record must not turn into a fatal oversized helper write.
-        if serde_json::to_vec(&command).unwrap().len() + 32 > crate::protocol::MAX_CONTROL_BYTES {
+        if serde_json::to_vec(&command).unwrap().len() + COMMAND_ID_JSON_HEADROOM
+            > crate::protocol::MAX_CONTROL_BYTES
+        {
             command =
                 json!({"type":"navigation.rejected", "url":"URL exceeds helper command limit"});
         }

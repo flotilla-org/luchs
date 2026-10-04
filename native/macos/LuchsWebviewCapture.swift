@@ -521,6 +521,8 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     }
 
     private func observePage(_ view: WKWebView) {
+        // One observer set owns the active view. Replacement invalidates the
+        // previous set; popup closure reattaches it to the newly active view.
         observations = [
             view.observe(\.title, options: [.new]) { [weak self] _, _ in self?.publishPageState() },
             view.observe(\.url, options: [.new]) { [weak self] _, _ in self?.publishPageState() },
@@ -534,6 +536,8 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     private func publishPageState() {
         guard let view = activeView else { return }
+        // Advisory helper readiness: emittedFrames counts socket writes. Rust
+        // additionally gates this on publication through the producer toolkit.
         emitState(["domain": "window", "body": ["title": view.title as Any? ?? NSNull(),
             "requested_size": NSNull(), "ready": navigationFinished && emittedFrames > 0]])
         emitState(["domain": "navigation", "body": ["url": view.url?.absoluteString as Any? ?? NSNull(),
