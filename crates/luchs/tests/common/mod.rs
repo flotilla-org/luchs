@@ -27,13 +27,12 @@ pub fn control(tag: u8, json: Value) -> Vec<u8> {
     envelope(&body)
 }
 
-pub fn printf(bytes: &[u8]) -> String {
+pub fn socket_write(bytes: &[u8]) -> String {
+    // dash only accepts single-digit descriptors in shell redirections. Use
+    // Python's fd API so concurrent tests can inherit any descriptor number.
     format!(
-        "printf '{}' >&$LUCHS_HELPER_FD",
-        bytes
-            .iter()
-            .map(|b| format!("\\{b:03o}"))
-            .collect::<String>()
+        "python3 -c 'import os; w=os.fdopen(int(os.environ[\"LUCHS_HELPER_FD\"]), \"wb\", closefd=False); w.write(bytes.fromhex(\"{}\")); w.flush()'",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     )
 }
 

@@ -59,7 +59,8 @@ report, so it cannot hold ping, reload or presentation behind page loading.
 Navigation completion reports activity and wakes capture. The existing initial
 navigation-failure handlers terminate with a diagnostic; subsequent failures
 remain logged. A backing-scale or navigation change during a snapshot discards
-that transient result and wakes a retry.
+that transient result and wakes a retry. An unexpected representation size likewise
+discards the result, invalidates the configuration and requests another capture.
 An `executed` ack confirms actual application of the command; enqueueing work
 for another thread is not execution.
 

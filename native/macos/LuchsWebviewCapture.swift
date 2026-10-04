@@ -819,7 +819,12 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         let publishStart = ProcessInfo.processInfo.systemUptime
         guard let representation = image.representations.first,
               representation.pixelsWide == width, representation.pixelsHigh == height else {
-            emitAck(command.id, outcome: "failed", detail: "snapshot representation does not match requested pixel size")
+            // WebKit can complete the representation with the previous display
+            // scale. Drop it and recompute the configuration on the next request.
+            configuredBacking = 0
+            debugLog("discarding snapshot with unexpected pixel size; retrying")
+            emitAck(command.id, outcome: "executed")
+            reportActivity()
             return
         }
         prepareBitmap(image, width: width, height: height)

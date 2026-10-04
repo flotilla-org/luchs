@@ -27,13 +27,17 @@ fn python(script: &str) -> Helper {
 
 #[test]
 fn fake_helper_streams_split_records_binary_pixels_and_resizes() {
+    // Exercise descriptor numbers above dash's redirection range deterministically.
+    let _occupied: Vec<_> = (0..16)
+        .map(|_| std::fs::File::open("/dev/null").unwrap())
+        .collect();
     let first = common::frame(1, &[0, 10, 255, 1]);
     let second = common::frame(2, b"12345678");
     let mut helper = fake(&format!(
         "{}; {}; {}",
-        common::printf(&first[..2]),
-        common::printf(&first[2..]),
-        common::printf(&second)
+        common::socket_write(&first[..2]),
+        common::socket_write(&first[2..]),
+        common::socket_write(&second)
     ));
     let first = helper.receive(TIMEOUT).unwrap().unwrap();
     assert_eq!(first.pixels, [0, 10, 255, 1]);
@@ -153,7 +157,7 @@ ack(command(), 'failed', 'no view')
 #[test]
 fn state_event_is_delivered_to_callback() {
     let (send, receive) = mpsc::channel();
-    let script = common::printf(&common::control(
+    let script = common::socket_write(&common::control(
         3,
         json!({"url":"file:///page", "nested":{"revision":7}}),
     ));
@@ -268,7 +272,7 @@ fn malformed_record_stops_and_reaps_without_waiting_for_drop() {
     let helper = fake(&format!(
         "echo $$ > '{}'; {}; exec sleep 60",
         pid_path.display(),
-        common::printf(&common::envelope(&[99]))
+        common::socket_write(&common::envelope(&[99]))
     ));
     assert_eq!(
         helper.receive(TIMEOUT).unwrap().unwrap_err().kind(),
@@ -284,7 +288,7 @@ fn panicking_state_callback_fails_and_reaps_helper() {
     let script = format!(
         "echo $$ > '{}'; {}; exec sleep 60",
         pid_path.display(),
-        common::printf(&common::control(3, json!({})))
+        common::socket_write(&common::control(3, json!({})))
     );
     let helper = Helper::spawn_with_state(Command::new("/bin/sh").args(["-c", &script]), |_| {
         panic!("test callback")
@@ -401,7 +405,7 @@ fn frame_decode_reuses_returned_pixel_storage() {
 fn stdout_is_unused_and_cannot_corrupt_socket_framing() {
     let helper = fake(&format!(
         "printf 'not a protocol record'; {}",
-        common::printf(&common::frame(1, b"bgra"))
+        common::socket_write(&common::frame(1, b"bgra"))
     ));
     assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"bgra");
 }

@@ -347,7 +347,12 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
                 eprintln!("luchs: ignoring scale hint beyond capture limits");
                 policy.scale
             };
-            let outcome = helper.send_json_command(serde_json::json!({"type": "presentation", "visible": hint.visible, "scale": scale}), crate::helper::COMMAND_TIMEOUT)?.wait();
+            let presentation = serde_json::json!({
+                "type": "presentation", "visible": hint.visible, "scale": scale
+            });
+            let outcome = helper
+                .send_json_command(presentation, crate::helper::COMMAND_TIMEOUT)?
+                .wait();
             if outcome != CommandOutcome::Executed {
                 return Err(format!("renderer presentation: {outcome:?}").into());
             }

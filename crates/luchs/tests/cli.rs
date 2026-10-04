@@ -192,7 +192,7 @@ fn immediate_helper_eof_without_consumer_stops_successfully() {
         &helper,
         format!(
             "#!/bin/sh\n{}\n",
-            common::printf(&common::frame(1, b"rgba"))
+            common::socket_write(&common::frame(1, b"rgba"))
         ),
     )
     .unwrap();
@@ -249,10 +249,11 @@ fn invalid_helper_frame_drops_source_and_reaps_helper() {
         format!(
             r#"#!/bin/sh
 echo $$ > '{}'
-printf '\001\000\000\000\143' >&$LUCHS_HELPER_FD
+{}
 exec sleep 60
 "#,
-            pid.display()
+            pid.display(),
+            common::socket_write(&[1, 0, 0, 0, 99])
         ),
     )
     .unwrap();
