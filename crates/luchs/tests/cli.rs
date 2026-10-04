@@ -220,3 +220,78 @@ fn immediate_helper_eof_without_consumer_stops_successfully() {
         .unwrap();
     assert!(!std::path::Path::new(endpoint.trim()).exists());
 }
+
+// A malformed helper frame must fail the CLI, remove its endpoint via Drop,
+// and reap a helper still blocked on stdin; explicit Source::stop is bypassed.
+#[test]
+fn invalid_helper_frame_drops_source_and_reaps_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = dir.path().join("helper");
+    let pid = dir.path().join("helper-pid");
+    // Fake only the renderer subprocess boundary.
+    std::fs::write(
+        &helper,
+        format!(
+            r#"#!/bin/sh
+echo $$ > '{}'
+printf 'invalid helper header\n'
+while IFS= read -r line; do :; done
+"#,
+            pid.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_luchs"))
+        .arg("--helper")
+        .arg(&helper)
+        .args(["--size=1x1", "https://example.com"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("malformed-frame shutdown did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("missing LUCHS_RAW_FRAME prefix"),
+        "{stderr}"
+    );
+    let mut endpoint = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut endpoint)
+        .unwrap();
+    assert!(!endpoint.trim().is_empty());
+    assert!(
+        !std::path::Path::new(endpoint.trim()).exists(),
+        "endpoint leaked: {}",
+        endpoint.trim()
+    );
+    let helper_pid: i32 = std::fs::read_to_string(pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal zero only probes the helper whose PID the test recorded.
+    assert_eq!(unsafe { libc::kill(helper_pid, 0) }, -1);
+}

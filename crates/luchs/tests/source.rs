@@ -75,6 +75,9 @@ fn acquire(consumer: &ArenaConsumer) -> FrameLease {
 #[test]
 fn private_bootstrap_source_publishes_rgba_and_reconfigures() {
     let (mut source, path) = source();
+    // Private parent permissions protect the socket before inode chmod.
+    let parent = std::path::Path::new(&path).parent().unwrap();
+    assert_eq!(std::fs::metadata(parent).unwrap().mode() & 0o777, 0o700);
     assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
     assert!(
         Source::bind(

@@ -12,12 +12,12 @@ observation-only, including one that requests optional input. No input
 capabilities are advertised. ABI 0.12 requires a nonzero typing mode,
 so cooperative admission is available but every operation returns unsupported;
 physical and source-text admission are unsupported. The helper retains its
-existing stdin protocol, but this core
-only sends reload commands. The toolkit reports `input cleanup failed` at
-shutdown if a cooperative input channel was admitted, because even cleanup work
-returns unsupported. Luchs logs that specific error and exits successfully on
+existing stdin protocol, but this core only sends reload commands. This producer
+never acquires held input state, yet rejects every work item, including cleanup.
+The toolkit reports `input cleanup failed` at shutdown if cooperative input was
+admitted because its cleanup was rejected. Luchs logs that specific error and exits successfully on
 orderly SIGINT, SIGTERM or EOF; other shutdown errors still fail the run.
-Optional input receives media, without authority to execute events.
+Viewers requesting optional input still receive frames; input events are rejected.
 
 ## Build and install
 

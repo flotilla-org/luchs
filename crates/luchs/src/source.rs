@@ -124,6 +124,7 @@ impl Source {
         // The pinned toolkit pump calls frame() unconditionally, even without
         // peers. Bound this flush to one second in case that contract changes;
         // ordered toolkit shutdown still runs if the final frame is skipped.
+        // Upstream flush barrier: https://github.com/flotilla-org/jackstay/issues/71
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline
             && !self.source.is_finished()
@@ -194,6 +195,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         // expected for this observation-only producer, not a failed CLI run.
         // jackstay-producer at ed785976 returns io::Error without a typed
         // cleanup variant. This exact message is pinned by the CLI test.
+        // Typed error follow-up: https://github.com/flotilla-org/jackstay/issues/70
         Err(error) if error.to_string() == "input cleanup failed" => {
             eprintln!("luchs: shutdown: {error}");
         }
