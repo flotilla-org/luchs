@@ -64,7 +64,8 @@ discards the result, invalidates the configuration and requests another capture.
 WebKit errors, missing images and invalid snapshot dimensions share a budget of
 two retries. A third consecutive failure emits a failed ack with a diagnostic
 that the CLI displays. A successful draw, including an unchanged image, resets
-the budget. Discarded attempts acknowledge without a snapshot report; the ack
+the budget. Expected backing-scale and navigation transitions do not consume
+that budget; captures remain suspended while loading. Discarded attempts acknowledge without a snapshot report; the ack
 reschedules the normal interval and activity wakes it immediately.
 An `executed` ack confirms actual application of the command; enqueueing work
 for another thread is not execution.

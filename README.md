@@ -32,6 +32,10 @@ install -d "$HOME/.local/bin"
 install target/release/luchs target/release/luchs-webview-capture "$HOME/.local/bin/"
 ```
 
+The helper build also validates its native recovery policy. Set
+`LUCHS_SKIP_NATIVE_TESTS=1` when building to skip that extra test compilation;
+`scripts/test-helper.sh` runs it separately.
+
 The helper must sit beside the `luchs` executable. `--helper PATH` overrides its
 location, including for fake helpers on Linux. The Rust workspace builds and
 tests on macOS and Linux without WebKit; only `scripts/build-helper.sh` compiles

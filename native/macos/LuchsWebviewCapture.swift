@@ -769,7 +769,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             // A display-scale or navigation change can invalidate an in-flight
             // snapshot. Retry through the scheduler rather than terminating.
             if (self.window?.backingScaleFactor ?? 1) != backing || !self.loaded {
-                self.retrySnapshot(command, "backing scale or navigation changed during snapshot")
+                self.retrySnapshot(command, "backing scale or navigation changed during snapshot", expectedTransition: true)
                 return
             }
             if let error {
@@ -785,13 +785,13 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         }
     }
 
-    private func retrySnapshot(_ command: HelperCommand, _ detail: String) {
+    private func retrySnapshot(_ command: HelperCommand, _ detail: String, expectedTransition: Bool = false) {
         configuredBacking = 0
-        if let failure = snapshotRecovery.failure(detail) {
+        if let failure = snapshotRecovery.discard(detail, expectedTransition: expectedTransition) {
             debugLog(failure)
             emitAck(command.id, outcome: "failed", detail: failure)
         } else {
-            debugLog("discarding snapshot (attempt \(snapshotRecovery.failures)): \(detail); retrying")
+            debugLog("discarding snapshot: \(detail); retrying")
             emitAck(command.id, outcome: "executed")
             reportActivity()
         }

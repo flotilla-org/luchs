@@ -3,7 +3,9 @@
 struct SnapshotRecovery {
     private(set) var failures = 0
 
-    mutating func failure(_ detail: String) -> String? {
+    mutating func discard(_ detail: String, expectedTransition: Bool = false) -> String? {
+        // Loading and changing displays are normal transitions, not failures.
+        if expectedTransition { return nil }
         failures += 1
         return failures >= 3
             ? "snapshot failed after \(failures) consecutive attempts: \(detail)"

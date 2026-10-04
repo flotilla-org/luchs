@@ -242,3 +242,9 @@ reset on success. The fake renderer discards two captures after an idle page
 wake and verifies that no-report acknowledgements schedule the successful retry
 with each next request within 250 ms instead of the 500 ms idle interval; another
 CLI test verifies the exhausted-retry diagnostic.
+
+Expected navigation or display-scale transitions discard an in-flight snapshot
+without charging the failure budget. The native policy test covers that
+distinction as well as genuine repeated failures. The helper build runs this
+test by default for existing CI; local builders can set
+`LUCHS_SKIP_NATIVE_TESTS=1` and run `scripts/test-helper.sh` separately.

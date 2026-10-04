@@ -14,4 +14,6 @@ swiftc -O -parse-as-library -framework AppKit -framework WebKit \
 
 # The existing macOS CI job invokes this script. Validate the shared recovery
 # policy alongside the helper without requiring a new workflow step.
-"$repo/scripts/test-helper.sh"
+if [ "${LUCHS_SKIP_NATIVE_TESTS:-0}" != 1 ]; then
+    "$repo/scripts/test-helper.sh"
+fi
