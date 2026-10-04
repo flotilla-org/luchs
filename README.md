@@ -13,7 +13,10 @@ through the producer toolkit's ordered executor. Commands use the
 completes input successfully; unsupported mappings are rejected, and failed or
 missing acks are uncertain. One controller owns the target. Focus loss,
 disconnect and shutdown wait for native releases before admitting a replacement.
-Producer-state affordances beyond presentation remain a later slice.
+
+Page state publishes window, navigation, cursor and document-scroll affordances.
+Navigation and scroll verbs execute in WebKit; host presentation scale and
+visibility hints control capture.
 
 ## Build and install
 
@@ -46,7 +49,7 @@ luchs --endpoint=my-web-page https://example.com
 ```
 
 Luchs prints its source socket path on stdout and diagnostics on stderr. Connect
-the SDL viewer by the configured endpoint name, using the pinned ABI 0.12 build:
+the SDL viewer by the configured endpoint name, using the pinned ABI 0.13 build:
 
 ```sh
 capture-viewer-sdl --source-endpoint my-page --typing cooperative --affordances optional
@@ -116,6 +119,30 @@ and stop/reap the helper. The toolkit drains for up to five seconds; consumers
 must retire their mappings and leases when media closes. Drain or input cleanup
 failures are reported. Consumer shutdown does not terminate Luchs.
 
+## Page affordances
+
+Use `--affordances required --log-affordances` in the SDL viewer to inspect page
+state and enable its navigation toolbar and document scrollbar overlays.
+`testdata/affordances.html` has links, a text field, a title-change button, and
+both scroll axes. Window readiness requires a completed navigation and a
+published frame. Titles, history and loading follow the active WebKit view,
+including popups. Cursor changes follow the last pointer position in the page;
+host pointer motion reaches WebKit through the native input executor.
+
+Only `document.scrollingElement` is represented. Scroll positions and dimensions
+use CSS pixels; nested scrollers are excluded. Small steps are 40 pixels and
+large steps are 90% of that axis's viewport. Positions are clamped before
+publication and execution, including non-scrollable axes, which publish zero.
+Restored history pages republish state on `pageshow`.
+
+Host `navigation.load` URLs are untrusted. HTTP and HTTPS are allowed. File URLs
+must resolve to an existing path inside the original local page's canonical
+directory; symlinks outside it are rejected. A remote startup page grants no
+file access. Rejections have no host reply and are recorded in `LUCHS_CONSOLE_LOG`.
+Unknown verbs are ignored. Complete domain snapshots replace earlier state;
+helper replacement withdraws all four domains and clears pending commands.
+The CLI still exits on helper EOF rather than automatically restarting it.
+
 ## Verification
 
 ```sh
@@ -129,7 +156,8 @@ CI runs these checks on macOS and Linux, plus helper compilation on macOS.
 Tests spawn fake helpers without WebKit and exercise framed records, ack
 ordering and timeouts, state callbacks, bounds, reload, console environment,
 termination, source bootstrap, replacement, pooled storage, idle policy,
-presentation hints and consumer process death. Command
+presentation hints, page-state propagation, helper replacement, URL containment,
+navigation/scroll command forwarding and consumer process death. Command
 fixtures require `python3`. The ignored `live_macos` test requires a built Swift
 helper and a logged-in desktop; a separate ignored child-process fixture runs
 inside the consumer-death test.
