@@ -1,5 +1,6 @@
 import Cocoa
 import WebKit
+import Carbon
 
 private let defaultWidth = 800
 private let defaultHeight = 600
@@ -241,6 +242,15 @@ private struct HelperCommand: Decodable {
     let type: String
     let scale: Double?
     let visible: Bool?
+    let x: Double?, y: Double?, dx: Double?, dy: Double?
+    let pointDx: Int64?, pointDy: Int64?
+    let button: Int?, press: UInt64?, keyCode: UInt16?, modifiers: UInt32?
+    let logical: String?, text: String?, scope: String?
+    let cooperative: Bool?, isRepeat: Bool?
+    enum CodingKeys: String, CodingKey {
+        case id, type, scale, visible, x, y, dx, dy, button, press, modifiers, logical, text, scope, cooperative
+        case pointDx = "point_dx", pointDy = "point_dy", keyCode = "key_code", isRepeat = "repeat"
+    }
 }
 
 private func littleEndian(_ value: UInt32) -> Data {
@@ -546,204 +556,245 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             // Executed means the reload request was applied to WKWebView. A
             // subsequent navigation failure is distinct from command failure.
             emitAck(command.id, outcome: "executed")
+        case "mouse_move", "mouse_down", "mouse_up", "scroll", "key_down", "key_up", "text", "cleanup":
+            emitAck(command.id, outcome: nativeInput(command))
         default:
-            // The old SDL stdin vocabulary has no entry point. Input commands
-            // will be added by #2 and must use native NSEvent delivery.
             emitAck(command.id, outcome: "unsupported")
         }
     }
 
     // MARK: Native input
-
-    // Native responder delivery retained for the input slice. JavaScript
-    // event synthesis and the LUCHS_INPUT=bridge switch have been removed.
+    private struct HeldKey {
+        let code: UInt16
+        var characters: String
+        let base: String
+        let flags: NSEvent.ModifierFlags
+        let view: WKWebView
+        var pending: Bool
+        var isRepeat: Bool
+    }
+    private struct HeldButton {
+        let point: NSPoint
+        let view: WKWebView
+        let count: Int
+    }
+    private var heldKeys: [UInt64: HeldKey] = [:]
+    private var heldButtons: [Int: HeldButton] = [:]
+    private var pendingPress: UInt64?
+    private var modifierFlags: NSEvent.ModifierFlags = []
+    private var lastClick: (time: TimeInterval, point: NSPoint, button: Int, count: Int) = (0, .zero, 0, 0)
     private let traceInput = ProcessInfo.processInfo.environment["LUCHS_INPUT_TRACE"] == "1"
 
-    // Straight to the active view's responder methods rather than through
-    // the window: with a popup open, the window would hand keys to its
-    // first responder, the main view, not the popup.
-    private func route(_ event: NSEvent, _ deliver: (NSEvent) -> Void) {
-        if traceInput { debugLog("input \(event.type.rawValue) at \(event.locationInWindow) characters \(event.type == .keyDown || event.type == .keyUp ? event.characters ?? "" : "")") }
-        deliver(event)
+    private func flags(_ bits: UInt32) -> NSEvent.ModifierFlags {
+        var value: NSEvent.ModifierFlags = []
+        if bits & 1 != 0 { value.insert(.shift) }
+        if bits & 2 != 0 { value.insert(.control) }
+        if bits & 4 != 0 { value.insert(.option) }
+        if bits & 8 != 0 { value.insert(.command) }
+        if bits & 32 != 0 { value.insert(.capsLock) }
+        return value
     }
-    private var buttonsDown: Set<Int> = []
-    private var lastClick: (time: TimeInterval, x: CGFloat, y: CGFloat, count: Int) = (0, 0, 0, 0)
-    // A printable key waits for the text event that follows it (the layout's
-    // characters, IME output), and is sent as one key event carrying them.
-    private var pendingKey: (keycode: Int, mod: Int, isRepeat: Bool)?
-    private var modifierFlags: NSEvent.ModifierFlags = []
-
-    private func windowPoint(_ x: CGFloat, _ y: CGFloat) -> NSPoint {
-        NSPoint(x: x, y: CGFloat(height) - y)
+    private func layoutCharacters(_ code: UInt16, flags: NSEvent.ModifierFlags) -> String? {
+        let source = TISCopyCurrentKeyboardLayoutInputSource().takeRetainedValue()
+        guard let property = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
+        let data = Unmanaged<CFData>.fromOpaque(property).takeUnretainedValue()
+        guard let bytes = CFDataGetBytePtr(data) else { return nil }
+        let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
+        var modifiers: UInt32 = 0
+        if flags.contains(.shift) { modifiers |= UInt32(shiftKey) }
+        if flags.contains(.control) { modifiers |= UInt32(controlKey) }
+        if flags.contains(.option) { modifiers |= UInt32(optionKey) }
+        if flags.contains(.command) { modifiers |= UInt32(cmdKey) }
+        if flags.contains(.capsLock) { modifiers |= UInt32(alphaLock) }
+        var dead: UInt32 = 0, length = 0
+        var output = [UniChar](repeating: 0, count: 255)
+        let result = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown), modifiers >> 8,
+            UInt32(LMGetKbdType()), OptionBits(1 << kUCKeyTranslateNoDeadKeysBit), &dead,
+            output.count, &length, &output)
+        guard result == noErr else { return nil }
+        return String(utf16CodeUnits: output, count: length)
     }
-
-    private func deliverNative(_ message: [String: Any], type: String, to view: WKWebView) {
-        guard let window else { return }
-        let now = ProcessInfo.processInfo.systemUptime
-        let x = CGFloat((message["x"] as? NSNumber)?.doubleValue ?? 0)
-        let y = CGFloat((message["y"] as? NSNumber)?.doubleValue ?? 0)
-        switch type {
-        case "mouse_move":
-            let kind: NSEvent.EventType = buttonsDown.contains(1) ? .leftMouseDragged
-                : buttonsDown.contains(3) ? .rightMouseDragged
-                : buttonsDown.isEmpty ? .mouseMoved : .otherMouseDragged
-            guard let event = NSEvent.mouseEvent(with: kind, location: windowPoint(x, y), modifierFlags: modifierFlags, timestamp: now, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0) else { return }
-            route(event) { event in
-                switch kind {
-                case .leftMouseDragged: view.mouseDragged(with: event)
-                case .rightMouseDragged: view.rightMouseDragged(with: event)
-                case .otherMouseDragged: view.otherMouseDragged(with: event)
-                default: view.mouseMoved(with: event)
-                }
-            }
-        case "mouse_down", "mouse_up":
-            // SDL buttons: 1 left, 2 middle, 3 right.
-            let button = (message["button"] as? NSNumber)?.intValue ?? 1
-            let down = type == "mouse_down"
-            var count = 1
-            if down {
-                if now - lastClick.time < 0.5 && abs(x - lastClick.x) < 4 && abs(y - lastClick.y) < 4 { count = lastClick.count + 1 }
-                lastClick = (now, x, y, count)
-                buttonsDown.insert(button)
-            } else {
-                count = max(1, lastClick.count)
-                buttonsDown.remove(button)
-            }
-            let kind: NSEvent.EventType = switch button {
-            case 1: down ? .leftMouseDown : .leftMouseUp
-            case 3: down ? .rightMouseDown : .rightMouseUp
-            default: down ? .otherMouseDown : .otherMouseUp
-            }
-            guard let event = NSEvent.mouseEvent(with: kind, location: windowPoint(x, y), modifierFlags: modifierFlags, timestamp: now, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: count, pressure: down ? 1 : 0) else { return }
-            route(event) { event in
-                switch kind {
-                case .leftMouseDown: view.mouseDown(with: event)
-                case .leftMouseUp: view.mouseUp(with: event)
-                case .rightMouseDown: view.rightMouseDown(with: event)
-                case .rightMouseUp: view.rightMouseUp(with: event)
-                case .otherMouseDown: view.otherMouseDown(with: event)
-                default: view.otherMouseUp(with: event)
-                }
-            }
-        case "wheel":
-            // SDL: y > 0 is a scroll up, x > 0 a scroll right; a Quartz wheel
-            // counts up and left as positive. One SDL notch is 40 pixels.
-            let dx = (message["dx"] as? NSNumber)?.doubleValue ?? 0
-            let dy = (message["dy"] as? NSNumber)?.doubleValue ?? 0
-            guard let quartz = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(dy * 40), wheel2: Int32(-dx * 40), wheel3: 0) else { return }
-            // Quartz locations are global with the origin at the primary
-            // screen's top left; the window sits at that screen's origin.
-            let primaryHeight = NSScreen.screens.first?.frame.height ?? CGFloat(height)
-            quartz.location = CGPoint(x: window.frame.minX + x, y: primaryHeight - (window.frame.minY + CGFloat(height) - y))
-            guard let event = NSEvent(cgEvent: quartz) else { return }
-            route(event) { event in view.scrollWheel(with: event) }
-        case "key_down", "key_up", "text":
-            deliverKey(message, type: type, to: view, now: now)
-        default:
-            break
-        }
-    }
-
-    private func deliverKey(_ message: [String: Any], type: String, to view: WKWebView, now: TimeInterval) {
-        if type == "text" {
-            let text = message["text"] as? String ?? ""
-            let pending = pendingKey
-            pendingKey = nil
-            let keycode = pending?.keycode ?? 0
-            let base = keyCharacters(keycode, mod: 0)?.characters ?? text
-            sendKey(.keyDown, characters: text, ignoringModifiers: base, keyCode: virtualKeyCode(keycode), flags: modifierFlags, isRepeat: pending?.isRepeat ?? false, to: view, now: now)
-            return
-        }
-        let keycode = (message["keycode"] as? NSNumber)?.intValue ?? 0
-        let mod = (message["mod"] as? NSNumber)?.intValue ?? 0
-        let isRepeat = (message["repeat"] as? Bool) ?? false
-        modifierFlags = modifierFlagsFromSdl(mod)
-        let shortcut = !modifierFlags.isDisjoint(with: [.control, .option, .command])
-        if type == "key_down" {
-            guard let chars = keyCharacters(keycode, mod: mod) else { return }
-            if isPrintable(keycode) && !shortcut {
-                pendingKey = (keycode, mod, isRepeat)
-                return
-            }
-            sendKey(.keyDown, characters: chars.characters, ignoringModifiers: chars.ignoringModifiers, keyCode: virtualKeyCode(keycode), flags: modifierFlags, isRepeat: isRepeat, to: view, now: now)
-        } else {
-            if let pending = pendingKey, pending.keycode == keycode, let chars = keyCharacters(keycode, mod: pending.mod) {
-                // No text followed (text input was off): send the key as is.
-                pendingKey = nil
-                sendKey(.keyDown, characters: chars.characters, ignoringModifiers: chars.ignoringModifiers, keyCode: virtualKeyCode(keycode), flags: modifierFlags, isRepeat: pending.isRepeat, to: view, now: now)
-            }
-            guard let chars = keyCharacters(keycode, mod: mod) else { return }
-            sendKey(.keyUp, characters: chars.characters, ignoringModifiers: chars.ignoringModifiers, keyCode: virtualKeyCode(keycode), flags: modifierFlags, isRepeat: false, to: view, now: now)
-        }
-    }
-
-    private func sendKey(_ kind: NSEvent.EventType, characters: String, ignoringModifiers: String, keyCode: UInt16, flags: NSEvent.ModifierFlags, isRepeat: Bool, to view: WKWebView, now: TimeInterval) {
-        guard let window else { return }
-        guard let event = NSEvent.keyEvent(with: kind, location: .zero, modifierFlags: flags, timestamp: now, windowNumber: window.windowNumber, context: nil, characters: characters, charactersIgnoringModifiers: ignoringModifiers, isARepeat: isRepeat, keyCode: keyCode) else { return }
-        route(event) { event in
-            if kind == .keyDown { view.keyDown(with: event) } else { view.keyUp(with: event) }
-        }
-    }
-
-    private func isPrintable(_ keycode: Int) -> Bool { keycode >= 32 && keycode <= 126 }
-
-    private func modifierFlagsFromSdl(_ mod: Int) -> NSEvent.ModifierFlags {
-        var flags: NSEvent.ModifierFlags = []
-        if mod & 0x3 != 0 { flags.insert(.shift) }
-        if mod & 0xC0 != 0 { flags.insert(.control) }
-        if mod & 0x300 != 0 { flags.insert(.option) }
-        if mod & 0xC00 != 0 { flags.insert(.command) }
-        if mod & 0x2000 != 0 { flags.insert(.capsLock) }
-        return flags
-    }
-
-    // The characters a key event carries: for a printable SDL keycode the
-    // US-layout character (shifted when shift is down, the control character
-    // under control); for a function key the Cocoa function-key code point.
-    private func keyCharacters(_ keycode: Int, mod: Int) -> (characters: String, ignoringModifiers: String)? {
-        if isPrintable(keycode) {
-            let base = String(UnicodeScalar(UInt8(keycode)))
-            var shown = base
-            if mod & 0x3 != 0 {
-                let shifted: [String: String] = ["`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(", "0": ")", "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|", ";": ":", "'": "\"", ",": "<", ".": ">", "/": "?"]
-                shown = shifted[base] ?? base.uppercased()
-            }
-            if mod & 0xC0 != 0, let scalar = base.unicodeScalars.first, scalar.value >= 0x40 && scalar.value <= 0x7F {
-                shown = String(UnicodeScalar(UInt8(scalar.value & 0x1F)))
-            }
-            return (shown, base)
-        }
-        let function: [Int: String] = [
-            13: "\r", 27: "\u{1B}", 8: "\u{7F}", 9: "\t", 127: "\u{F728}",
-            1073741912: "\r",
-            1073741906: "\u{F700}", 1073741905: "\u{F701}", 1073741904: "\u{F702}", 1073741903: "\u{F703}",
-            1073741898: "\u{F729}", 1073741901: "\u{F72B}", 1073741899: "\u{F72C}", 1073741902: "\u{F72D}",
-            1073741897: "\u{F727}",
-        ]
-        if let text = function[keycode] { return (text, text) }
-        if keycode >= 1073741882 && keycode <= 1073741893 {
-            let text = String(UnicodeScalar(UInt32(0xF704 + keycode - 1073741882))!)
-            return (text, text)
-        }
+    private func specialCharacters(_ code: UInt16) -> String? {
+        let named: [UInt16: UInt32] = [36:13, 48:9, 51:0x7f, 53:0x1b, 76:13,
+            117:0xf728, 115:0xf729, 119:0xf72b, 116:0xf72c, 121:0xf72d,
+            123:0xf702,124:0xf703,125:0xf701,126:0xf700,114:0xf746,71:0xf739]
+        if let value = named[code] { return String(UnicodeScalar(value)!) }
+        let functions: [UInt16] = [122,120,99,118,96,97,98,100,101,109,103,111,105,107,113,106]
+        if let index = functions.firstIndex(of: code) { return String(UnicodeScalar(0xf704 + UInt32(index))!) }
+        if isModifier(code) { return "" }
         return nil
     }
+    private func isModifier(_ code: UInt16) -> Bool { (54...62).contains(code) }
+    private func sendKey(_ key: HeldKey, down: Bool, flags: NSEvent.ModifierFlags? = nil) -> Bool {
+        guard let window else { return false }
+        let kind: NSEvent.EventType = isModifier(key.code) ? .flagsChanged : down ? .keyDown : .keyUp
+        guard let event = NSEvent.keyEvent(with: kind, location: .zero, modifierFlags: flags ?? key.flags,
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+            characters: key.characters, charactersIgnoringModifiers: key.base, isARepeat: down && key.isRepeat,
+            keyCode: key.code) else { return false }
+        if traceInput { debugLog("input key code=\(key.code) down=\(down) characters=\(key.characters) flags=\(event.modifierFlags.rawValue)") }
+        if kind == .flagsChanged { key.view.flagsChanged(with: event) }
+        else if down {
+            if event.modifierFlags.contains(.command) {
+                // A standalone WebKit host needs AppKit's standard Edit menu
+                // for key equivalents. Target the bound view, including popups.
+                let menu = NSMenu(title: "Edit")
+                for (title, action, equivalent) in [("Select All", "selectAll:", "a"), ("Copy", "copy:", "c"),
+                    ("Paste", "paste:", "v"), ("Cut", "cut:", "x"), ("Undo", "undo:", "z")] {
+                    let item = NSMenuItem(title: title, action: NSSelectorFromString(action), keyEquivalent: equivalent)
+                    item.target = key.view
+                    menu.addItem(item)
+                }
+                if menu.performKeyEquivalent(with: event) || key.view.performKeyEquivalent(with: event) { return true }
+            }
+            key.view.keyDown(with: event)
+        } else { key.view.keyUp(with: event) }
+        return true
+    }
+    private func flushPending() -> Bool {
+        guard let press = pendingPress, var key = heldKeys[press] else { pendingPress = nil; return true }
+        key.pending = false
+        guard sendKey(key, down: true) else { return false }
+        heldKeys[press] = key
+        pendingPress = nil
+        return true
+    }
+    private func mouse(_ button: Int, down: Bool, point: NSPoint, count: Int, view: WKWebView) -> Bool {
+        guard let window else { return false }
+        let kind: NSEvent.EventType = button == 1 ? (down ? .leftMouseDown : .leftMouseUp)
+            : button == 2 ? (down ? .rightMouseDown : .rightMouseUp) : (down ? .otherMouseDown : .otherMouseUp)
+        guard let initial = NSEvent.mouseEvent(with: kind, location: point, modifierFlags: modifierFlags,
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: count, pressure: down ? 1 : 0), let cg = initial.cgEvent else { return false }
+        cg.setIntegerValueField(.mouseEventButtonNumber, value: Int64(button - 1))
+        guard let event = NSEvent(cgEvent: cg) else { return false }
+        if traceInput { debugLog("input button=\(button) down=\(down) point=\(point) native=\(event.buttonNumber)") }
+        switch kind {
+        case .leftMouseDown: view.mouseDown(with: event)
+        case .leftMouseUp: view.mouseUp(with: event)
+        case .rightMouseDown: view.rightMouseDown(with: event)
+        case .rightMouseUp: view.rightMouseUp(with: event)
+        case .otherMouseDown: view.otherMouseDown(with: event)
+        default: view.otherMouseUp(with: event)
+        }
+        return true
+    }
+    private func cleanup(_ scope: String) -> Bool {
+        // Remove only confirmed releases. A partial failure deliberately retains
+        // the remaining bindings for retry; Rust quarantines controller admission.
 
-    private func virtualKeyCode(_ keycode: Int) -> UInt16 {
-        let table: [Int: UInt16] = [
-            0x61: 0, 0x73: 1, 0x64: 2, 0x66: 3, 0x68: 4, 0x67: 5, 0x7A: 6, 0x78: 7, 0x63: 8, 0x76: 9, 0x62: 11,
-            0x71: 12, 0x77: 13, 0x65: 14, 0x72: 15, 0x79: 16, 0x74: 17, 0x31: 18, 0x32: 19, 0x33: 20, 0x34: 21,
-            0x36: 22, 0x35: 23, 0x3D: 24, 0x39: 25, 0x37: 26, 0x2D: 27, 0x38: 28, 0x30: 29, 0x5D: 30, 0x6F: 31,
-            0x75: 32, 0x5B: 33, 0x69: 34, 0x70: 35, 0x6C: 37, 0x6A: 38, 0x27: 39, 0x6B: 40, 0x3B: 41, 0x5C: 42,
-            0x2C: 43, 0x2F: 44, 0x6E: 45, 0x6D: 46, 0x2E: 47, 0x60: 50, 0x20: 49,
-            13: 36, 9: 48, 8: 51, 27: 53, 127: 117, 1073741912: 76,
-            1073741898: 115, 1073741899: 116, 1073741901: 119, 1073741902: 121,
-            1073741904: 123, 1073741903: 124, 1073741905: 125, 1073741906: 126,
-            1073741882: 122, 1073741883: 120, 1073741884: 99, 1073741885: 118, 1073741886: 96, 1073741887: 97,
-            1073741888: 98, 1073741889: 100, 1073741890: 101, 1073741891: 109, 1073741892: 103, 1073741893: 111,
-        ]
-        // No entry: a code no shortcut is bound to. 0 would be kVK_ANSI_A, and an
-        // unknown key could then fire an A-keyed shortcut such as select all.
-        return table[keycode] ?? 0xFFFF
+        for button in heldButtons.keys.sorted() {
+            guard let held = heldButtons[button], mouse(button, down: false, point: held.point, count: held.count, view: held.view) else { return false }
+            heldButtons.removeValue(forKey: button)
+        }
+        if scope == "all" {
+            // Deferred printable presses were never delivered; cleanup discards
+            // them instead of introducing a new character while losing focus.
+            pendingPress = nil
+            for press in heldKeys.keys.sorted() {
+                guard let key = heldKeys[press] else { continue }
+                if !key.pending && !sendKey(key, down: false, flags: []) { return false }
+                heldKeys.removeValue(forKey: press)
+            }
+            modifierFlags = []
+        }
+        return true
+    }
+    private func nativeInput(_ command: HelperCommand) -> String {
+        if command.type == "cleanup" {
+            guard let scope = command.scope, scope == "all" || scope == "pointer" else { return "unsupported" }
+            return cleanup(scope) ? "executed" : "failed"
+        }
+        guard let view = activeView, let window else { return "failed" }
+        if window.firstResponder !== view { window.makeFirstResponder(view) }
+        let point = NSPoint(x: command.x ?? 0, y: Double(height) - (command.y ?? 0))
+        switch command.type {
+        case "text":
+            guard let text = command.text else { return "unsupported" }
+            if command.cooperative == true, let press = pendingPress, var key = heldKeys[press] {
+                key.characters = text; key.pending = false
+                guard sendKey(key, down: true) else { return "failed" }
+                heldKeys[press] = key; pendingPress = nil
+            } else {
+                guard let client = view as? NSTextInputClient else { return "unsupported" }
+                client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            }
+        case "key_down", "key_up":
+            guard let press = command.press else { return "unsupported" }
+            modifierFlags = flags(command.modifiers ?? 0)
+            if command.type == "key_up" {
+                guard var key = heldKeys[press] else { return "unsupported" }
+                if key.pending {
+                    key.pending = false
+                    guard sendKey(key, down: true) else { return "failed" }
+                }
+                guard sendKey(key, down: false, flags: modifierFlags) else { return "failed" }
+                heldKeys.removeValue(forKey: press)
+                if pendingPress == press { pendingPress = nil }
+            } else if command.isRepeat == true {
+                guard var key = heldKeys[press], flushPending() else { return "unsupported" }
+                key.isRepeat = true
+                key.pending = command.cooperative == true && !key.characters.isEmpty && key.characters.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value < 0xf700 } && modifierFlags.isDisjoint(with: [.control,.option,.command])
+                if key.pending { pendingPress = press } else if !sendKey(key, down: true, flags: modifierFlags) { return "failed" }
+                heldKeys[press] = key
+            } else {
+                guard heldKeys[press] == nil, let code = command.keyCode, flushPending() else { return "unsupported" }
+                let chars = command.logical ?? specialCharacters(code) ?? layoutCharacters(code, flags: modifierFlags)
+                let base = command.logical ?? specialCharacters(code) ?? layoutCharacters(code, flags: [])
+                guard let chars, let base else { return "unsupported" }
+                let pending = command.cooperative == true && !chars.isEmpty && chars.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value < 0xf700 } && modifierFlags.isDisjoint(with: [.control,.option,.command])
+                let key = HeldKey(code: code, characters: chars, base: base, flags: modifierFlags, view: view, pending: pending, isRepeat: false)
+                if pending { pendingPress = press } else if !sendKey(key, down: true) { return "failed" }
+                heldKeys[press] = key
+            }
+        case "mouse_down", "mouse_up":
+            guard let button = command.button, (1...5).contains(button) else { return "unsupported" }
+            if command.type == "mouse_up" {
+                guard let held = heldButtons[button], mouse(button, down: false, point: point, count: held.count, view: held.view) else { return "failed" }
+                heldButtons.removeValue(forKey: button)
+            } else {
+                let now = ProcessInfo.processInfo.systemUptime
+                let count = lastClick.button == button && now - lastClick.time < NSEvent.doubleClickInterval && hypot(point.x - lastClick.point.x, point.y - lastClick.point.y) < 4 ? lastClick.count + 1 : 1
+                guard mouse(button, down: true, point: point, count: count, view: view) else { return "failed" }
+                lastClick = (now, point, button, count)
+                heldButtons[button] = HeldButton(point: point, view: view, count: count)
+            }
+        case "mouse_move":
+            let button = heldButtons.keys.sorted().first
+            let target = button.flatMap { heldButtons[$0]?.view } ?? view
+            let kind: NSEvent.EventType = button == 1 ? .leftMouseDragged : button == 2 ? .rightMouseDragged : button == nil ? .mouseMoved : .otherMouseDragged
+            guard let initial = NSEvent.mouseEvent(with: kind, location: point, modifierFlags: modifierFlags,
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 0, pressure: button == nil ? 0 : 1), let cg = initial.cgEvent else { return "failed" }
+            if let button { cg.setIntegerValueField(.mouseEventButtonNumber, value: Int64(button - 1)) }
+            guard let event = NSEvent(cgEvent: cg) else { return "failed" }
+            switch kind {
+            case .leftMouseDragged: target.mouseDragged(with: event)
+            case .rightMouseDragged: target.rightMouseDragged(with: event)
+            case .otherMouseDragged: target.otherMouseDragged(with: event)
+            default: target.mouseMoved(with: event)
+            }
+            for button in heldButtons.keys { if let held = heldButtons[button] { heldButtons[button] = HeldButton(point: point, view: held.view, count: held.count) } }
+        case "scroll":
+            guard let dx = command.dx, let dy = command.dy, dx.isFinite, dy.isFinite,
+                abs(dx) <= 32767, abs(dy) <= 32767, let px = command.pointDx, let py = command.pointDy,
+                let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: 0, wheel3: 0) else { return "unsupported" }
+            cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+            // Jackstay positive means content toward its end; Quartz positive is up/left.
+            cg.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: -py)
+            cg.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: -px)
+            cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: -dy)
+            cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: -dx)
+            cg.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: -py)
+            cg.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: -px)
+            let primaryHeight = NSScreen.screens.first?.frame.height ?? CGFloat(height)
+            cg.location = CGPoint(x: window.frame.minX + point.x, y: primaryHeight - (window.frame.minY + point.y))
+            guard let event = NSEvent(cgEvent: cg) else { return "failed" }
+            if traceInput { debugLog("input scroll dx=\(dx) dy=\(dy) fixed=\(cg.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)) native=\(event.scrollingDeltaX),\(event.scrollingDeltaY) precise=\(event.hasPreciseScrollingDeltas)") }
+            view.scrollWheel(with: event)
+        default: return "unsupported"
+        }
+        return "executed"
     }
 
     private func capture(_ command: HelperCommand) {

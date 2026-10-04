@@ -35,7 +35,7 @@ impl CommandOutcome {
         match self {
             Self::Executed => Outcome::Executed,
             Self::Unsupported => Outcome::Unsupported,
-            Self::Failed(_) => Outcome::Rejected,
+            Self::Failed(_) => Outcome::Uncertain,
             Self::Uncertain => Outcome::Uncertain,
         }
     }
@@ -132,6 +132,19 @@ pub struct Helper {
     socket: Option<UnixStream>,
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
+    sender: CommandSender,
+}
+
+/// Cloneable command port; writes and IDs are serialized, acknowledgement waits
+/// do not hold the writer lock. It cannot keep the helper process alive.
+#[derive(Clone)]
+pub struct CommandSender {
+    writer: Arc<Mutex<CommandWriter>>,
+    shared: Arc<Shared>,
+    process: Arc<Mutex<Child>>,
+}
+struct CommandWriter {
+    socket: UnixStream,
     next_id: u64,
 }
 
@@ -232,12 +245,20 @@ impl Helper {
                 }
             }
         });
+        let sender = CommandSender {
+            process: child.clone(),
+            writer: Arc::new(Mutex::new(CommandWriter {
+                socket: socket.try_clone()?,
+                next_id: 1,
+            })),
+            shared: shared.clone(),
+        };
         Ok(Self {
             child,
             socket: Some(socket),
             shared,
             reader: Some(reader),
-            next_id: 1,
+            sender,
         })
     }
 
@@ -307,64 +328,16 @@ impl Helper {
         self.send_json_command(serde_json::json!({"type": kind}), timeout)
     }
 
+    pub fn command_sender(&self) -> CommandSender {
+        self.sender.clone()
+    }
+
     pub fn send_json_command(
         &mut self,
-        mut command: serde_json::Value,
+        command: serde_json::Value,
         timeout: Duration,
     ) -> io::Result<PendingCommand> {
-        let id = self.next_id;
-        let next = id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("command ids exhausted"))?;
-        let object = command.as_object_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "command must be an object")
-        })?;
-        object.insert("id".into(), id.into());
-        let bytes = encode_json_command(&command)?;
-        let (send, ack) = mpsc::sync_channel(1);
-        let deadline = Instant::now() + timeout;
-        {
-            let mut state = self.shared.state.lock().unwrap();
-            if state.ended {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "helper stopped"));
-            }
-            if state.pending.len() >= MAX_PENDING_COMMANDS {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "too many pending commands",
-                ));
-            }
-            state.pending.insert(id, AckWaiter { send, deadline });
-        }
-        self.next_id = next;
-        let pending = PendingCommand {
-            id,
-            ack,
-            shared: self.shared.clone(),
-            deadline,
-        };
-        if let Err(error) = write_command(
-            self.socket.as_mut().expect("running helper"),
-            &bytes,
-            deadline,
-        ) {
-            // A peer that exits with unread commands can reset the socket on
-            // Linux. Let the reader drain complete final frames and verify exit.
-            if matches!(
-                error.kind(),
-                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-            ) {
-                return Err(error);
-            }
-            // A partial command cannot be retried on the same byte stream.
-            end_stream(
-                &self.shared,
-                &self.child,
-                Some(io::Error::new(error.kind(), error.to_string())),
-            );
-            return Err(error);
-        }
-        Ok(pending)
+        self.sender.send_json_command(command, timeout)
     }
 
     pub fn command(&mut self, kind: &str, timeout: Duration) -> CommandOutcome {
@@ -391,6 +364,62 @@ impl Helper {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+impl CommandSender {
+    pub fn send_json_command(
+        &self,
+        mut command: serde_json::Value,
+        timeout: Duration,
+    ) -> io::Result<PendingCommand> {
+        let mut writer = self.writer.lock().unwrap();
+        let id = writer.next_id;
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("command ids exhausted"))?;
+        let object = command.as_object_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "command must be an object")
+        })?;
+        object.insert("id".into(), id.into());
+        let bytes = encode_json_command(&command)?;
+        let (send, ack) = mpsc::sync_channel(1);
+        let deadline = Instant::now() + timeout;
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            if state.ended {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "helper stopped"));
+            }
+            if state.pending.len() >= MAX_PENDING_COMMANDS {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "too many pending commands",
+                ));
+            }
+            state.pending.insert(id, AckWaiter { send, deadline });
+        }
+        writer.next_id = next;
+        let pending = PendingCommand {
+            id,
+            ack,
+            shared: self.shared.clone(),
+            deadline,
+        };
+        if let Err(error) = write_command(&mut writer.socket, &bytes, deadline) {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ) {
+                return Err(error);
+            }
+            end_stream(
+                &self.shared,
+                &self.process,
+                Some(io::Error::new(error.kind(), error.to_string())),
+            );
+            return Err(error);
+        }
+        Ok(pending)
     }
 }
 

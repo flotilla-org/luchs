@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     os::unix::fs::MetadataExt,
     sync::atomic::{AtomicU32, Ordering},
@@ -183,15 +185,14 @@ fn consumer_process_death_releases_reservation() {
     assert_eq!(acquire(&consumer).bytes(), [42; 4]);
 }
 
-// Optional controls must preserve media while luchs remains observation-only.
 #[test]
-fn optional_input_and_affordances_receive_media_without_input_authority() {
-    let (mut source, path) = source();
+fn all_typing_modes_advertise_native_families_and_preserve_media() {
     for mode in [
         jackstay::input::Mode::Physical,
         jackstay::input::Mode::SourceText,
         jackstay::input::Mode::Cooperative,
     ] {
+        let (mut source, path) = source();
         let connected = bootstrap::connect_v2(
             Stream::connect(&path).unwrap(),
             InputRequest::Optional(mode),
@@ -199,30 +200,87 @@ fn optional_input_and_affordances_receive_media_without_input_authority() {
         )
         .unwrap();
         assert!(connected.affordances.is_some());
-        if let Some(input) = &connected.input {
-            assert_eq!(input.welcome().config.capabilities, 0);
-            assert_eq!(
-                input.send(jackstay::input::Event::Text("never executed".into())),
-                Err(jackstay::input::Error::Unsupported)
-            );
-        } else {
-            assert_eq!(
-                connected.input_error,
-                Some(jackstay::input::Error::Unsupported)
-            );
-        }
+        let input = connected.input.as_ref().unwrap();
+        assert_eq!(
+            input.welcome().config.capabilities,
+            jackstay::input::CAP_ALL
+        );
+        assert_eq!(input.welcome().config.modes, 7);
         // SAFETY: this test owns a grant from its conforming sole producer.
         let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
         let consumer = setup.attach(1).unwrap();
         source.publish(pixels(1)).unwrap();
         assert_eq!(acquire(&consumer).bytes(), [42; 4]);
+        drop((consumer, setup, connected.input, connected.affordances));
+        source.stop().unwrap();
     }
-    // Rejecting cleanup is deliberately reported by the toolkit, never executed.
-    assert!(
-        source
-            .stop()
-            .unwrap_err()
-            .to_string()
-            .contains("input cleanup failed")
+}
+
+#[test]
+fn helper_attachment_does_not_wait_for_in_flight_input_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release-ack");
+    let script = format!(
+        r#"
+cmd=command(); assert cmd['type']=='key_down'
+control(3,{{'started':True}})
+while not os.path.exists({path}): time.sleep(0.01)
+ack(cmd)
+cmd=command(); assert cmd['type']=='cleanup'; ack(cmd)
+"#,
+        path = serde_json::to_string(&release.to_string_lossy()).unwrap()
     );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut helper = luchs::helper::Helper::spawn_with_state(
+        std::process::Command::new("python3")
+            .args(["-c", &format!("{}{script}", common::PYTHON_PROTOCOL)]),
+        move |state| {
+            if state["started"].as_bool() == Some(true) {
+                tx.send(()).unwrap();
+            }
+        },
+    )
+    .unwrap();
+    let (source, path) = source();
+    source.attach_input(&helper);
+    let connected = bootstrap::connect_v2(
+        Stream::connect(&path).unwrap(),
+        InputRequest::Required(jackstay::input::Mode::Physical),
+        ChannelRequest::None,
+    )
+    .unwrap();
+    let input = connected.input.as_ref().unwrap();
+    let sequence = input
+        .send(jackstay::input::Event::Key {
+            press: 1,
+            action: jackstay::input::Action::Down,
+            key: jackstay::input::Key::Physical("KeyA".into()),
+            modifiers: 0,
+        })
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let start = Instant::now();
+    source.attach_input(&helper);
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "attachment waited for input acknowledgement"
+    );
+    std::fs::write(&release, "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(jackstay::input::Status::Completed {
+            sequence: completed,
+            outcome,
+        }) = input.poll()
+        {
+            assert_eq!(completed, sequence);
+            assert_eq!(outcome, jackstay::input::Outcome::Executed);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(connected);
+    source.stop().unwrap();
+    helper.finish().unwrap();
 }

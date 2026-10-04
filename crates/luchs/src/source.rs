@@ -1,4 +1,4 @@
-//! Helper frames and observation-only callbacks for the native producer toolkit.
+//! Helper frames and native input callbacks for the native producer toolkit.
 use crate::{
     Result,
     capture::CapturePolicy,
@@ -26,14 +26,16 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-struct Observation {
+struct PageProducer {
+    input: crate::input::Executor,
     recycled: Arc<Mutex<Vec<Vec<u8>>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
     logical_size: (f64, f64),
     latest: Arc<Mutex<Option<jackstay_producer::Frame>>>,
+    input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
 }
-impl Producer for Observation {
+impl Producer for PageProducer {
     fn frame(&mut self) -> Option<jackstay_producer::Frame> {
         // Only an Option is swapped under this lock; unwinding cannot leave a
         // partially mutated frame or ownership bookkeeping to repair.
@@ -43,8 +45,14 @@ impl Producer for Observation {
             .take()
     }
 
-    fn execute(&mut self, _work: Work) -> Outcome {
-        Outcome::Unsupported
+    fn execute(&mut self, work: Work) -> Outcome {
+        // The toolkit owns and serializes the executor. Only attachment is
+        // shared; release its lock before the helper acknowledgement wait.
+        let sender = self.input_sender.lock().unwrap().clone();
+        if let Some(sender) = sender {
+            self.input.attach(sender);
+        }
+        self.input.execute(work)
     }
     fn recycle(&mut self, frame: jackstay_producer::Frame) {
         let mut pool = self.recycled.lock().unwrap();
@@ -77,6 +85,7 @@ pub struct Source {
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     source: jackstay_producer::Source,
     latest: Arc<Mutex<Option<jackstay_producer::Frame>>>,
+    input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
     started: Instant,
     sequence: u64,
 }
@@ -89,6 +98,7 @@ impl Source {
         let recycled = Arc::new(Mutex::new(Vec::with_capacity(4)));
         let presentation = Arc::new(Mutex::new(None));
         let wake = Arc::new(Mutex::new(None));
+        let input_sender = Arc::new(Mutex::new(None));
         let source = Builder::new(
             endpoint,
             ArenaConfig {
@@ -102,9 +112,8 @@ impl Source {
                 drain_timeout: Duration::from_secs(5),
             },
             Config {
-                // ABI 0.12 rejects modes=0. Advertise no capabilities and reject
-                // every callback; the default cooperative mode conveys no authority.
-                capabilities: 0,
+                modes: 7,
+                capabilities: jackstay::input::CAP_ALL,
                 geometry: jackstay::input::Geometry {
                     revision: 1,
                     width: width.into(),
@@ -112,12 +121,14 @@ impl Source {
                 },
                 ..Config::default()
             },
-            Observation {
+            PageProducer {
                 recycled: recycled.clone(),
                 presentation: presentation.clone(),
                 wake: wake.clone(),
                 logical_size: (f64::from(width), f64::from(height)),
                 latest: latest.clone(),
+                input: crate::input::Executor::new(f64::from(height)),
+                input_sender: input_sender.clone(),
             },
         )
         .max_connections(16)
@@ -129,6 +140,7 @@ impl Source {
         Ok((
             Self {
                 wake,
+                input_sender,
                 recycled,
                 presentation,
                 source,
@@ -138,6 +150,10 @@ impl Source {
             },
             path,
         ))
+    }
+
+    pub fn attach_input(&self, helper: &Helper) {
+        *self.input_sender.lock().unwrap() = Some(helper.command_sender());
     }
 
     pub fn publish(&mut self, frame: Frame) -> Result<()> {
@@ -285,6 +301,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             activity.store(true, Ordering::Release);
         }
     })?;
+    source.attach_input(&helper);
     *source.wake.lock().unwrap() = Some(helper.wake_handle());
     let mut policy = CapturePolicy::new(cli.fps, Instant::now());
     let mut pending_capture: Option<crate::helper::PendingCommand> = None;
@@ -423,17 +440,6 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     if ignored > 0 {
         eprintln!("luchs: helper ignored {ignored} unmatched or late acks");
     }
-    match source.stop() {
-        // Zero-capability input never acquires held state. Rejecting cleanup is
-        // expected for this observation-only producer, not a failed CLI run.
-        // The pinned jackstay-producer returns io::Error without a typed
-        // cleanup variant. This exact message is pinned by the CLI test.
-        // TODO(jackstay#70): replace the message comparison with a typed cleanup error.
-        // https://github.com/flotilla-org/jackstay/issues/70
-        Err(error) if error.to_string() == "input cleanup failed" => {
-            eprintln!("luchs: shutdown: {error}");
-        }
-        result => result?,
-    }
+    source.stop()?;
     Ok(())
 }

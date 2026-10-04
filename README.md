@@ -7,19 +7,13 @@ consumer can present the page. SDL is a reference consumer, not Luchs's primary 
 
 This repository implements the frame-producing slice of
 [Jackstay's split](https://github.com/flotilla-org/jackstay/issues/32).
-Input admission and producer-state affordances belong to later slices; host
-presentation scale and visibility hints are handled by this slice. Every connection is
-observation-only, including one that requests optional input. No input
-capabilities are advertised. ABI 0.12 requires a nonzero typing mode,
-so cooperative admission is available but every operation returns unsupported;
-physical and source-text admission are unsupported. The helper uses a
-[framed bidirectional protocol](docs/helper-protocol.md) with per-command acks;
-this core sends reload commands and reserves state events for the next slice. This producer
-never acquires held input state, yet rejects every work item, including cleanup.
-The toolkit reports `input cleanup failed` at shutdown if cooperative input was
-admitted because its cleanup was rejected. Luchs logs that specific error and exits successfully on
-orderly SIGINT, SIGTERM or EOF; other shutdown errors still fail the run.
-Viewers requesting optional input still receive frames; input events are rejected.
+Luchs advertises cooperative, text and physical typing, pointer and scroll input
+through the producer toolkit's ordered executor. Commands use the
+[framed helper protocol](docs/helper-protocol.md). Only an `executed` helper ack
+completes input successfully; unsupported mappings are rejected, and failed or
+missing acks are uncertain. One controller owns the target. Focus loss,
+disconnect and shutdown wait for native releases before admitting a replacement.
+Producer-state affordances beyond presentation remain a later slice.
 
 ## Build and install
 
@@ -51,16 +45,17 @@ luchs --endpoint=my-page --size=800x600 --watch testdata/interactive.html
 luchs --endpoint=my-web-page https://example.com
 ```
 
-Luchs prints its source socket path on stdout and diagnostics on stderr. Pass
-that path to a consumer built with Jackstay bootstrap v2 support (ABI 0.12):
+Luchs prints its source socket path on stdout and diagnostics on stderr. Connect
+the SDL viewer by the configured endpoint name, using the pinned ABI 0.12 build:
 
 ```sh
-capture-viewer-sdl --source-socket /path/printed/by/luchs.sock --observe --affordances optional
+capture-viewer-sdl --source-endpoint my-page --typing cooperative --affordances optional
 ```
 
-Bootstrap v2 is required. The SDL viewer supports it; request its presentation
-channel with `--affordances optional` on a raw source socket. V1-only consumers
-cannot connect.
+Bootstrap v2 is required. Build the SDL viewer against the exact Jackstay revision
+pinned here; use `--source-endpoint` for its v2 path. Add `--observe` for frames
+without input, or choose `--typing text` / `--typing physical` to exercise those
+modes. V1-only consumers cannot connect.
 Rust consumers use `jackstay::bootstrap::connect_v2` with optional or no controls.
 
 The endpoint lives in Jackstay's private per-user runtime directory and the

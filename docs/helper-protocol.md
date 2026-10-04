@@ -86,14 +86,73 @@ An invalid ack schema is a protocol failure.
 | `reload` | Apply a cache-bypassing reload request to the main page view; ack `executed` after the WebKit load/reload call returns |
 | `capture` | Complete a visible snapshot and any changed-frame write before ack; hidden requests take no snapshot |
 | `presentation` | Apply `visible` (boolean) and `scale` (positive finite number), validating the resulting pixel size before ack |
+| `mouse_move`, `mouse_down`, `mouse_up` | Deliver a native pointer event with f64 `x`/`y`; down/up require canonical `button` 1 through 5 |
+| `scroll` | Deliver a continuous pixel CGEvent with `dx`/`dy` and accumulated integer `point_dx`/`point_dy` |
+| `key_down`, `key_up` | Apply a key operation with `press`, `key_code`, `modifiers`, `repeat`, `cooperative`, and optional `logical` characters |
+| `text` | Apply UTF-8 `text`; `cooperative=true` pairs a deferred printable press, otherwise uses the web view's `NSTextInputClient.insertText` |
+| `cleanup` | `scope=pointer` releases held buttons; `scope=all` also releases held keys and discards undelivered printable presses, before ack |
 | Any other type | Apply no effect; ack `unsupported` |
 
 For a local page, reload reads the file and calls `loadHTMLString` with the page
 URL as base URL. A read failure gets `failed`. Remote pages use
 `reloadFromOrigin`. An executed reload confirms submission to WebKit, not
 navigation completion or delivery of a replacement frame; later navigation
-errors go to the console log. Native input and producer-state publication belong to later slices. Old SDL command names currently receive `unsupported`; future input
-handlers must deliver native events, with no JavaScript event-synthesis path.
+errors go to the console log. Producer-state publication beyond capture activity belongs to later slices.
+There is no JavaScript event-synthesis path or SDL keycode vocabulary.
+
+## Native input
+
+Rust's `keymap.rs` maps DOM physical codes to Carbon virtual key codes. Unknown
+codes are unsupported without a guess. Logical keys carry literal characters or
+AppKit's named-key characters. For a printable logical character without a
+known physical position, `key_code=65535` (`u16::MAX`) explicitly means no
+physical binding. It is used only with literal `logical` characters, retained
+for release, and never sent to `UCKeyTranslate` or guessed as another key. The
+helper passes this sentinel to `NSEvent.keyEvent` so native text delivery cannot
+accidentally select a physical-key shortcut. The helper derives physical `characters` and
+`charactersIgnoringModifiers` from the current layout with
+[UCKeyTranslate](https://developer.apple.com/documentation/coreservices/1390584-uckeytranslate).
+It retains code, characters, original flags and destination view per press.
+Repeats and releases resolve that binding rather than translating a new position.
+Modifier metadata uses Jackstay's shift/control/alt/super/caps-lock bits; physical
+modifier presses produce `flagsChanged`. Standard Edit menu key equivalents
+route native Cmd+A/C/V/X/Z to the bound web view.
+
+Cooperative printable down commands reserve a native binding and await the
+following text commit. Text dispatches one native keyDown carrying the commit.
+An unrelated key down flushes the pending key; its own up flushes it if no text
+arrived. Cleanup drops a pending press that was never delivered. Text mode calls
+`insertText` directly and produces no synthetic key events. Native responder
+calls return before `executed` is sent; page processing in WebKit's separate
+process can finish afterward.
+
+Pointer coordinates stay in logical viewport units regardless of capture scale;
+the helper converts to window points without integer rounding. Buttons are
+primary 1, secondary 2, auxiliary 3, back 4 and forward 5; native button numbers
+are 0 through 4. Double-click count uses the native interval, button and distance.
+Motion coalescing belongs to Jackstay. Holds retain their destination view, so
+cleanup still releases a press if the active popup changes.
+
+Scroll follows [Jackstay #64](https://github.com/flotilla-org/jackstay/issues/64):
+Pixel uses logical points, Line multiplies by 40, and Page by logical viewport
+height. Positive y moves content toward its end and positive x toward the right;
+the helper negates both for Quartz. Rust retains subpixel remainders per axis for
+the integer point fields. Every event also carries its own fractional displacement
+in the signed 16.16
+[fixed-point fields](https://developer.apple.com/documentation/coregraphics/cgeventfield).
+Set line fields first, then fixed-point fields, then point fields: Quartz's line
+setter otherwise overwrites point values. `NSEvent` exposes integer point deltas
+from this CGEvent path, so four 0.25-point events deliver one point without loss.
+Unsupported values outside the signed fixed-point range are rejected. Cleanup
+resets remainders after its executed ack. Scroll carry advances only after an
+executed ack; failed sends, rejection and uncertainty leave the prior carry
+unchanged. Phases and momentum metadata are deferred by the v1 contract.
+
+The toolkit owns exclusive controller admission and cleanup barriers. Rust sends
+one scoped cleanup command and waits for the helper to release every hold before
+acknowledging it. Failed or timed-out cleanup quarantines replacement admission.
+Geometry changes trigger pointer cleanup through the toolkit. A capture-scale
+change retains logical geometry and therefore does not cancel holds.
 
 ## Rust dispatch and timeouts
 
