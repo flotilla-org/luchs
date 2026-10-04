@@ -45,8 +45,8 @@ luchs --endpoint=my-page --size=800x600 --watch testdata/interactive.html
 luchs --endpoint=my-web-page https://example.com
 ```
 
-Luchs prints its source socket path on stdout and diagnostics on stderr. Pass
-that path to a consumer built with Jackstay bootstrap v2 support (ABI 0.12):
+Luchs prints its source socket path on stdout and diagnostics on stderr. Connect
+the SDL viewer by the configured endpoint name, using the pinned ABI 0.12 build:
 
 ```sh
 capture-viewer-sdl --source-endpoint my-page --typing cooperative --affordances optional
@@ -54,8 +54,8 @@ capture-viewer-sdl --source-endpoint my-page --typing cooperative --affordances 
 
 Bootstrap v2 is required. Build the SDL viewer against the exact Jackstay revision
 pinned here; use `--source-endpoint` for its v2 path. Add `--observe` for frames
-without input, or choose `--typing text` / `--typing physical` to exercise those modes. V1-only consumers
-cannot connect.
+without input, or choose `--typing text` / `--typing physical` to exercise those
+modes. V1-only consumers cannot connect.
 Rust consumers use `jackstay::bootstrap::connect_v2` with optional or no controls.
 
 The endpoint lives in Jackstay's private per-user runtime directory and the
