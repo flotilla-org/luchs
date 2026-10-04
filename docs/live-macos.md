@@ -113,3 +113,9 @@ stdout. The ping/reload/watch acceptance test passed again after the Rust
 recovery changes. Fake-helper CLI tests separately cover retrying failed and
 uncertain reloads without another file modification, and stopping on an
 unsupported reload.
+
+
+Both live tests passed once more after replacing raw pipe setup/readiness calls
+with rustix wrappers and preserving command-write diagnostics. The final Rust
+pipe path therefore has live ping/reload/watch and clean-EOF evidence as well as
+the fake-helper regression tests.

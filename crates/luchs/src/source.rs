@@ -214,6 +214,10 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     if dropped > 0 {
         eprintln!("luchs: helper dropped {dropped} frames");
     }
+    let ignored = helper.ignored_acks();
+    if ignored > 0 {
+        eprintln!("luchs: helper ignored {ignored} unmatched or late acks");
+    }
     match source.stop() {
         // Zero-capability input never acquires held state. Rejecting cleanup is
         // expected for this observation-only producer, not a failed CLI run.

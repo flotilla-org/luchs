@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, BufReader, Write},
-    os::fd::AsRawFd,
     panic::{AssertUnwindSafe, catch_unwind},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -13,6 +12,10 @@ use std::{
 };
 
 use crate::protocol::{Ack, AckOutcome, Frame, Record, encode_command, read_record};
+use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
+    fs::{OFlags, fcntl_getfl, fcntl_setfl},
+};
 
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_PENDING_COMMANDS: usize = 64;
@@ -46,6 +49,7 @@ struct AckWaiter {
 struct StreamState {
     frames: VecDeque<Frame>,
     dropped_frames: u64,
+    ignored_acks: u64,
     error: Option<io::Error>,
     ended: bool,
     pending: HashMap<u64, AckWaiter>,
@@ -125,15 +129,11 @@ impl Helper {
         let stdout = child.stdout.take().expect("piped stdout");
         let stdin = child.stdin.take().expect("piped stdin");
         // Bound command writes too, including a helper that stops reading stdin.
-        // SAFETY: stdin is a live, owned pipe descriptor; fcntl does not retain it.
-        let flags = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0
-            || unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
-                < 0
+        if let Err(error) =
+            fcntl_getfl(&stdin).and_then(|flags| fcntl_setfl(&stdin, flags | OFlags::NONBLOCK))
         {
-            let error = io::Error::last_os_error();
             kill_and_reap(&mut child);
-            return Err(error);
+            return Err(error.into());
         }
         let child = Arc::new(Mutex::new(child));
         let shared = Arc::new(Shared::default());
@@ -153,9 +153,13 @@ impl Helper {
                         stream.ready.notify_one();
                     }
                     Ok(Some(Record::Ack(ack))) => {
-                        if let Some(waiter) = stream.state.lock().unwrap().pending.remove(&ack.id) {
-                            if Instant::now() <= waiter.deadline {
+                        let mut state = stream.state.lock().unwrap();
+                        match state.pending.remove(&ack.id) {
+                            Some(waiter) if Instant::now() <= waiter.deadline => {
                                 let _ = waiter.send.try_send(ack);
+                            }
+                            _ => {
+                                state.ignored_acks = state.ignored_acks.saturating_add(1);
                             }
                         }
                     }
@@ -210,6 +214,11 @@ impl Helper {
         self.shared.state.lock().unwrap().dropped_frames
     }
 
+    /// Counts unmatched and late acks, including helper duplicate replies.
+    pub fn ignored_acks(&self) -> u64 {
+        self.shared.state.lock().unwrap().ignored_acks
+    }
+
     pub fn send_command(&mut self, kind: &str, timeout: Duration) -> io::Result<PendingCommand> {
         let id = self.next_id;
         let next = id
@@ -244,8 +253,11 @@ impl Helper {
             deadline,
         ) {
             // A partial command cannot be retried on the same byte stream.
-            let mut child = self.child.lock().unwrap();
-            kill_and_reap(&mut child);
+            end_stream(
+                &self.shared,
+                &self.child,
+                Some(io::Error::new(error.kind(), error.to_string())),
+            );
             return Err(error);
         }
         Ok(pending)
@@ -289,7 +301,10 @@ fn end_stream(shared: &Shared, process: &Mutex<Child>, error: Option<io::Error>)
         kill_and_reap(&mut process.lock().unwrap());
     }
     let mut state = shared.state.lock().unwrap();
-    state.error = error;
+    // EOF can race a command-write failure; never erase its root cause.
+    if error.is_some() {
+        state.error = error;
+    }
     state.ended = true;
     state.pending.clear();
     shared.ready.notify_all();
@@ -313,7 +328,18 @@ fn write_command(stdin: &mut ChildStdin, mut bytes: &[u8], deadline: Instant) ->
             Ok(len) => bytes = &bytes[len..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
+                // Keep each wait representable on platforms with millisecond
+                // poll limits, while the outer loop enforces the full deadline.
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(1));
+                let timeout = Timespec::try_from(remaining).expect("at most one second");
+                let mut fds = [PollFd::new(&*stdin, PollFlags::OUT)];
+                if let Err(error) = poll(&mut fds, Some(&timeout)) {
+                    if error != rustix::io::Errno::INTR {
+                        return Err(error.into());
+                    }
+                }
             }
             Err(error) => return Err(error),
         }

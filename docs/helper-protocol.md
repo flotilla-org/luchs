@@ -87,7 +87,9 @@ admission returns `WouldBlock`. Dropping a waiter frees its slot.
 
 The timeout starts when the command is admitted and includes writing stdin.
 Writes use a nonblocking pipe; a timeout or write failure terminates and reaps
-the helper because a partial command cannot be retried on the same stream.
+the helper because a partial command cannot be retried on the same stream. Pipe
+readiness uses `poll`; frame reception retains the write error even if stdout
+EOF races shutdown.
 `Helper::command` maps send failure, timeout, and helper disconnection to
 `CommandOutcome::Uncertain`. A reader accepts an ack only before its command's
 deadline; even a caller that waits later cannot turn a late ack into `Executed`.
@@ -96,13 +98,17 @@ An ack queued before the deadline retains its outcome.
 Unmatched acks, including late acks and duplicate acks, are discarded. They
 cannot satisfy a different waiter or revise an outcome already returned. This
 keeps retired-ID bookkeeping bounded; helpers still owe exactly one ack for
-each command. `execution_outcome()` maps `executed` to Jackstay `Executed`,
+each command. `Helper::ignored_acks()` counts these discarded replies, and the
+CLI logs a nonzero count at shutdown. `execution_outcome()` maps `executed` to Jackstay `Executed`,
 `unsupported` to `Unsupported`, `failed` to `Rejected`, and timeout/disconnection
 to `Uncertain`. The CLI uses a one-second reload deadline. Unsupported reload
 is fatal because it means the helper cannot implement watch. Failed or uncertain
 reloads log a diagnostic when the failure outcome changes and retain the last successfully handled modification
 time, retrying on the next 250 ms poll even if the file has not changed again.
-Malformed output and command-write failures remain fatal.
+Malformed output and command-write failures remain fatal. `Uncertain` does not
+prove that no effect occurred: watch can apply the same reload request more than
+once. Future non-idempotent input or affordance commands must not use this retry
+policy.
 
 ## Frames
 

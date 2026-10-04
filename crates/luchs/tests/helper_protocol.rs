@@ -91,10 +91,32 @@ ack(b, 'unsupported')
         CommandOutcome::Unsupported
     );
     helper.finish().unwrap();
+    assert_eq!(helper.ignored_acks(), 1);
     assert_eq!(
         CommandOutcome::Uncertain.execution_outcome(),
         jackstay::input::Outcome::Uncertain
     );
+}
+
+#[test]
+fn duplicate_and_unknown_acks_are_counted_and_cannot_satisfy_a_waiter() {
+    let mut helper = python(
+        r#"
+a = command()
+ack(a)
+ack(a)
+control(2, {'id': 9000, 'outcome': 'executed'})
+b = command()
+ack(b, 'unsupported')
+"#,
+    );
+    assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Executed);
+    assert_eq!(
+        helper.command("future", TIMEOUT),
+        CommandOutcome::Unsupported
+    );
+    helper.finish().unwrap();
+    assert_eq!(helper.ignored_acks(), 2);
 }
 
 #[test]
@@ -311,7 +333,7 @@ fn helper_exit_disconnects_pending_acks_as_uncertain() {
 
 #[test]
 fn pending_slots_and_blocked_command_writes_are_bounded() {
-    let mut helper = python("for _ in range(64): command()\ntime.sleep(60)\n");
+    let mut helper = python("for _ in range(64): command()\nframe()\ntime.sleep(60)\n");
     let pending: Vec<_> = (0..MAX_PENDING_COMMANDS)
         .map(|_| helper.send_command("ping", TIMEOUT).unwrap())
         .collect();
@@ -320,10 +342,30 @@ fn pending_slots_and_blocked_command_writes_are_bounded() {
         io::ErrorKind::WouldBlock
     );
     drop(pending);
+    // Confirm the helper has consumed all small commands and stopped reading.
+    helper.receive(TIMEOUT).unwrap().unwrap();
     let start = Instant::now();
-    assert_eq!(
-        helper.command(&"x".repeat(120 * 1024), Duration::from_millis(100)),
-        CommandOutcome::Uncertain
-    );
-    assert!(start.elapsed() < Duration::from_secs(1));
+    for _ in 0..16 {
+        match helper.send_command(&"x".repeat(120 * 1024), Duration::from_millis(100)) {
+            Ok(pending) => drop(pending),
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert!(start.elapsed() < Duration::from_secs(2));
+                let error = helper.receive(TIMEOUT).unwrap().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert!(error.to_string().contains("command write timed out"));
+                return;
+            }
+        }
+    }
+    panic!("nonreading helper pipe never filled");
+}
+
+#[test]
+fn write_failure_keeps_root_cause_when_stdout_closes() {
+    let mut helper = python("os.close(0)\nframe()\ntime.sleep(60)\n");
+    helper.receive(TIMEOUT).unwrap().unwrap();
+    assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Uncertain);
+    let error = helper.receive(TIMEOUT).unwrap().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
 }
