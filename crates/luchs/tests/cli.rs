@@ -85,10 +85,31 @@ done
         std::thread::sleep(Duration::from_millis(10));
     }
     let logged = std::fs::read_to_string(&log).unwrap();
+    // SIGTERM must stop with a live v2 consumer and reap the helper.
+    let connected = jackstay::bootstrap::connect_v2(
+        jackstay::local::Stream::connect(endpoint.trim()).unwrap(),
+        jackstay::bootstrap::InputRequest::None,
+        jackstay::bootstrap::ChannelRequest::None,
+    )
+    .unwrap();
+    // SAFETY: the spawned luchs process is the sole conforming producer.
+    let mut setup =
+        unsafe { jackstay::acquisition::socket::CpuSetupClient::from_stream(connected.media) };
+    let consumer = setup.attach(1).unwrap();
     // SAFETY: the test owns this unreaped child process.
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }
+    // A conforming consumer retires its mappings when the source stops.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !matches!(
+        consumer.acquire_latest(0).unwrap(),
+        jackstay::acquisition::arena::AcquireOutcome::Closed
+    ) {
+        assert!(Instant::now() < deadline, "source did not stop media");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop((consumer, setup));
     let deadline = Instant::now() + Duration::from_secs(3);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
