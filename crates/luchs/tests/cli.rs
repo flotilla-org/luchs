@@ -307,3 +307,130 @@ while IFS= read -r line; do :; done
     // SAFETY: signal zero only probes the helper whose PID the test recorded.
     assert_eq!(unsafe { libc::kill(helper_pid, 0) }, -1);
 }
+
+struct Process(std::process::Child);
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn watch_retries_failed_reload_without_another_file_change() {
+    watch_reload_outcome("failed");
+}
+
+#[test]
+fn watch_retries_uncertain_reload_without_another_file_change() {
+    watch_reload_outcome("uncertain");
+}
+
+#[test]
+fn watch_unsupported_reload_stops_the_run() {
+    watch_reload_outcome("unsupported");
+}
+
+fn watch_reload_outcome(first_outcome: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let page = dir.path().join("page.html");
+    let helper = dir.path().join("helper");
+    let log = dir.path().join("reloads");
+    std::fs::write(&page, "old page").unwrap();
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/usr/bin/env python3\n{}\n{}",
+            common::PYTHON_PROTOCOL,
+            format_args!(
+                r#"
+log = r'{}'
+with open(log, 'w') as out: out.write('ready\n')
+frame()
+first = command()
+assert first['type'] == 'reload'
+if '{}' == 'uncertain':
+    time.sleep(1.15)
+    ack(first)
+else:
+    ack(first, '{}')
+second = command()
+assert second['type'] == 'reload' and second['id'] != first['id']
+ack(second)
+with open(log, 'a') as out: out.write('recovered\n')
+while True:
+    try: ack(command())
+    except EOFError: break
+"#,
+                log.display(),
+                first_outcome,
+                first_outcome
+            )
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = Process(
+        Command::new(env!("CARGO_BIN_EXE_luchs"))
+            .arg("--helper")
+            .arg(&helper)
+            .args(["--size=1x1", "--watch"])
+            .arg(&page)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut endpoint = String::new();
+    BufReader::new(child.0.stdout.take().unwrap())
+        .read_line(&mut endpoint)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !log.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&page)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(2))
+        .unwrap();
+    if first_outcome != "unsupported" {
+        while !std::fs::read_to_string(&log).unwrap().contains("recovered") {
+            assert!(Instant::now() < deadline, "watch did not retry");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "watch stopped on {first_outcome}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: the test owns the unreaped CLI child.
+        unsafe {
+            libc::kill(child.0.id() as i32, libc::SIGTERM);
+        }
+    }
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "CLI did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.success(), first_outcome != "unsupported");
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let expected = match first_outcome {
+        "failed" => "renderer reload: Failed",
+        "uncertain" => "renderer reload: Uncertain",
+        _ => "renderer reload: unsupported",
+    };
+    assert!(stderr.contains(expected), "{stderr}");
+    assert!(!std::path::Path::new(endpoint.trim()).exists());
+}

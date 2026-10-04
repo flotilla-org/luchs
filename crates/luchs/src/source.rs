@@ -189,16 +189,26 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
                 // Keep the last known time across an atomic-save disappearance.
                 if now.is_some() && now != modified {
                     match helper.reload()? {
-                        CommandOutcome::Executed => {}
-                        outcome => return Err(format!("renderer reload: {outcome:?}").into()),
+                        CommandOutcome::Executed => {
+                            modified = now;
+                        }
+                        CommandOutcome::Unsupported => {
+                            return Err("renderer reload: unsupported".into());
+                        }
+                        outcome => {
+                            eprintln!("luchs: renderer reload: {outcome:?}; retrying");
+                        }
                     }
-                    modified = now;
                 }
             }
             last_poll = Instant::now();
         }
     }
     eprintln!("luchs: stopped after {received} frames");
+    let dropped = helper.dropped_frames();
+    if dropped > 0 {
+        eprintln!("luchs: helper dropped {dropped} frames");
+    }
     match source.stop() {
         // Zero-capability input never acquires held state. Rejecting cleanup is
         // expected for this observation-only producer, not a failed CLI run.

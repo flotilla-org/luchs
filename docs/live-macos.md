@@ -104,3 +104,12 @@ main-thread reload, ack demultiplexing, and publication through Jackstay. The
 CLI stopped successfully on SIGTERM after six frames and removed its endpoint.
 No SDL viewer was needed for this protocol acceptance check; the earlier v2
 presenter check remains separate.
+
+
+The review follow-up also ran `native_stdin_eof_exits_successfully`: a framed
+ping with ID `18446744073709551615` round-tripped without losing bits, and closing
+stdin exited the real Swift helper with status zero while a reader drained
+stdout. The ping/reload/watch acceptance test passed again after the Rust
+recovery changes. Fake-helper CLI tests separately cover retrying failed and
+uncertain reloads without another file modification, and stopping on an
+unsupported reload.

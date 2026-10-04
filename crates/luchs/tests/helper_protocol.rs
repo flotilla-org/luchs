@@ -66,6 +66,7 @@ ack(a)
     assert_ne!(a.id(), b.id());
     assert_eq!(a.wait(), CommandOutcome::Executed);
     assert_eq!(b.wait(), CommandOutcome::Unsupported);
+    assert_eq!(helper.dropped_frames(), 8);
     assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"rgba");
     helper.finish().unwrap();
 }
@@ -252,6 +253,25 @@ fn malformed_record_stops_and_reaps_without_waiting_for_drop() {
         io::ErrorKind::InvalidData
     );
     assert_reaped(&pid_path);
+}
+
+#[test]
+fn panicking_state_callback_fails_and_reaps_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("pid");
+    let script = format!(
+        "echo $$ > '{}'; {}; exec sleep 60",
+        pid_path.display(),
+        common::printf(&common::control(3, json!({})))
+    );
+    let helper = Helper::spawn_with_state(Command::new("/bin/sh").args(["-c", &script]), |_| {
+        panic!("test callback")
+    })
+    .unwrap();
+    let error = helper.receive(TIMEOUT).unwrap().unwrap_err();
+    assert!(error.to_string().contains("state callback panicked"));
+    assert_reaped(&pid_path);
+    drop(helper);
 }
 
 fn assert_reaped(path: &std::path::Path) {

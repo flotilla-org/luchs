@@ -74,8 +74,10 @@ handlers must deliver native events, with no JavaScript event-synthesis path.
 
 One reader thread demultiplexes all stdout records. It keeps at most two queued
 frames, dropping the oldest when full so frame reception cannot block ack
-routing. `Helper::spawn_with_state` delivers state objects to a callback on that
-reader thread; the callback must return promptly and must not panic. This slice
+routing. `Helper::dropped_frames()` counts mailbox drops; the CLI logs the
+count at shutdown when nonzero. `Helper::spawn_with_state` delivers state objects
+to a callback on that reader thread; the callback must return promptly. A
+callback panic terminates and reaps the helper and reports a stream error. This slice
 reserves the tag and accepts opaque objects. Issue #3 will define their fields.
 
 `Helper::send_command` registers a per-ID waiter before writing any bytes and
@@ -96,8 +98,11 @@ cannot satisfy a different waiter or revise an outcome already returned. This
 keeps retired-ID bookkeeping bounded; helpers still owe exactly one ack for
 each command. `execution_outcome()` maps `executed` to Jackstay `Executed`,
 `unsupported` to `Unsupported`, `failed` to `Rejected`, and timeout/disconnection
-to `Uncertain`. The CLI uses a one-second reload deadline and fails the run if
-reload is unsupported, failed, or uncertain.
+to `Uncertain`. The CLI uses a one-second reload deadline. Unsupported reload
+is fatal because it means the helper cannot implement watch. Failed or uncertain
+reloads log a diagnostic and retain the last successfully handled modification
+time, retrying on the next 250 ms poll even if the file has not changed again.
+Malformed output and command-write failures remain fatal.
 
 ## Frames
 
@@ -121,7 +126,8 @@ The current Swift viewport stays fixed during a run.
 `cargo test --locked --test helper_protocol --test cli` exercises fake-helper
 frame passthrough, split records, out-of-order acks under frame backpressure,
 unknown commands, failed commands, timeout and late acks, state callbacks,
-malformed records, size bounds, process reaping, and CLI watch reload.
+malformed records, size bounds, callback panic, process reaping, and CLI watch
+reload recovery after failed and uncertain acks (including unsupported failure).
 Fake command helpers require `python3`, available on the CI runners.
 
 On a logged-in macOS desktop, build the Swift helper and run:
@@ -131,6 +137,7 @@ scripts/build-helper.sh
 cargo test --locked --test live_macos -- --ignored --nocapture
 ```
 
-This test checks native ping/reload acks and verifies that `--watch` publishes
+The tests check native ping/reload acks, a full-range u64 ID, zero-status exit on
+stdin EOF, and verify that `--watch` publishes
 changed page pixels through the real CLI, Swift helper, and Jackstay producer.
 See [live macOS evidence](live-macos.md) for the recorded run.

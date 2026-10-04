@@ -70,7 +70,8 @@ also depends on each consumer's holding credit.
 
 `--size=WxH` defaults to 800x600. `--watch` polls a local file's modification time
 every 250 ms and asks WebKit to reload without its cache, waiting up to one
-second for its execution ack; URLs load once.
+second for its execution ack. Failed or uncertain reloads log and retry on the
+next poll; an unsupported reload fails the run. URLs load once.
 `LUCHS_CONSOLE_LOG` names the helper's console/error/navigation log, otherwise
 the helper uses `/tmp/luchs-console-<helper-pid>.log`. Its stderr passes through
 to Luchs's stderr. `--renderer=native-webview` remains accepted for existing

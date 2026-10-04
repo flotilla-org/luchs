@@ -129,3 +129,59 @@ fn native_ping_reload_and_watch() {
     }
     assert!(!std::path::Path::new(endpoint.trim()).exists());
 }
+
+#[test]
+#[ignore = "requires built Swift helper and a live macOS desktop"]
+fn native_stdin_eof_exits_successfully() {
+    use luchs::protocol::{Record, encode_command, read_record};
+    use std::{io::Write, sync::mpsc};
+    let dir = tempfile::tempdir().unwrap();
+    let html = dir.path().join("page.html");
+    page(&html, "red");
+    let renderer =
+        std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
+    let mut process = Process(
+        Command::new(renderer)
+            .arg(html)
+            .args(["32", "32", "0", "15"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = process.0.stdout.take().unwrap();
+    let (send, receive) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        while let Some(record) = read_record(&mut stdout).unwrap() {
+            if let Record::Ack(ack) = record {
+                send.send(ack).unwrap();
+            }
+        }
+    });
+    process
+        .0
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&encode_command(u64::MAX, "ping").unwrap())
+        .unwrap();
+    let ack = receive.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(ack.id, u64::MAX);
+    assert_eq!(ack.outcome, luchs::protocol::AckOutcome::Executed);
+    process.0.stdin.take();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Swift helper did not exit on EOF"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().unwrap();
+}

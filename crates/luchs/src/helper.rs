@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, BufReader, Write},
     os::fd::AsRawFd,
+    panic::{AssertUnwindSafe, catch_unwind},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
@@ -44,6 +45,7 @@ struct AckWaiter {
 #[derive(Default)]
 struct StreamState {
     frames: VecDeque<Frame>,
+    dropped_frames: u64,
     error: Option<io::Error>,
     ended: bool,
     pending: HashMap<u64, AckWaiter>,
@@ -70,6 +72,9 @@ impl PendingCommand {
     }
 
     pub fn wait(self) -> CommandOutcome {
+        // The reader timestamps acceptance against this same deadline. A queued
+        // ack accepted in time stays valid even if wait() is called later;
+        // recv_timeout bounds how long we wait for an ack not yet received.
         match self
             .ack
             .recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
@@ -107,6 +112,7 @@ impl Helper {
 
     /// The callback runs on the reader thread and must return promptly. State
     /// is an opaque JSON object until the affordance slice defines its schema.
+    /// A callback panic terminates/reaps the helper and reports a stream error.
     pub fn spawn_with_state(
         command: &mut Command,
         mut state_event: impl FnMut(serde_json::Map<String, serde_json::Value>) + Send + 'static,
@@ -126,8 +132,7 @@ impl Helper {
                 < 0
         {
             let error = io::Error::last_os_error();
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             return Err(error);
         }
         let child = Arc::new(Mutex::new(child));
@@ -142,6 +147,7 @@ impl Helper {
                         let mut state = stream.state.lock().unwrap();
                         if state.frames.len() == 2 {
                             state.frames.pop_front();
+                            state.dropped_frames = state.dropped_frames.saturating_add(1);
                         }
                         state.frames.push_back(frame);
                         stream.ready.notify_one();
@@ -153,20 +159,18 @@ impl Helper {
                             }
                         }
                     }
-                    Ok(Some(Record::State(event))) => state_event(event),
-                    result => {
-                        if result.is_err() {
-                            // A protocol violation is fatal even if nobody is
-                            // currently receiving frames or awaiting commands.
-                            let mut child = process.lock().unwrap();
-                            let _ = child.kill();
-                            let _ = child.wait();
+                    Ok(Some(Record::State(event))) => {
+                        if catch_unwind(AssertUnwindSafe(|| state_event(event))).is_err() {
+                            end_stream(
+                                &stream,
+                                &process,
+                                Some(io::Error::other("state callback panicked")),
+                            );
+                            break;
                         }
-                        let mut state = stream.state.lock().unwrap();
-                        state.error = result.err();
-                        state.ended = true;
-                        state.pending.clear();
-                        stream.ready.notify_all();
+                    }
+                    result => {
+                        end_stream(&stream, &process, result.err());
                         break;
                     }
                 }
@@ -200,6 +204,10 @@ impl Helper {
             }
             state = self.shared.ready.wait_timeout(state, left).unwrap().0;
         }
+    }
+
+    pub fn dropped_frames(&self) -> u64 {
+        self.shared.state.lock().unwrap().dropped_frames
     }
 
     pub fn send_command(&mut self, kind: &str, timeout: Duration) -> io::Result<PendingCommand> {
@@ -237,8 +245,7 @@ impl Helper {
         ) {
             // A partial command cannot be retried on the same byte stream.
             let mut child = self.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             return Err(error);
         }
         Ok(pending)
@@ -269,6 +276,23 @@ impl Helper {
             thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn end_stream(shared: &Shared, process: &Mutex<Child>, error: Option<io::Error>) {
+    if error.is_some() {
+        // Fail immediately even when nobody is receiving frames or awaiting acks.
+        kill_and_reap(&mut process.lock().unwrap());
+    }
+    let mut state = shared.state.lock().unwrap();
+    state.error = error;
+    state.ended = true;
+    state.pending.clear();
+    shared.ready.notify_all();
 }
 
 fn write_command(stdin: &mut ChildStdin, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
@@ -311,8 +335,7 @@ impl Drop for Helper {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_and_reap(&mut child);
         drop(child);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
