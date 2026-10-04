@@ -234,3 +234,11 @@ handlers and confirms that the helper exits with a diagnostic. Static pages now
 stop the animation activity probe instead of running `getAnimations()` on every
 animation frame. Snapshot completion also checks the window backing scale and
 navigation state, discarding an invalidated snapshot and requesting a retry.
+
+The final recovery policy allows two retries for consecutive invalid snapshots,
+including WebKit errors or mismatched dimensions. The third reports the reason
+to the CLI. `scripts/test-helper.sh` verifies that native policy, including budget
+reset on success. The fake renderer discards two captures after an idle page
+wake and verifies that no-report acknowledgements schedule the successful retry
+with each next request within 250 ms instead of the 500 ms idle interval; another
+CLI test verifies the exhausted-retry diagnostic.

@@ -317,6 +317,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     private var fingerprint: UInt64?
     private var emittedFrames = 0
     private var activityPending = false
+    private var snapshotRecovery = SnapshotRecovery()
 
     init(pageURL: URL, width: Int, height: Int, frameCount: Int) {
         self.pageURL = pageURL
@@ -768,21 +769,31 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             // A display-scale or navigation change can invalidate an in-flight
             // snapshot. Retry through the scheduler rather than terminating.
             if (self.window?.backingScaleFactor ?? 1) != backing || !self.loaded {
-                self.configuredBacking = 0
-                emitAck(command.id, outcome: "executed")
-                self.reportActivity()
+                self.retrySnapshot(command, "backing scale or navigation changed during snapshot")
                 return
             }
             if let error {
-                emitAck(command.id, outcome: "failed", detail: "snapshot failed: \(error.localizedDescription)")
+                self.retrySnapshot(command, "WebKit snapshot error: \(error.localizedDescription)")
                 return
             }
             guard let image else {
-                emitAck(command.id, outcome: "failed", detail: "snapshot returned no image")
+                self.retrySnapshot(command, "snapshot returned no image")
                 return
             }
             let elapsed = ProcessInfo.processInfo.systemUptime - start
             self.emit(image, width: requestedWidth, height: requestedHeight, command: command, snapshotSeconds: elapsed)
+        }
+    }
+
+    private func retrySnapshot(_ command: HelperCommand, _ detail: String) {
+        configuredBacking = 0
+        if let failure = snapshotRecovery.failure(detail) {
+            debugLog(failure)
+            emitAck(command.id, outcome: "failed", detail: failure)
+        } else {
+            debugLog("discarding snapshot (attempt \(snapshotRecovery.failures)): \(detail); retrying")
+            emitAck(command.id, outcome: "executed")
+            reportActivity()
         }
     }
 
@@ -819,12 +830,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         let publishStart = ProcessInfo.processInfo.systemUptime
         guard let representation = image.representations.first,
               representation.pixelsWide == width, representation.pixelsHigh == height else {
-            // WebKit can complete the representation with the previous display
-            // scale. Drop it and recompute the configuration on the next request.
-            configuredBacking = 0
-            debugLog("discarding snapshot with unexpected pixel size; retrying")
-            emitAck(command.id, outcome: "executed")
-            reportActivity()
+            retrySnapshot(command, "unexpected pixel size; requested \(width)x\(height)")
             return
         }
         prepareBitmap(image, width: width, height: height)
@@ -837,7 +843,11 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         graphicsContext.compositingOperation = .copy
         let drawn = representation.draw(in: NSRect(x: 0, y: 0, width: width, height: height))
         NSGraphicsContext.restoreGraphicsState()
-        if !drawn { fail("snapshot draw failed") }
+        if !drawn {
+            retrySnapshot(command, "snapshot draw failed")
+            return
+        }
+        snapshotRecovery.succeeded()
         let count = width * height * 4
         // FNV-1a over native words: one read pass, no previous-frame allocation.
         let words = bitmap.bindMemory(to: UInt32.self, capacity: count / 4)

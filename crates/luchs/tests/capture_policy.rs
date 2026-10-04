@@ -62,7 +62,7 @@ fn socketpair_fake_checks_idle_wakes_scale_visibility_and_unchanged_publications
     std::fs::write(&page, "fixture").unwrap();
     std::fs::write(&script, format!("#!/usr/bin/env python3\n{}\n{}", common::PYTHON_PROTOCOL, r#"
 import select
-scale, visible, fresh, revision = 1, True, True, 1
+scale, visible, fresh, revision, retries = 1, True, True, 1, 0
 while True:
     if os.path.exists(os.environ['CAPTURE_WAKE']):
         os.unlink(os.environ['CAPTURE_WAKE'])
@@ -71,12 +71,20 @@ while True:
         control(3, {'capture_changed':True})
         revision += 1
         fresh = True
+        retries = 2
     if not select.select([transport], [], [], .01)[0]: continue
     try: cmd = raw_command()
     except EOFError: break
+    if cmd['type'] == 'capture' and retries: cmd['retry_discard'] = True
     with open(os.environ['CAPTURE_LOG'], 'a') as log:
         log.write(json.dumps({'type':cmd['type'], 'time':time.monotonic(), **cmd}) + '\n')
     if cmd['type'] == 'capture':
+        if retries:
+            retries -= 1
+            # Match Swift's discarded-snapshot ack: no report and no pixels.
+            # Ack alone must reschedule; the earlier page wake was at idle.
+            ack(cmd)
+            continue
         assert visible
         size = round(scale)
         pixels = bytes([revision, 0, 0, 255]) * size * size
@@ -189,6 +197,30 @@ while True:
             return false;
         };
         assert!(next["time"].as_f64().unwrap() - log[index]["time"].as_f64().unwrap() < 0.2);
+        true
+    });
+    wait(|| {
+        let log = events(&log);
+        let Some(index) = log.iter().position(|v| v["type"] == "page-change") else {
+            return false;
+        };
+        let captures: Vec<_> = log[index + 1..]
+            .iter()
+            .filter(|v| v["type"] == "capture")
+            .take(3)
+            .collect();
+        if captures.len() < 3 {
+            return false;
+        }
+        assert_eq!(captures[0]["retry_discard"], true);
+        assert_eq!(captures[1]["retry_discard"], true);
+        assert!(captures[2]["retry_discard"].is_null());
+        for pair in captures.windows(2) {
+            assert!(
+                pair[1]["time"].as_f64().unwrap() - pair[0]["time"].as_f64().unwrap() < 0.25,
+                "discarded capture ack fell back to the 500 ms idle interval: {captures:?}"
+            );
+        }
         true
     });
     // This traverses the toolkit's real affordance callback, not a helper-only command.

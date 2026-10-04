@@ -232,7 +232,11 @@ impl CaptureStats {
         };
         if let Some(ack) = command.poll() {
             if ack.outcome != crate::protocol::AckOutcome::Executed {
-                return Err("renderer capture failed".into());
+                return Err(format!(
+                    "renderer capture failed: {}",
+                    ack.detail.as_deref().unwrap_or("no diagnostic")
+                )
+                .into());
             }
             if let Some(report) = ack.capture {
                 self.snapshots += 1;

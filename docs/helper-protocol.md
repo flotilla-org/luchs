@@ -61,6 +61,11 @@ navigation-failure handlers terminate with a diagnostic; subsequent failures
 remain logged. A backing-scale or navigation change during a snapshot discards
 that transient result and wakes a retry. An unexpected representation size likewise
 discards the result, invalidates the configuration and requests another capture.
+WebKit errors, missing images and invalid snapshot dimensions share a budget of
+two retries. A third consecutive failure emits a failed ack with a diagnostic
+that the CLI displays. A successful draw, including an unchanged image, resets
+the budget. Discarded attempts acknowledge without a snapshot report; the ack
+reschedules the normal interval and activity wakes it immediately.
 An `executed` ack confirms actual application of the command; enqueueing work
 for another thread is not execution.
 
@@ -222,6 +227,11 @@ On a logged-in macOS desktop, build the Swift helper and run:
 scripts/build-helper.sh
 cargo test --locked --test live_macos -- --ignored --nocapture
 ```
+
+`scripts/test-helper.sh` checks native recovery: transient retry, successful
+reset and bounded persistent failure. The fake renderer tests two no-report
+discard acks after idle followed by a prompt successful capture, and verifies
+that an exhausted-retry diagnostic reaches the CLI.
 
 The tests check slow-loading capture/ping/presentation responsiveness and initial navigation failure, native ping/reload acks, a full-range u64 ID, zero-status exit on
 socket EOF, and verify that `--watch` publishes
