@@ -86,9 +86,11 @@ a transparent on-screen window so WebKit keeps its page clock running, Safari's
 user agent, popup views with their opener, and the existing caret script.
 Frames come from `takeSnapshot`, not screen capture. The helper emits BGRA
 with premultiplied alpha (`Bgra8Unorm`); consumers must respect premultiplication
-when compositing translucent pixels. It reuses its bitmap and contexts and writes
-changed pixels on a background queue through an inherited socketpair. Rust pools
-frame storage and returns consumed buffers through the producer toolkit.
+when compositing translucent pixels. Rust exports its Jackstay payload mapping
+over an inherited socketpair using
+`SCM_RIGHTS`. The helper reuses a CGContext per slot, draws into the reserved
+BGRA storage and acknowledges completion. Rust commits that slot without a pixel
+copy; socket records contain only commands, acknowledgements and page state.
 A live macOS desktop session is required.
 
 Each snapshot is compared with the previous publication. Unchanged pixels are
@@ -103,18 +105,19 @@ page need not reach a limit greater than one.
 
 The renderer architecture stays one engine per helper. ScreenCaptureKit and
 capturing the helper window through Porthole are not the frame path; guaranteed
-GPU capture would require a different engine. Direct writing into delegated
-Jackstay arena slots remains #13, after Jackstay #75. The socketpair is the
-future descriptor-transfer channel.
+GPU capture would require a different engine. The frame path uses Jackstay #75's
+exclusive reservations and writer exports.
+A timeout, helper death or mismatched draw reply reaps the helper before
+abandoning its slot, preventing late writes into reused storage.
 
-The Swift viewport stays fixed for a run. The Rust protocol accepts changes in
-frame dimensions or stride and reconfigures the Jackstay CPU allocation before
-publishing the replacement. The toolkit manages capacity-paused replacements,
-retrying reconfiguration on later helper frames as old allocations retire;
-it never overwrites leased pixels. The callback keeps only the latest helper
-frame, so intermediate frames may be skipped. Shutdown allows up to one second
-for the final queued frame before starting ordered toolkit teardown. Frames are limited to 64 MiB and the producer's
-allocation budget is 1 GiB. SIGINT, SIGTERM, EOF and errors all close the endpoint
+The Swift viewport stays fixed for a run. Rust reconfigures the CPU allocation
+when presentation scale changes its pixel dimensions, exporting the replacement
+before another draw. Capacity-paused replacements retry on later scheduler turns
+as old allocations retire; leased pixels stay intact. Rust owns `--frames` and
+stops after committing the requested number of changed frames. On orderly
+shutdown it allows up to one second for a pending draw before input cleanup.
+Frames are limited to 64 MiB and the allocation budget is 1 GiB.
+SIGINT, SIGTERM, EOF and errors all close the endpoint
 and stop/reap the helper. The toolkit drains for up to five seconds; consumers
 must retire their mappings and leases when media closes. Drain or input cleanup
 failures are reported. Consumer shutdown does not terminate Luchs.
@@ -162,7 +165,7 @@ checks trusted native motion, CSS hover, cursor transitions and clean teardown.
 CI runs these checks on macOS and Linux, plus helper compilation on macOS.
 Tests spawn fake helpers without WebKit and exercise framed records, ack
 ordering and timeouts, state callbacks, bounds, reload, console environment,
-termination, source bootstrap, replacement, pooled storage, idle policy,
+termination, source bootstrap, replacement, delegated slots, idle policy,
 presentation hints, page-state propagation, helper replacement, URL containment,
 navigation/scroll command forwarding and consumer process death. Command
 fixtures require `python3`. The ignored `live_macos` test requires a built Swift

@@ -14,7 +14,7 @@ private func fail(_ message: String) -> Never {
 
 // Page console output, page errors and navigations, one line each, in the
 // file LUCHS_CONSOLE_LOG names (default /tmp/luchs-console-<pid>.log). The
-// helper's socket carries frames and its stderr is the launcher's, so this
+// helper's socket carries commands and acknowledgements and its stderr is the launcher's, so this
 // is the one place a page can be debugged from.
 private let consoleLogPath: String = ProcessInfo.processInfo.environment["LUCHS_CONSOLE_LOG"]
     ?? "/tmp/luchs-console-\(getpid()).log"
@@ -237,7 +237,65 @@ private let activityRecord: Data = {
     return record
 }()
 
+private struct WriterLayout: Decodable {
+    let generation: UInt64
+    let map_len: Int
+    let slot_capacity: Int
+    let slots: UInt32
+}
+
+// Contains payload bytes only. The helper does not read arena bookkeeping.
+private final class WriterMapping {
+    let layout: WriterLayout
+    let base: UnsafeMutableRawPointer
+    // Each arena command replaces this whole mapping, so cached slot contexts
+    // cannot outlive their allocation generation or refer to retired memory.
+    private var contexts: [UInt32: (width: Int, height: Int, stride: Int, graphics: NSGraphicsContext)] = [:]
+    private var colorSpace: CGColorSpace?
+    init(_ layout: WriterLayout, fd: Int32) {
+        defer { close(fd) }
+        var info = stat()
+        guard layout.generation > 0, layout.slots > 0, layout.slot_capacity > 0,
+              layout.map_len > 0, layout.slot_capacity <= layout.map_len / Int(layout.slots),
+              fstat(fd, &info) == 0, info.st_size >= layout.map_len,
+              let address = mmap(nil, layout.map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
+              address != MAP_FAILED else { fail("invalid arena writer mapping") }
+        self.layout = layout
+        self.base = address
+    }
+    deinit { contexts.removeAll(); munmap(base, layout.map_len) }
+    func slot(_ command: HelperCommand) -> UnsafeMutableRawPointer? {
+        guard command.generation == layout.generation, let slot = command.slot, slot < layout.slots,
+              let width = command.width, let height = command.height, let stride = command.stride,
+              width > 0, height > 0, width <= maxFrameBytes / 4,
+              stride == width * 4, height <= maxFrameBytes / stride,
+              stride * height <= layout.slot_capacity else { return nil }
+        return base.advanced(by: Int(slot) * layout.slot_capacity)
+    }
+    func graphicsContext(_ command: HelperCommand, image: NSImage) -> NSGraphicsContext? {
+        guard let pointer = slot(command), let index = command.slot,
+              let width = command.width, let height = command.height, let stride = command.stride else { return nil }
+        if let context = contexts[index] {
+            guard context.width == width, context.height == height, context.stride == stride else { return nil }
+            return context.graphics
+        }
+        if colorSpace == nil { colorSpace = image.cgImage(forProposedRect: nil, context: nil, hints: nil)?.colorSpace }
+        guard let space = colorSpace,
+              let context = CGContext(data: pointer, width: width, height: height,
+                  bitsPerComponent: 8, bytesPerRow: stride, space: space,
+                  bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue)
+        else { return nil }
+        let result = NSGraphicsContext(cgContext: context, flipped: false)
+        contexts[index] = (width, height, stride, result)
+        return result
+    }
+
+}
+
 private struct HelperCommand: Decodable {
+    let layout: WriterLayout?
+    let slot: UInt32?, generation: UInt64?
+    let width: Int?, height: Int?, stride: Int?
     let id: UInt64
     let type: String
     let scale: Double?
@@ -253,6 +311,7 @@ private struct HelperCommand: Decodable {
     let step: String?
     let direction: String?
     enum CodingKeys: String, CodingKey {
+        case layout, slot, generation, width, height, stride
         case id, type, scale, visible, x, y, dx, dy, button, press, modifiers, logical, text, scope, cooperative
         case url, axis, position, step, direction
         case pointDx = "point_dx", pointDy = "point_dy", keyCode = "key_code", isRepeat = "repeat"
@@ -264,29 +323,43 @@ private func littleEndian(_ value: UInt32) -> Data {
     return withUnsafeBytes(of: &value) { Data($0) }
 }
 
-private func readExactly(_ count: Int, allowEOF: Bool = false) -> Data? {
+private func readExactly(_ count: Int, allowEOF: Bool = false, descriptor: inout Int32?) -> Data? {
     var result = Data()
     while result.count < count {
-        let chunk: Data
-        do {
-            chunk = try transport.read(upToCount: count - result.count) ?? Data()
-        } catch {
-            fail("command read failed: \(error.localizedDescription)")
+        var chunk = Data(count: count - result.count)
+        var fd: Int32 = -1
+        let n = chunk.withUnsafeMutableBytes { bytes in
+            luchs_recv_rights(transport.fileDescriptor, bytes.baseAddress, bytes.count, &fd)
         }
-        if chunk.isEmpty {
-            if allowEOF && result.isEmpty { return nil }
+        if n < 0 && errno == EINTR { continue }
+        if n < 0 { fail("command recvmsg failed") }
+        if fd >= 0 {
+            // macOS has no MSG_CMSG_CLOEXEC. The helper launches no child
+            // processes, so no fork/exec can race this fallback in our code.
+            guard descriptor == nil, fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else {
+                close(fd)
+                fail("unexpected command descriptors")
+            }
+            descriptor = fd
+        }
+        if n == 0 {
+            if allowEOF && result.isEmpty && descriptor == nil { return nil }
             fail("truncated command record")
         }
+        chunk.count = n
         result.append(chunk)
     }
     return result
 }
 
-private func emitAck(_ id: UInt64, outcome: String, detail: String? = nil, capture: [String: Any]? = nil) {
+private func emitAck(_ id: UInt64, outcome: String, detail: String? = nil, capture: [String: Any]? = nil, generation: UInt64? = nil, slot: UInt32? = nil, frame: [String: Any]? = nil) {
     precondition(Thread.isMainThread)
     var object: [String: Any] = ["id": id, "outcome": outcome]
     if let detail { object["detail"] = detail }
     if let capture { object["capture"] = capture }
+    if let generation { object["generation"] = generation }
+    if let slot { object["slot"] = slot }
+    if let frame { object["frame"] = frame }
     guard let json = try? JSONSerialization.data(withJSONObject: object), json.count + 1 <= maxControlBytes else {
         fail("could not encode acknowledgement")
     }
@@ -298,6 +371,11 @@ private func emitAck(_ id: UInt64, outcome: String, detail: String? = nil, captu
         writeData(bytes)
         commandDrained.signal()
     }
+}
+
+private func emitDrawAck(_ command: HelperCommand, outcome: String, detail: String? = nil, capture: [String: Any]? = nil, frame: [String: Any]? = nil) {
+    emitAck(command.id, outcome: outcome, detail: detail, capture: capture,
+            generation: command.generation, slot: command.slot, frame: frame)
 }
 
 private func emitState(_ object: [String: Any]) {
@@ -319,7 +397,6 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     private let pageURL: URL
     private let width: Int
     private let height: Int
-    private let frameCount: Int
     private var window: NSWindow?
     private var webView: WKWebView?
     // Windows the page opened (OAuth sign-in, target=_blank), newest last.
@@ -333,27 +410,23 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     private var navigationFinished = false
     private var loaded = false
     private var everLoadedMain = false
+    private let frameCount: Int
     private let snapshotConfiguration = WKSnapshotConfiguration()
     private var configuredScale = 0.0
     private var configuredBacking = 0.0
     private var scale = 1.0
     private var visible = true
-    private var bitmap: UnsafeMutableRawPointer?
-    private var context: CGContext?
-    private var graphicsContext: NSGraphicsContext?
-    private var pixelWidth = 0
-    private var pixelHeight = 0
-    private var envelope = Data()
+    private var arena: WriterMapping?
     private var fingerprint: UInt64?
     private var emittedFrames = 0
     private var activityPending = false
     private var snapshotRecovery = SnapshotRecovery()
 
     init(pageURL: URL, width: Int, height: Int, frameCount: Int) {
+        self.frameCount = frameCount
         self.pageURL = pageURL
         self.width = width
         self.height = height
-        self.frameCount = frameCount
 
     }
 
@@ -536,7 +609,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     private func publishPageState() {
         guard let view = activeView else { return }
-        // Advisory helper readiness: emittedFrames counts socket writes. Rust
+        // Advisory helper readiness: emittedFrames counts completed draws. Rust
         // additionally gates this on publication through the producer toolkit.
         // It stays true after the first completed navigation; later loads use
         // navigation.loading to describe progress without hiding the window.
@@ -557,21 +630,27 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             // Only one command is queued at a time. Waiting for main-thread
             // handling and writer completion bounds memory under command floods.
-            while let prefix = readExactly(4, allowEOF: true) {
+            while true {
+                var descriptor: Int32?
+                guard let prefix = readExactly(4, allowEOF: true, descriptor: &descriptor) else { break }
                 let size = prefix.enumerated().reduce(UInt32(0)) { value, byte in
                     value | (UInt32(byte.element) << (8 * byte.offset))
                 }
                 guard size > 0 && size <= UInt32(maxControlBytes) else {
                     fail("invalid command record length")
                 }
-                guard let data = readExactly(Int(size)),
+                guard let data = readExactly(Int(size), descriptor: &descriptor),
                       let command = try? JSONDecoder().decode(HelperCommand.self, from: data),
                       !command.type.isEmpty else {
                     fail("invalid command JSON")
                 }
                 DispatchQueue.main.sync { [weak self] in
                     guard let self else { fail("command controller stopped") }
-                    self.handleCommand(command)
+                    if command.type != "arena", let fd = descriptor {
+                        close(fd)
+                        fail("descriptor on non-arena command")
+                    }
+                    self.handleCommand(command, descriptor: descriptor)
                 }
                 commandDrained.wait()
             }
@@ -589,14 +668,32 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         }
     }
 
-    private func handleCommand(_ command: HelperCommand) {
+    private func handleCommand(_ command: HelperCommand, descriptor: Int32?) {
         precondition(Thread.isMainThread)
-        if command.type != "capture" { reportActivity() }
+        if command.type != "draw" && command.type != "arena" && command.type != "arena_release" { reportActivity() }
         switch command.type {
-        case "capture":
+        case "arena":
+            guard let layout = command.layout, let fd = descriptor else { fail("arena command needs one payload descriptor") }
+            arena = WriterMapping(layout, fd: fd) // releases the previous mapping before ack
+            fingerprint = nil
+            emitAck(command.id, outcome: "executed", generation: layout.generation)
+        case "arena_release":
+            guard let generation = command.generation, generation == arena?.layout.generation else {
+                emitAck(command.id, outcome: "failed", detail: "stale arena release")
+                return
+            }
+            arena = nil
+            emitAck(command.id, outcome: "executed", generation: generation)
+        case "draw":
+            guard let arena, arena.slot(command) != nil,
+                  command.width == Int((Double(width) * scale).rounded()),
+                  command.height == Int((Double(height) * scale).rounded()) else {
+                emitDrawAck(command, outcome: "failed", detail: "stale generation or invalid draw layout")
+                return
+            }
             // Never park the command reader behind page loading. Navigation
             // completion wakes Rust; ping, reload and visibility remain usable.
-            if !loaded { emitAck(command.id, outcome: "executed") } else { capture(command) }
+            if !loaded { emitDrawAck(command, outcome: "executed") } else { capture(command) }
         case "presentation":
             guard let scale = command.scale, let visible = command.visible,
                   scale.isFinite, scale > 0 else {
@@ -931,7 +1028,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 
     private func capture(_ command: HelperCommand) {
         guard visible, let webView = activeView else {
-            emitAck(command.id, outcome: "executed")
+            emitDrawAck(command, outcome: "executed")
             return
         }
         let requestedWidth = Int((Double(width) * scale).rounded())
@@ -972,41 +1069,12 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         configuredBacking = 0
         if let failure = snapshotRecovery.discard(detail, expectedTransition: expectedTransition) {
             debugLog(failure)
-            emitAck(command.id, outcome: "failed", detail: failure)
+            emitDrawAck(command, outcome: "failed", detail: failure)
         } else {
             debugLog("discarding snapshot: \(detail); retrying")
-            emitAck(command.id, outcome: "executed")
+            emitDrawAck(command, outcome: "executed")
             reportActivity()
         }
-    }
-
-    private func prepareBitmap(_ image: NSImage, width: Int, height: Int) {
-        if pixelWidth == width && pixelHeight == height { return }
-        graphicsContext = nil
-        context = nil
-        bitmap?.deallocate()
-        pixelWidth = width
-        pixelHeight = height
-        bitmap = UnsafeMutableRawPointer.allocate(byteCount: width * height * 4, alignment: 64)
-        // Native little-endian premultiplied BGRA, with the snapshot's RGB
-        // colour space. No channel swizzle or intermediate image copy.
-        let info = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
-        // Inspect colour space only when allocating a new size. NSImage's
-        // screen-scaled CGImage extraction rounds odd sizes; steady-state draws
-        // below use WebKit's original representation directly.
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              let space = cgImage.colorSpace, let context = CGContext(data: bitmap, width: width, height: height,
-            bitsPerComponent: 8, bytesPerRow: width * 4, space: space, bitmapInfo: info) else {
-            fail("failed to create BGRA bitmap context")
-        }
-        self.context = context
-        self.graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
-        fingerprint = nil
-        let json = Data("{\"format\":\"bgra8\",\"width\":\(width),\"height\":\(height),\"stride\":\(width * 4),\"len\":\(width * height * 4)}".utf8)
-        envelope = littleEndian(UInt32(5 + json.count + width * height * 4))
-        envelope.append(1)
-        envelope.append(littleEndian(UInt32(json.count)))
-        envelope.append(json)
     }
 
     private func emit(_ image: NSImage, width: Int, height: Int, command: HelperCommand, snapshotSeconds: Double) {
@@ -1016,8 +1084,12 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             retrySnapshot(command, "unexpected pixel size; requested \(width)x\(height)")
             return
         }
-        prepareBitmap(image, width: width, height: height)
-        guard let bitmap, let context, let graphicsContext else { fail("bitmap unavailable") }
+        guard let bitmap = arena?.slot(command), let graphicsContext = arena?.graphicsContext(command, image: image)
+        else {
+            emitDrawAck(command, outcome: "failed", detail: "failed to create arena BGRA context")
+            return
+        }
+        let context = graphicsContext.cgContext
         // Draw the snapshot's native representation 1:1. Asking NSImage for a
         // screen-scaled CGImage can round 26x17 pixels down to 24x16 on Retina.
         context.setBlendMode(.copy)
@@ -1034,32 +1106,24 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         let count = width * height * 4
         // FNV-1a over native words: one read pass, no previous-frame allocation.
         let words = bitmap.bindMemory(to: UInt32.self, capacity: count / 4)
-        var hash: UInt64 = 14695981039346656037
+        var hash: UInt64 = (14695981039346656037 ^ UInt64(width)) &* 1099511628211
+        hash = (hash ^ UInt64(height)) &* 1099511628211
         for i in 0..<(count / 4) { hash = (hash ^ UInt64(words[i])) &* 1099511628211 }
         if fingerprint == hash {
-            emitAck(command.id, outcome: "executed", capture: ["published": false,
+            emitDrawAck(command, outcome: "executed", capture: ["published": false,
                 "snapshot_ns": UInt64(snapshotSeconds * 1e9), "publish_ns": 0])
             return
         }
         fingerprint = hash
-        // The command reader waits for this ack. No later capture can reuse
-        // the bitmap until the serial writer has finished borrowing its bytes.
-        let header = envelope
-        writer.async { [weak self] in
-            writeData(header)
-            writeBytes(bitmap, count)
-            let elapsed = ProcessInfo.processInfo.systemUptime - publishStart
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.emittedFrames += 1
-                if self.emittedFrames == 1 { self.publishPageState() }
-                emitAck(command.id, outcome: "executed", capture: ["published": true,
-                    "snapshot_ns": UInt64(snapshotSeconds * 1e9), "publish_ns": UInt64(elapsed * 1e9)])
-                if self.frameCount > 0 && self.emittedFrames >= self.frameCount {
-                    writer.async { DispatchQueue.main.async { NSApplication.shared.terminate(nil) } }
-                }
-            }
-        }
+        emittedFrames += 1
+        if emittedFrames == 1 { publishPageState() }
+        let elapsed = ProcessInfo.processInfo.systemUptime - publishStart
+        emitDrawAck(command, outcome: "executed", capture: ["published": true,
+            "snapshot_ns": UInt64(snapshotSeconds * 1e9), "publish_ns": UInt64(elapsed * 1e9)],
+            frame: ["format":"bgra8", "width":width, "height":height, "stride":width * 4, "len":count])
+        // Rust owns --frames and shuts down only after commit. An ack followed
+        // by helper exit must never turn an outstanding reservation into a frame.
+
     }
 
 }

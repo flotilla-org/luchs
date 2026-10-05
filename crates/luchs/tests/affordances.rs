@@ -387,7 +387,7 @@ while True:
     wait(|| {
         commands(&log)
             .iter()
-            .filter(|c| c["type"] != "capture" && c["type"] != "presentation")
+            .filter(|c| c["type"] != "draw" && c["type"] != "presentation")
             .count()
             == 8
     });

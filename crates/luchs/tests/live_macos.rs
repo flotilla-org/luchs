@@ -31,16 +31,118 @@ fn page(path: &std::path::Path, color: &str) {
     .unwrap();
 }
 
-fn request_frame(helper: &mut Helper) -> luchs::protocol::Frame {
+// Copying out a completed reservation is test inspection only; the production
+// CLI commits the same bytes in place. Drop the helper before its writer export.
+struct NativeCapture {
+    helper: Helper,
+    arena: jackstay::acquisition::arena::ArenaProducer,
+    export: Option<jackstay::acquisition::arena::WriterExport>,
+    size: (u32, u32),
+}
+impl std::ops::Deref for NativeCapture {
+    type Target = Helper;
+    fn deref(&self) -> &Helper {
+        &self.helper
+    }
+}
+impl std::ops::DerefMut for NativeCapture {
+    fn deref_mut(&mut self) -> &mut Helper {
+        &mut self.helper
+    }
+}
+impl NativeCapture {
+    fn new(helper: Helper, width: u32, height: u32) -> Self {
+        use jackstay::acquisition::arena::{ArenaConfig, ArenaProducer};
+        let arena = ArenaProducer::new(ArenaConfig {
+            resource_capacity: 8,
+            retained_history: 1,
+            producer_reserve: 1,
+            payload_capacity: width as usize * height as usize * 4,
+            memory_budget: 1 << 30,
+            max_incarnations: 1,
+            drain_timeout: TIMEOUT,
+        })
+        .unwrap();
+        Self {
+            helper,
+            arena,
+            export: None,
+            size: (width, height),
+        }
+    }
+    fn capture(&mut self, size: (u32, u32)) -> Option<luchs::protocol::Frame> {
+        use luchs::protocol::{AckOutcome, Format, Frame, Header};
+        if size != self.size {
+            self.arena
+                .reconfigure_cpu(size.0 as usize * size.1 as usize * 4)
+                .unwrap();
+            self.size = size;
+            self.install();
+        } else if self.export.is_none() {
+            self.install();
+        }
+        let mut reservation = self.arena.reserve().unwrap().unwrap();
+        let slot = reservation.slot();
+        let pending = self
+            .helper
+            .send_json_command(
+                serde_json::json!({"type":"draw", "slot":slot.slot,
+            "generation":slot.generation, "width":size.0, "height":size.1, "stride":size.0 * 4}),
+                TIMEOUT,
+            )
+            .unwrap();
+        let ack = pending.wait_ack().unwrap();
+        assert_eq!(ack.outcome, AckOutcome::Executed, "{:?}", ack.detail);
+        assert_eq!(ack.generation, Some(slot.generation));
+        assert_eq!(ack.slot, Some(slot.slot));
+        let result = if ack.capture.is_some_and(|r| r.published) {
+            let header = Header {
+                format: Format::Bgra8,
+                width: size.0,
+                height: size.1,
+                stride: size.0 * 4,
+                len: size.0 as usize * size.1 as usize * 4,
+            };
+            assert_eq!(ack.frame, Some(header));
+            let header = ack.frame.unwrap();
+            Some(Frame {
+                pixels: reservation.bytes_mut()[..header.len].to_vec(),
+                header,
+            })
+        } else {
+            None
+        };
+        self.arena.abandon(reservation).unwrap();
+        result
+    }
+    fn install(&mut self) {
+        use std::os::fd::AsFd;
+        let export = self.arena.export_writer().unwrap().unwrap();
+        // SAFETY: export retained until replacement ack or helper destruction.
+        let fd = unsafe { export.duplicate_object() }.unwrap();
+        let ack = self
+            .helper
+            .command_sender()
+            .send_with_fd(
+                serde_json::json!({"type":"arena", "layout":export.descriptor()}),
+                TIMEOUT,
+                Some(fd.as_fd()),
+            )
+            .unwrap()
+            .wait_ack()
+            .unwrap();
+        assert_eq!(ack.generation, Some(export.descriptor().generation));
+        self.export = Some(export);
+    }
+}
+fn request_frame(helper: &mut NativeCapture) -> luchs::protocol::Frame {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        assert_eq!(helper.command("capture", TIMEOUT), CommandOutcome::Executed);
-        match helper.receive(Duration::from_millis(100)) {
-            Ok(frame) => return frame.unwrap(),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(error) => panic!("renderer stopped: {error}"),
+        if let Some(frame) = helper.capture(helper.size) {
+            return frame;
         }
         assert!(Instant::now() < deadline, "no native frame");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -53,12 +155,13 @@ fn native_ping_reload_and_watch() {
     let binary = std::path::Path::new(env!("CARGO_BIN_EXE_luchs"));
     let renderer = binary.with_file_name("luchs-webview-capture");
     assert!(renderer.exists(), "run scripts/build-helper.sh first");
-    let mut helper = Helper::spawn(
+    let helper = Helper::spawn(
         Command::new(&renderer)
             .arg(&html)
             .args(["32", "32", "0", "15"]),
     )
     .unwrap();
+    let mut helper = NativeCapture::new(helper, 32, 32);
     let initial = request_frame(&mut helper);
     assert_eq!(initial.header.width, 32);
     assert_eq!(&initial.pixels[..4], &[0, 0, 255, 255]);
@@ -72,9 +175,7 @@ fn native_ping_reload_and_watch() {
     let deadline = Instant::now() + TIMEOUT;
     std::thread::sleep(Duration::from_millis(200));
     loop {
-        let pending = helper.send_command("capture", TIMEOUT).unwrap();
-        let frame = helper.receive(TIMEOUT).unwrap().unwrap();
-        assert_eq!(pending.wait(), CommandOutcome::Executed);
+        let frame = request_frame(&mut helper);
         if frame.pixels[..4] == [255, 0, 0, 255] {
             break;
         }
@@ -223,39 +324,45 @@ fn native_socket_eof_exits_successfully() {
 #[ignore = "requires built Swift helper and a live macOS desktop"]
 fn native_skip_scale_and_hidden_capture() {
     use serde_json::json;
-    use std::sync::mpsc::RecvTimeoutError;
     let dir = tempfile::tempdir().unwrap();
     let html = dir.path().join("page.html");
     page(&html, "red");
     let renderer =
         std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
-    let mut helper = Helper::spawn(
+    let helper = Helper::spawn(
         Command::new(renderer)
             .arg(html)
             .args(["32", "32", "0", "30"]),
     )
     .unwrap();
+    let mut helper = NativeCapture::new(helper, 32, 32);
     assert_eq!(request_frame(&mut helper).header.width, 32);
-    assert_eq!(helper.command("capture", TIMEOUT), CommandOutcome::Executed);
-    assert!(matches!(
-        helper.receive(Duration::from_millis(100)),
-        Err(RecvTimeoutError::Timeout)
-    ));
+    assert!(helper.capture(helper.size).is_none());
     assert_eq!(
         helper
             .send_json_command(
-                json!({"type":"presentation", "scale":2., "visible":false}),
+                json!({"type":"presentation", "scale":1., "visible":false}),
                 TIMEOUT
             )
             .unwrap()
             .wait(),
         CommandOutcome::Executed
     );
-    assert_eq!(helper.command("capture", TIMEOUT), CommandOutcome::Executed);
-    assert!(matches!(
-        helper.receive(Duration::from_millis(100)),
-        Err(RecvTimeoutError::Timeout)
-    ));
+    assert!(helper.capture((32, 32)).is_none());
+    assert_eq!(
+        helper
+            .send_json_command(
+                json!({"type":"presentation", "scale":1., "visible":true}),
+                TIMEOUT
+            )
+            .unwrap()
+            .wait(),
+        CommandOutcome::Executed
+    );
+    // NativeCapture abandoned the first changed draw. Re-show must reset the
+    // helper fingerprint even though this mapping, scale and pixels are identical.
+    let frame = helper.capture((32, 32)).unwrap();
+    assert_eq!(&frame.pixels[..4], &[0, 0, 255, 255]);
     assert_eq!(
         helper
             .send_json_command(
@@ -266,11 +373,9 @@ fn native_skip_scale_and_hidden_capture() {
             .wait(),
         CommandOutcome::Executed
     );
-    let pending = helper.send_command("capture", TIMEOUT).unwrap();
-    let frame = helper.receive(TIMEOUT).unwrap().unwrap();
+    let frame = helper.capture((64, 64)).unwrap();
     assert_eq!((frame.header.width, frame.header.height), (64, 64));
     assert_eq!(&frame.pixels[..4], &[0, 0, 255, 255]);
-    assert_eq!(pending.wait(), CommandOutcome::Executed);
 }
 
 #[test]
@@ -282,12 +387,13 @@ fn native_fractional_scale_preserves_odd_pixel_sizes() {
     page(&html, "red");
     let renderer =
         std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
-    let mut helper = Helper::spawn(
+    let helper = Helper::spawn(
         Command::new(renderer)
             .arg(html)
             .args(["17", "11", "0", "30"]),
     )
     .unwrap();
+    let mut helper = NativeCapture::new(helper, 17, 11);
     for (scale, expected) in [(1., (17, 11)), (1.5, (26, 17)), (2., (34, 22))] {
         assert_eq!(
             helper
@@ -299,7 +405,14 @@ fn native_fractional_scale_preserves_odd_pixel_sizes() {
                 .wait(),
             CommandOutcome::Executed
         );
-        let frame = request_frame(&mut helper);
+        let deadline = Instant::now() + TIMEOUT;
+        let frame = loop {
+            if let Some(frame) = helper.capture(expected) {
+                break frame;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert_eq!((frame.header.width, frame.header.height), expected);
         assert_eq!(&frame.pixels[..4], &[0, 0, 255, 255]);
     }
@@ -330,18 +443,16 @@ fn native_capture_during_slow_load_does_not_block_commands() {
     });
     let renderer =
         std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
-    let mut helper = Helper::spawn(
+    let helper = Helper::spawn(
         Command::new(renderer)
             .arg(url)
             .args(["32", "32", "0", "30"]),
     )
     .unwrap();
+    let mut helper = NativeCapture::new(helper, 32, 32);
     waiting.recv_timeout(TIMEOUT).unwrap();
     let start = Instant::now();
-    assert_eq!(
-        helper.command("capture", Duration::from_secs(1)),
-        CommandOutcome::Executed
-    );
+    assert!(helper.capture((32, 32)).is_none());
     assert_eq!(
         helper.command("ping", Duration::from_secs(1)),
         CommandOutcome::Executed
@@ -393,7 +504,7 @@ const scroller=document.querySelector('#scroll'); scroller.addEventListener('scr
 </script>"#).unwrap();
     let renderer =
         std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
-    let mut helper = Helper::spawn(
+    let helper = Helper::spawn(
         Command::new(renderer)
             .arg(&html)
             .args(["800", "600", "0", "15"])
@@ -401,6 +512,7 @@ const scroller=document.querySelector('#scroll'); scroller.addEventListener('scr
             .env("LUCHS_INPUT_TRACE", "1"),
     )
     .unwrap();
+    let mut helper = NativeCapture::new(helper, 800, 600);
     request_frame(&mut helper);
     let mut executor = luchs::input::Executor::new(600.0);
     executor.attach(helper.command_sender());

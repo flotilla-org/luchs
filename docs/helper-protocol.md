@@ -3,12 +3,12 @@
 Rust creates one `AF_UNIX` `SOCK_STREAM` socketpair per renderer and passes the
 child endpoint in `LUCHS_HELPER_FD`. Only that endpoint survives exec; the helper
 sets close-on-exec again before starting WebKit. Stdin and stdout are `/dev/null`
-and carry no protocol bytes. Stderr carries diagnostics. The socket can carry
-future `SCM_RIGHTS` arena grants (#13); this slice passes no descriptors.
+and carry no protocol bytes. Stderr carries diagnostics. The socket carries one `SCM_RIGHTS` payload descriptor with each `arena` command.
+No pixel bytes travel over the socket.
 
 One helper process owns each engine and uses `takeSnapshot`, without Screen
-Recording permission. Direct writing into delegated Jackstay arena slots is
-follow-on work in #13, depending on Jackstay #75.
+Recording permission. Rust reserves and commits Jackstay CPU slots; the helper maps only their payload
+object and draws snapshots directly into the reserved slot. It does not link Jackstay.
 
 ## Envelopes and limits
 
@@ -17,22 +17,21 @@ contains no required trailing newline. A length excludes its own four bytes.
 Readers must accept split reads and multiple records in one read. Clean EOF
 occurs only between records; a partial prefix or payload is a protocol failure.
 A peer reset at a record boundary is treated as EOF, including on Linux when a
-helper exits with an unread command. Complete final frames are drained and the
-helper's exit status is still checked.
+helper exits with an unread command. Outstanding draws are abandoned on EOF and the helper's exit status is still checked.
 
 | Direction | Envelope | Limit |
 | --- | --- | --- |
 | Rust to helper | `u32 json_length`, then JSON bytes | 1 to 131,072 JSON bytes |
 | Helper to Rust | `u32 record_length`, `u8 tag`, then payload | Limits below include the tag |
-| Frame (tag 1) | `u32 header_length`, JSON header, raw pixels | At most 4,096 header bytes and 67,108,864 pixel bytes; outer maximum 67,112,965 bytes |
+| Retired frame tag 1 | Rejected | No socket pixel fallback |
 | Ack (tag 2) | JSON object | At most 131,072 record bytes |
 | State (tag 3) | JSON object | At most 131,072 record bytes |
 
 There is no padding between records. Zero lengths, unknown output tags, invalid
 JSON, invalid fields, oversized records, and truncation are fatal. Reject a
-length before allocating its payload. Frame readers validate the header before
-allocating pixels. On failure Rust terminates and reaps the helper, disconnects
-ack waiters, and reports the error through frame reception. The helper exits
+length before allocating its payload. Draw acknowledgements carry a frame header, validated against the reserved
+layout before commit. On failure Rust terminates and reaps the helper, disconnects
+ack waiters, and reports the error through the event wait. The helper exits
 with an error for malformed command records and terminates on clean socket EOF.
 
 ## Commands and acknowledgements
@@ -52,8 +51,7 @@ The helper emits exactly one ack per valid command, including unknown command
 types. It applies the command on its UI main thread and then emits the ack on
 that thread. A serial background socket writer keeps records from interleaving
 and keeps blocking writes off WebKit's main thread. The command reader admits
-one command at a time and waits for its acknowledgement to drain; a capture's
-bitmap stays borrowed until its write completes. This bounds queued work.
+one command at a time and waits for its acknowledgement to drain; a draw owns its reserved slot until its acknowledgement drains. This bounds queued work.
 While navigation is loading, capture acks immediately without a snapshot or
 report, so it cannot hold ping, reload or presentation behind page loading.
 Navigation completion reports activity and wakes capture. The existing initial
@@ -84,7 +82,9 @@ An invalid ack schema is a protocol failure.
 | --- | --- |
 | `ping` | The main thread has handled the command; ack `executed` |
 | `reload` | Apply a cache-bypassing reload request to the main page view; ack `executed` after the WebKit load/reload call returns |
-| `capture` | Complete a visible snapshot and any changed-frame write before ack; hidden requests take no snapshot |
+| `arena` | Receive exactly one payload fd, map `layout.map_len` bytes read/write, unmap the previous generation, then ack with `generation` |
+| `arena_release` | Unmap the named generation and destroy its contexts, then ack with that generation |
+| `draw` | Validate `slot`, `generation`, `width`, `height`, `stride`; snapshot and draw into that reserved slot; ack with matching generation/slot and a changed frame header, an unchanged report, or no report for a discarded/hidden/loading attempt |
 | `presentation` | Apply `visible` (boolean) and `scale` (positive finite number), validating the resulting pixel size before ack |
 | `mouse_move`, `mouse_down`, `mouse_up` | Deliver a native pointer event with f64 `x`/`y`; down/up require canonical `button` 1 through 5 |
 | `scroll` | Deliver a continuous pixel CGEvent with `dx`/`dy` and accumulated integer `point_dx`/`point_dy` |
@@ -193,9 +193,9 @@ WebKit input events.
 Host navigation/scroll verbs enter a bounded 64-command queue; the CLI dispatches
 one verb at a time without waiting on WebKit in the producer callback. Helper
 acks are internal and never become host replies. Unsupported verbs are ignored.
-When replacing a helper, `Source::helper_stopped` discards pending frames and
-commands and withdraws all four domains before new state is published. Normal
-CLI EOF preserves the final frame for its existing flush, then closes the source.
+When replacing a helper, `Source::helper_stopped` clears page commands and
+withdraws all four domains before new state is published. CLI EOF abandons any
+outstanding draw, checks the helper exit status, then closes the source.
 
 Rust parses host loads as URLs and canonicalizes file paths under the startup
 page directory. The helper independently validates schemes and symlink
@@ -204,13 +204,11 @@ startup pages grant no file authority. Rejected loads log to the helper console 
 
 ## Rust dispatch and timeouts
 
-One reader thread demultiplexes all socket records. It keeps at most two queued
-frames, dropping the oldest when full so frame reception cannot block ack
-routing. `Helper::dropped_frames()` counts mailbox drops; the CLI logs the
-count at shutdown when nonzero. `Helper::spawn_with_state` delivers state objects
-to a callback on that reader thread; the callback must return promptly. A
-callback panic terminates and reaps the helper and reports a stream error. State objects use the complete domain schema below; unrelated objects are ignored
-by the page-state bridge.
+One reader thread demultiplexes acknowledgement and state records.
+`Helper::spawn_with_state` delivers state objects to a callback on that reader
+thread; the callback must return promptly. A callback panic terminates and reaps
+the helper and reports a stream error. State objects use the complete domain
+schema above; the page-state bridge ignores unrelated objects.
 
 `Helper::send_command` registers a per-ID waiter before writing any bytes and
 returns a `PendingCommand`. Multiple commands can be outstanding and acks can
@@ -220,7 +218,7 @@ admission returns `WouldBlock`. Dropping a waiter frees its slot.
 The timeout starts when the command is admitted and includes writing the socket.
 Writes use a nonblocking socket; a timeout or write failure terminates and reaps
 the helper because a partial command cannot be retried on the same stream. Socket
-readiness uses `poll`; frame reception retains the write error even if socket
+readiness uses `poll`; the event wait retains the write error even if socket
 EOF races shutdown.
 `Helper::command` maps send failure, timeout, and helper disconnection to
 `CommandOutcome::Uncertain`. A reader accepts an ack only before its command's
@@ -231,8 +229,9 @@ Unmatched acks, including late acks and duplicate acks, are discarded. They
 cannot satisfy a different waiter or revise an outcome already returned. This
 keeps retired-ID bookkeeping bounded; helpers still owe exactly one ack for
 each command. `Helper::ignored_acks()` counts these discarded replies, and the
-CLI logs a nonzero count at shutdown. `execution_outcome()` maps `executed` to Jackstay `Executed`,
-`unsupported` to `Unsupported`, `failed` to `Rejected`, and timeout/disconnection
+CLI logs a nonzero count at shutdown. `receive_event` distinguishes wake, deadline
+and clean closure with `HelperEvent`; malformed records return an I/O error. `execution_outcome()` maps `executed` to Jackstay `Executed`,
+`unsupported` to `Unsupported`, `failed` to `Uncertain`, and timeout/disconnection
 to `Uncertain`. The CLI uses a one-second reload deadline. Unsupported reload
 is fatal because it means the helper cannot implement watch. Failed or uncertain
 reloads log a diagnostic when the failure outcome changes and retain the last successfully handled modification
@@ -242,36 +241,62 @@ prove that no effect occurred: watch can apply the same reload request more than
 once. Future non-idempotent input or affordance commands must not use this retry
 policy.
 
-## Frames
+## Arena grants and draws
 
-The JSON header uses device-pixel dimensions and premultiplied BGRA bytes:
+At setup Rust exports Jackstay's writable payload object. An `arena` command
+carries its descriptor and exactly one fd in `SCM_RIGHTS`, attached to the first
+command byte. Ancillary receipt uses `recvmsg` even across split reads. The helper
+validates the object length and layout, maps it shared read/write, closes the fd,
+and acknowledges its allocation generation. No Jackstay bookkeeping is exported.
+`arena_scope` is carried in the layout; the helper uses the generation and slot
+bounds within this one process lifetime.
 
 ```json
-{"format":"bgra8","width":800,"height":600,"stride":3200,"len":1920000}
+{"id":1,"type":"arena","layout":{"arena_scope":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"generation":1,"map_len":131072,"slot_capacity":16384,"slots":8}}
+{"id":1,"outcome":"executed","generation":1}
 ```
 
-Width and height must be positive unsigned 32-bit integers. Stride must be at
-least `width * 4`, and `len` must equal `stride * height`, fit the 64 MiB cap,
-and match the bytes remaining in the record. The format must be `bgra8`.
-No record can contain trailing bytes after its declared pixels.
+The numbers above illustrate a layout, not a portable page-size assumption.
+Slot N starts at `N * slot_capacity` in the payload mapping. Rust retains the
+writer export until unmap acknowledgement or verified helper exit. Before resize,
+it sends `arena_release {generation}`; the helper destroys its contexts and
+mapping before acknowledging that generation. Rust then releases the old export,
+reconfigures, and exports the replacement. A capacity pause uses
+`advance_reconfiguration` on later scheduler turns, so an old consumer lease or
+mapping can retire without restarting the transition. This also prevents a
+writer export from permanently pinning a paused allocation.
 
-The Swift helper emits little-endian premultiplied BGRA (`Bgra8Unorm`). It sets
-`snapshotWidth` to `logical_width * scale / window_backing_scale`, then draws
-WebKit's native image representation 1:1 into a reused bitmap/context. Integer
-pixel dimensions round each logical dimension times scale to the nearest pixel.
-The original representation preserves odd sizes which screen-scaled `NSImage`
-CGImage extraction would round away. There is no channel swizzle, intermediate
-pixel `Data`, or per-frame page mutation. The CGContext uses the snapshot's RGB
-colour space, determined when allocating a size.
+For each snapshot Rust reserves one exclusive slot and sends:
 
-Bitmap storage, its graphics contexts and frame envelope are reused until the
-pixel size changes. Rust decodes headers with fixed scratch storage and recycles
-pixel vectors from mailbox drops, replaced latest frames and the toolkit's
-`recycle()` callback. Frame-sized allocations occur during warm-up or size growth;
-small command/ack JSON and WebKit's snapshot objects still use framework storage.
-The toolkit's `input_size()` callback keeps input geometry in the logical viewport
-when scale changes the pixel allocation. The Swift logical viewport stays fixed;
-preferred size and focus hints remain #7's work.
+```json
+{"id":3,"type":"draw","slot":0,"generation":2,"width":800,"height":600,"stride":3200}
+```
+
+The helper rejects stale generations, out-of-range slots, invalid dimensions,
+stride other than `width * 4`, payloads beyond the slot capacity or 64 MiB cap,
+and dimensions inconsistent with the current presentation scale. It draws native
+little-endian premultiplied BGRA directly into that slot, then replies:
+
+```json
+{"id":3,"outcome":"executed","generation":2,"slot":0,"frame":{"format":"bgra8","width":800,"height":600,"stride":3200,"len":1920000},"capture":{"published":true,"snapshot_ns":2100000,"publish_ns":900000}}
+```
+
+Rust verifies command ID, slot, allocation generation and the entire header before
+commit. An unchanged draw carries `capture.published=false` and no frame header;
+Rust abandons it. Hidden, loading and discarded attempts have no capture report
+and also abandon their slot. A timeout, invalid reply, helper death or cancelled
+reservation terminates and reaps the helper before releasing the reservation.
+An acknowledgement followed by EOF before completion cannot publish a slot.
+No pixel fallback exists; output tag 1 is retired and rejected.
+
+The Swift helper sets `snapshotWidth` to
+`logical_width * scale / window_backing_scale` and draws WebKit's original image
+representation 1:1. That preserves odd fractional sizes which screen-scaled
+`NSImage` CGImage extraction can round away. Each mapped slot reuses its CGContext;
+the snapshot's RGB colour space is determined once per allocation. No channel
+swizzle, intermediate pixel `Data`, Rust pixel vector or socket pixel write remains
+in the helper path. Small command/ack JSON and WebKit snapshot objects still
+allocate. Input geometry stays in the fixed logical viewport.
 
 ## Capture policy and reports
 
@@ -279,26 +304,31 @@ Rust requests one capture at a time, using the ordinary command IDs and acks.
 A successful capture ack adds an optional report without changing its outcome:
 
 ```json
-{"id":4,"outcome":"executed","capture":{"published":false,"snapshot_ns":2100000,"publish_ns":0}}
+{"id":4,"outcome":"executed","generation":2,"slot":1,"capture":{"published":false,"snapshot_ns":2100000,"publish_ns":0}}
 ```
 
-`published` means the helper sent a changed frame. Snapshot time measures the
-WebKit API latency; publish time includes drawing, hashing and draining a changed
-frame to the socket. Skipped frames have zero publish time. A hidden or loading capture ack
-has no report because no snapshot was taken. `--stats` reports completed snapshots,
-Jackstay publications, unchanged skips and the mean times at exit. An in-flight
-capture interrupted by shutdown is not counted as completed.
+`published` means the helper completed a changed draw. Snapshot time measures
+WebKit API latency; publish time measures drawing and hashing through completion
+of the slot write. It excludes the small JSON acknowledgement and Rust commit.
+Skipped frames report zero publish time. Hidden/loading attempts have no report.
+`--stats` reports completed snapshots, Jackstay publications, unchanged skips,
+the mean times and `copies_per_frame=1`. The copy count describes the explicit
+full-frame destination writes in this path; it excludes WebKit internals and
+hashing reads. Orderly shutdown allows up to one second to complete a pending
+draw, then acknowledges unmap while keeping the helper alive for native input
+cleanup. Helper termination follows toolkit shutdown.
 
-The helper compares an FNV-1a fingerprint of native pixels with its last sent
-frame. A match emits no frame record. Rust also fingerprints dimensions, stride
-and pixels before Jackstay publication, guarding against renderer duplicates.
+The helper compares an FNV-1a fingerprint of dimensions and native pixels with
+its last changed draw. A match acknowledges unchanged and writes no frame header.
+Rust accepts that report and abandons the slot; it performs no second pixel scan.
 After one second without a changed frame or wake, captures back off from `--fps`
 (default 30) to 2 fps. Deadlines run from snapshot completion, so the effective
 frame rate is lower than `--fps` by snapshot and publish latency. The Rust loop
 sleeps until the next capture or 250 ms watch/signal deadline; acks, page activity
 and presentation callbacks interrupt its condition-variable wait immediately.
 A changed frame restores full rate. Reload and presentation
-commands wake capture; every non-capture helper command also reports a wake.
+commands wake capture; input, navigation and presentation commands also report a wake; arena setup
+and release do not.
 Page mutations, editing, selection, focus, scroll and resize report
 `{"capture_changed":true}` on the existing state tag. Active CSS animations report
 activity from a page rAF probe started by animation/transition events or DOM
@@ -314,34 +344,20 @@ scale hint is logged and retains the previous scale; its visibility still applie
 suppresses queued publications while leaving the WebKit window ordered in, so
 its page clock keeps running. `visible=true` requests an immediate capture and
 invalidates the previous fingerprint so an unchanged image can be presented
-again. `--frames=N` counts changed helper frames; a static page with N greater
+again. `--frames=N` counts committed changed frames; a static page with N greater
 than one can therefore remain running until content or presentation changes.
 
 ## Verification
 
-`cargo test --locked --test helper_protocol --test cli` exercises fake-helper
-frame passthrough, split records, out-of-order acks under frame backpressure,
-unknown commands, failed commands, timeout and late acks, state callbacks,
-malformed records, size bounds, callback panic, process reaping, and CLI watch
-reload recovery after failed and uncertain acks (including unsupported failure).
-`capture_policy` exercises the real CLI with a fake socketpair renderer: duplicate
-suppression, idle threshold, reload and page-signal wake, scale through the actual
-presentation callback, hidden capture suspension and immediate re-show.
-Fake command helpers require `python3`, available on the CI runners.
+`cargo test --workspace --locked` exercises fd export/mapping with fake Python
+helpers, byte-exact consumer frames, unchanged-slot abandonment, resize and old
+leases, capacity-paused retry, timeout, helper death (including death after ack),
+and mismatched generation, slot, ID or header. Protocol tests cover split records,
+retired pixel tags, out-of-order/late/duplicate acks, bounds, callback panic and
+process reaping. CLI tests cover watch, final draws and ordered input cleanup.
+`capture_policy` checks idle backoff, reload/page wakes, scale, hidden capture and
+re-show. Fake helpers require `python3`, available on CI runners.
 
-On a logged-in macOS desktop, build the Swift helper and run:
-
-```sh
-scripts/build-helper.sh
-cargo test --locked --test live_macos -- --ignored --nocapture
-```
-
-`scripts/test-helper.sh` checks native recovery: transient retry, successful
-reset and bounded persistent failure. The fake renderer tests two no-report
-discard acks after idle followed by a prompt successful capture, and verifies
-that an exhausted-retry diagnostic reaches the CLI.
-
-The tests check slow-loading capture/ping/presentation responsiveness and initial navigation failure, native ping/reload acks, a full-range u64 ID, zero-status exit on
-socket EOF, and verify that `--watch` publishes
-changed page pixels through the real CLI, Swift helper, and Jackstay producer.
-See [live macOS evidence](live-macos.md) for the recorded run.
+The ignored macOS tests exercise the production WebKit helper and native input,
+including odd fractional dimensions and real bootstrap consumers. Run them
+sequentially in a logged-in desktop after `scripts/build-helper.sh`.

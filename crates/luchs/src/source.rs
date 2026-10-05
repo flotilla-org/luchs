@@ -4,7 +4,7 @@ use crate::{
     affordances::{LoadPolicy, PageState},
     capture::CapturePolicy,
     cli::Cli,
-    helper::{CommandOutcome, Helper},
+    helper::{CommandOutcome, Helper, HelperEvent},
     protocol::Frame,
 };
 use jackstay::{
@@ -15,14 +15,11 @@ use jackstay::{
 };
 use jackstay_producer::{Builder, Producer};
 use std::{
-    collections::hash_map::DefaultHasher,
     fs,
-    hash::{Hash, Hasher},
     os::unix::fs::PermissionsExt,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::RecvTimeoutError,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -31,21 +28,14 @@ struct PageProducer {
     input: crate::input::Executor,
     page: PageState,
     load_policy: LoadPolicy,
-    recycled: Arc<Mutex<Vec<Vec<u8>>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
     logical_size: (f64, f64),
-    latest: Arc<Mutex<Option<jackstay_producer::Frame>>>,
     input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
 }
 impl Producer for PageProducer {
     fn frame(&mut self) -> Option<jackstay_producer::Frame> {
-        // Only an Option is swapped under this lock; unwinding cannot leave a
-        // partially mutated frame or ownership bookkeeping to repair.
-        self.latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        None
     }
 
     fn execute(&mut self, work: Work) -> Outcome {
@@ -59,13 +49,6 @@ impl Producer for PageProducer {
     }
     fn snapshots(&mut self) -> Vec<jackstay::affordances::Snapshot> {
         self.page.snapshots()
-    }
-    fn recycle(&mut self, frame: jackstay_producer::Frame) {
-        self.page.frame_published();
-        let mut pool = self.recycled.lock().unwrap();
-        if pool.len() < 4 {
-            pool.push(frame.bytes);
-        }
     }
     fn input_size(&mut self, _width: u32, _height: u32) -> (f64, f64) {
         self.logical_size
@@ -96,13 +79,14 @@ impl Producer for PageProducer {
 pub struct Source {
     pub page: PageState,
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
-    recycled: Arc<Mutex<Vec<Vec<u8>>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     source: jackstay_producer::Source,
-    latest: Arc<Mutex<Option<jackstay_producer::Frame>>>,
     input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
     started: Instant,
     sequence: u64,
+    mapping: Option<crate::arena_capture::Mapping>,
+    dimensions: (u32, u32, u32),
+    pending_dimensions: Option<(u32, u32, u32)>,
 }
 impl Source {
     pub fn bind(name: &str, width: u32, height: u32) -> Result<(Self, String)> {
@@ -115,13 +99,21 @@ impl Source {
         height: u32,
         page_path: Option<&std::path::Path>,
     ) -> Result<(Self, String)> {
+        Self::bind_page_with_budget(name, width, height, page_path, 1024 * 1024 * 1024)
+    }
+
+    fn bind_page_with_budget(
+        name: &str,
+        width: u32,
+        height: u32,
+        page_path: Option<&std::path::Path>,
+        memory_budget: u64,
+    ) -> Result<(Self, String)> {
         let load_policy = LoadPolicy::new(page_path)?;
         let page = PageState::default();
         crate::protocol::validate_size(width, height)?;
         let endpoint = Endpoint::new(Scope::User, name, Transport::LocalStream)?;
         let path = endpoint.render()?;
-        let latest = Arc::new(Mutex::new(None));
-        let recycled = Arc::new(Mutex::new(Vec::with_capacity(4)));
         let presentation = Arc::new(Mutex::new(None));
         let wake = Arc::new(Mutex::new(None));
         let input_sender = Arc::new(Mutex::new(None));
@@ -133,7 +125,7 @@ impl Source {
                 producer_reserve: 1,
                 payload_capacity: width as usize * height as usize * 4,
                 // Frames are capped at 64 MiB; 1 GiB bounds aggregate arena allocations.
-                memory_budget: 1024 * 1024 * 1024,
+                memory_budget,
                 max_incarnations: 3,
                 drain_timeout: Duration::from_secs(5),
             },
@@ -150,11 +142,9 @@ impl Source {
             PageProducer {
                 page: page.clone(),
                 load_policy,
-                recycled: recycled.clone(),
                 presentation: presentation.clone(),
                 wake: wake.clone(),
                 logical_size: (f64::from(width), f64::from(height)),
-                latest: latest.clone(),
                 input: crate::input::Executor::new(f64::from(height)),
                 input_sender: input_sender.clone(),
             },
@@ -170,12 +160,13 @@ impl Source {
                 page,
                 wake,
                 input_sender,
-                recycled,
                 presentation,
                 source,
-                latest,
                 started: Instant::now(),
                 sequence: 0,
+                mapping: None,
+                dimensions: (width, height, width * 4),
+                pending_dimensions: None,
             },
             path,
         ))
@@ -185,46 +176,174 @@ impl Source {
         *self.input_sender.lock().unwrap() = Some(helper.command_sender());
     }
 
+    fn setup_writer(&mut self, helper: &Helper) -> Result<()> {
+        self.mapping.take(); // reap a replaced helper before retiring its export
+        let export = self
+            .source
+            .with_arena(|arena| arena.export_writer())?
+            .ok_or("arena paused during setup")?;
+        self.mapping = Some(crate::arena_capture::Mapping::install(helper, export)?);
+        Ok(())
+    }
+
+    /// Publish locally supplied pixels, for non-helper producers and fixtures.
+    /// Helper draws use `draw`/`complete_draw` and never enter this copying path.
     pub fn publish(&mut self, frame: Frame) -> Result<()> {
         if self.source.is_finished() {
             return Err("source pump stopped".into());
         }
-
+        crate::protocol::validate_size(frame.header.width, frame.header.height)?;
+        if frame.header.stride < frame.header.width * 4
+            || frame.header.len != frame.pixels.len()
+            || frame.pixels.len() != frame.header.stride as usize * frame.header.height as usize
+            || frame.pixels.len() > crate::protocol::MAX_FRAME_BYTES
+        {
+            return Err("invalid local frame".into());
+        }
+        let dimensions = (frame.header.width, frame.header.height, frame.header.stride);
+        if !self.configure_dimensions(dimensions, frame.pixels.len())? {
+            return Ok(());
+        }
         self.sequence += 1;
-        let header = &frame.header;
-        let previous = self
-            .latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .replace(jackstay_producer::Frame {
-                descriptor: FrameDescriptor {
-                    sequence: self.sequence,
-                    timestamp_ns: self.started.elapsed().as_nanos() as u64,
-                    width: header.width,
-                    height: header.height,
-                    stride: header.stride,
-                    pixel_format: PixelFormat::Bgra8Unorm as u32,
-                    clock_domain: ClockDomain::MediaTime as u32,
-                    sync_kind: FrameSyncKind::CpuCopyComplete as u32,
-                    damage_kind: DamageKind::FullFrame as u32,
-                    ..FrameDescriptor::default()
-                },
-                bytes: frame.pixels,
-            });
-        if let Some(previous) = previous {
-            let mut pool = self.recycled.lock().unwrap();
-            if pool.len() < 4 {
-                pool.push(previous.bytes);
+        self.source.with_arena(|arena| -> Result<()> {
+            if let Some(mut slot) = arena.reserve()? {
+                slot.bytes_mut()[..frame.pixels.len()].copy_from_slice(&frame.pixels);
+                arena.commit(
+                    slot,
+                    FrameDescriptor {
+                        sequence: self.sequence,
+                        timestamp_ns: self.started.elapsed().as_nanos() as u64,
+                        width: frame.header.width,
+                        height: frame.header.height,
+                        stride: frame.header.stride,
+                        payload_len: frame.pixels.len() as u64,
+                        pixel_format: PixelFormat::Bgra8Unorm as u32,
+                        clock_domain: ClockDomain::MediaTime as u32,
+                        sync_kind: FrameSyncKind::CpuCopyComplete as u32,
+                        damage_kind: DamageKind::FullFrame as u32,
+                        ..FrameDescriptor::default()
+                    },
+                )?;
+                self.page.frame_published();
+            }
+            Ok(())
+        })
+    }
+
+    pub fn draw(
+        &mut self,
+        helper: &Helper,
+        width: u32,
+        height: u32,
+        timeout: Duration,
+    ) -> Result<Option<crate::arena_capture::Draw>> {
+        crate::protocol::validate_size(width, height)?;
+        let dimensions = (width, height, width * 4);
+        let len = width as usize * height as usize * 4;
+        if !self.configure_dimensions(dimensions, len)? {
+            return Ok(None);
+        }
+        if self.mapping.is_none() {
+            let Some(export) = self.source.with_arena(|arena| arena.export_writer())? else {
+                return Ok(None);
+            };
+            self.mapping = Some(crate::arena_capture::Mapping::install(helper, export)?);
+        }
+        let Some(reservation) = self.source.with_arena(|arena| arena.reserve())? else {
+            return Ok(None);
+        };
+        let header = crate::protocol::Header {
+            format: crate::protocol::Format::Bgra8,
+            width,
+            height,
+            stride: width * 4,
+            len,
+        };
+        Ok(Some(crate::arena_capture::Draw::start(
+            helper,
+            reservation,
+            header,
+            timeout,
+        )?))
+    }
+
+    fn configure_dimensions(&mut self, requested: (u32, u32, u32), len: usize) -> Result<bool> {
+        use jackstay::acquisition::arena::ReconfigurationStatus;
+        if self.pending_dimensions.is_none() && self.dimensions == requested {
+            return Ok(true);
+        }
+        let status = if self.pending_dimensions.is_some() {
+            self.source
+                .with_arena(|arena| arena.advance_reconfiguration())?
+        } else {
+            if let Some(mapping) = self.mapping.take() {
+                mapping.release()?;
+            }
+            self.pending_dimensions = Some(requested);
+            self.source.with_arena(|arena| arena.reconfigure_cpu(len))?
+        };
+        if matches!(status, ReconfigurationStatus::Ready { .. }) {
+            self.dimensions = self.pending_dimensions.take().unwrap();
+            return Ok(self.dimensions == requested);
+        }
+        Ok(false)
+    }
+
+    pub fn complete_draw(
+        &mut self,
+        helper: &Helper,
+        draw: crate::arena_capture::Draw,
+        ack: crate::protocol::Ack,
+    ) -> Result<Option<crate::protocol::CaptureReport>> {
+        self.finish_draw(helper, draw, ack, true)
+    }
+
+    fn finish_draw(
+        &mut self,
+        helper: &Helper,
+        mut draw: crate::arena_capture::Draw,
+        mut ack: crate::protocol::Ack,
+        visible: bool,
+    ) -> Result<Option<crate::protocol::CaptureReport>> {
+        if !helper.running()? {
+            return Err("renderer died during draw".into());
+        }
+        draw.validate(&ack)?;
+        let reservation = draw.reservation.complete();
+        if !visible {
+            if let Some(report) = ack.capture.as_mut() {
+                report.published = false;
+                report.publish_ns = 0;
             }
         }
-        Ok(())
+        if ack.capture.as_ref().is_some_and(|r| r.published) {
+            self.sequence += 1;
+            self.source.with_arena(|arena| {
+                arena.commit(
+                    reservation,
+                    FrameDescriptor {
+                        sequence: self.sequence,
+                        timestamp_ns: self.started.elapsed().as_nanos() as u64,
+                        width: draw.header.width,
+                        height: draw.header.height,
+                        stride: draw.header.stride,
+                        payload_len: draw.header.len as u64,
+                        pixel_format: PixelFormat::Bgra8Unorm as u32,
+                        clock_domain: ClockDomain::MediaTime as u32,
+                        sync_kind: FrameSyncKind::CpuCopyComplete as u32,
+                        damage_kind: DamageKind::FullFrame as u32,
+                        ..FrameDescriptor::default()
+                    },
+                )
+            })?;
+            self.page.frame_published();
+        } else {
+            self.source.with_arena(|arena| arena.abandon(reservation))?;
+        }
+        Ok(ack.capture)
     }
 
     pub fn helper_stopped(&self) {
-        self.latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
         self.page.helper_stopped();
     }
 
@@ -232,29 +351,11 @@ impl Source {
         self.presentation.lock().unwrap().take()
     }
 
-    pub fn recycle_into(&self, helper: &Helper) {
-        for pixels in self.recycled.lock().unwrap().drain(..) {
-            helper.recycle(pixels);
-        }
-    }
-
-    pub fn stop(self) -> Result<()> {
-        // EOF can follow the final helper frame immediately. Let the pump take
-        // that frame before stopping; joining it completes that publication.
-        // The pinned toolkit pump calls frame() unconditionally, even without
-        // peers. Bound this flush to one second in case that contract changes;
-        // ordered toolkit shutdown still runs if the final frame is skipped.
-        // Upstream flush barrier: https://github.com/flotilla-org/jackstay/issues/71
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline
-            && !self.source.is_finished()
-            && self
-                .latest
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_some()
-        {
-            std::thread::sleep(Duration::from_millis(5));
+    pub fn stop(mut self) -> Result<()> {
+        // Unmap pixels without terminating the helper: native input cleanup still
+        // needs its command endpoint while the toolkit stops.
+        if let Some(mapping) = self.mapping.take() {
+            mapping.release()?;
         }
         self.source.stop()?;
         Ok(())
@@ -275,40 +376,26 @@ struct CaptureStats {
     publish_ns: u128,
 }
 impl CaptureStats {
-    fn poll(
+    fn report(
         &mut self,
-        pending: &mut Option<crate::helper::PendingCommand>,
+        report: Option<crate::protocol::CaptureReport>,
         policy: &mut CapturePolicy,
-    ) -> Result<()> {
-        let Some(command) = pending.as_ref() else {
-            return Ok(());
-        };
-        if let Some(ack) = command.poll() {
-            if ack.outcome != crate::protocol::AckOutcome::Executed {
-                return Err(format!(
-                    "renderer capture failed: {}",
-                    ack.detail.as_deref().unwrap_or("no diagnostic")
-                )
-                .into());
-            }
-            if let Some(report) = ack.capture {
-                self.snapshots += 1;
-                self.skipped += u64::from(!report.published);
-                self.snapshot_ns += u128::from(report.snapshot_ns);
-                self.publish_ns += u128::from(report.publish_ns);
-                policy.completed(report.published, Instant::now());
-            } else {
-                policy.completed(true, Instant::now());
-            }
-            *pending = None;
-        } else if command.expired() {
-            return Err("renderer capture timed out".into());
+    ) {
+        if let Some(report) = report {
+            self.snapshots += 1;
+            self.skipped += u64::from(!report.published);
+            self.snapshot_ns += u128::from(report.snapshot_ns);
+            self.publish_ns += u128::from(report.publish_ns);
+            policy.completed(report.published, Instant::now());
+        } else {
+            policy.completed(true, Instant::now());
         }
-        Ok(())
     }
     fn log(&self, received: u64) {
+        // One explicit destination write is a path invariant, not a runtime
+        // hardware counter; kernel/WebKit internals and hashing reads are excluded.
         eprintln!(
-            "luchs: stats snapshots={} published={received} skipped={} mean_snapshot_ms={:.3} mean_publish_ms={:.3}",
+            "luchs: stats snapshots={} published={received} skipped={} copies_per_frame=1 mean_snapshot_ms={:.3} mean_publish_ms={:.3}",
             self.snapshots,
             self.skipped,
             self.snapshot_ns as f64 / self.snapshots.max(1) as f64 / 1e6,
@@ -342,10 +429,10 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         page.helper_state(state);
     })?;
     source.attach_input(&helper);
+    source.setup_writer(&helper)?;
     *source.wake.lock().unwrap() = Some(helper.wake_handle());
     let mut policy = CapturePolicy::new(cli.fps, Instant::now());
-    let mut pending_capture: Option<crate::helper::PendingCommand> = None;
-    let mut fingerprint = None;
+    let mut pending_capture: Option<crate::arena_capture::Draw> = None;
     let mut stats = CaptureStats::default();
     println!("{path}");
     eprintln!("luchs: source ready: {path}");
@@ -366,34 +453,18 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             policy.wait(Instant::now()).min(watch_wait)
         };
         match helper.receive_event(timeout) {
-            Ok(frame) => {
-                let frame = frame?;
-                // Defend publication against duplicate frames from alternate or
-                // misbehaving helpers; native Swift already skips its own duplicates.
-                let mut hash = DefaultHasher::new();
-                (frame.header.width, frame.header.height, frame.header.stride).hash(&mut hash);
-                frame.pixels.hash(&mut hash);
-                let value = hash.finish();
-                if policy.visible && fingerprint != Some(value) {
-                    fingerprint = Some(value);
-                    source.publish(frame)?;
-                    received += 1;
-                } else {
-                    helper.recycle(frame.pixels);
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
+            Ok(HelperEvent::Wake | HelperEvent::Timeout) => {}
+            Err(error) => return Err(error.into()),
+            Ok(HelperEvent::Closed) => {
                 source.page.helper_stopped();
                 helper.finish()?;
-                stats.poll(&mut pending_capture, &mut policy)?;
+                pending_capture.take();
                 if received == 0 {
                     return Err("renderer exited without a frame".into());
                 }
                 break;
             }
         }
-        source.recycle_into(&helper);
         if changed.swap(false, Ordering::AcqRel) {
             policy.wake(Instant::now());
         }
@@ -419,9 +490,6 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             if outcome != CommandOutcome::Executed {
                 return Err(format!("renderer presentation: {outcome:?}").into());
             }
-            if hint.visible && (!policy.visible || scale != policy.scale) {
-                fingerprint = None;
-            }
             policy.presentation(hint.visible, scale, Instant::now());
         }
         if pending_verb
@@ -437,23 +505,52 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
                 policy.wake(Instant::now());
             }
         }
-        stats.poll(&mut pending_capture, &mut policy)?;
+        if let Some(draw) = pending_capture.as_ref() {
+            if let Some(ack) = draw.poll() {
+                let report = source.finish_draw(
+                    &helper,
+                    pending_capture.take().unwrap(),
+                    ack,
+                    policy.visible,
+                )?;
+                let published = report.as_ref().is_some_and(|r| r.published);
+                stats.report(report, &mut policy);
+                received += u64::from(published);
+                if cli.frames > 0 && received >= u64::from(cli.frames) {
+                    break;
+                }
+            } else if draw.expired() {
+                return Err("renderer capture timed out".into());
+            }
+        }
         if pending_capture.is_none()
             && !command_socket_closed
             && !helper.ended()
             && policy.due(Instant::now())
         {
-            match helper.send_command("capture", Duration::from_secs(10)) {
-                Ok(command) => pending_capture = Some(command),
+            match source.draw(
+                &helper,
+                (cli.size.0 as f64 * policy.scale).round() as u32,
+                (cli.size.1 as f64 * policy.scale).round() as u32,
+                Duration::from_secs(10),
+            ) {
+                Ok(command) => {
+                    pending_capture = command;
+                    if pending_capture.is_none() {
+                        policy.completed(false, Instant::now());
+                    }
+                }
                 Err(error)
                     if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        error
+                            .downcast_ref::<std::io::Error>()
+                            .map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
                     ) =>
                 {
                     command_socket_closed = true;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         if last_poll.elapsed() >= Duration::from_millis(250) {
@@ -482,14 +579,27 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             last_poll = Instant::now();
         }
     }
+    // Complete an in-flight draw before ordered input cleanup. Reaping a
+    // cancelled writer first would also remove the native cleanup endpoint.
+    if let Some(draw) = pending_capture.take() {
+        let deadline = Instant::now() + draw.remaining().min(Duration::from_secs(1));
+        loop {
+            if let Some(ack) = draw.poll() {
+                let report = source.finish_draw(&helper, draw, ack, policy.visible)?;
+                let published = report.as_ref().is_some_and(|r| r.published);
+                stats.report(report, &mut policy);
+                received += u64::from(published);
+                break;
+            }
+            if helper.ended() || Instant::now() >= deadline {
+                return Err("renderer stopped or timed out during final draw".into());
+            }
+            helper.receive_event(deadline.saturating_duration_since(Instant::now()))?;
+        }
+    }
     eprintln!("luchs: stopped after {received} frames");
-    stats.poll(&mut pending_capture, &mut policy)?;
     if cli.stats {
         stats.log(received);
-    }
-    let dropped = helper.dropped_frames();
-    if dropped > 0 {
-        eprintln!("luchs: helper dropped {dropped} frames");
     }
     let ignored = helper.ignored_acks();
     if ignored > 0 {
@@ -498,3 +608,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     source.stop()?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "arena_capture_tests.rs"]
+mod arena_capture_tests;
