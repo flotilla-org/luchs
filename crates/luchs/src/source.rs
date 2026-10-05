@@ -313,10 +313,10 @@ impl Source {
         mut ack: crate::protocol::Ack,
         visible: bool,
     ) -> Result<Option<crate::protocol::CaptureReport>> {
+        draw.validate(&ack)?;
         if !helper.running()? {
             return Err("renderer died during draw".into());
         }
-        draw.validate(&ack)?;
         let reservation = draw.reservation.complete();
         if !visible {
             if let Some(report) = ack.capture.as_mut() {
@@ -480,7 +480,14 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             Ok(HelperEvent::Closed) => {
                 source.page.helper_stopped();
                 helper.finish()?;
-                pending_capture.take();
+                if let Some(draw) = pending_capture.take()
+                    && let Some(ack) = draw.poll()
+                {
+                    // EOF can win the event wait even when the reader delivered
+                    // a failed draw ack first. Preserve that diagnostic, but never
+                    // commit pixels from an exited writer. finish() reaps it first.
+                    draw.validate(&ack)?;
+                }
                 if received == 0 {
                     return Err("renderer exited without a frame".into());
                 }

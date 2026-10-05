@@ -118,3 +118,39 @@ fn native_resize_reflows_and_focus_controls_caret() {
     wait(|| process.0.try_wait().unwrap().is_some());
     assert!(process.0.wait().unwrap().success());
 }
+
+#[test]
+#[ignore = "requires built Swift helper and live macOS desktop"]
+fn native_frame_cap_resize_acks_fit_command_timeout() {
+    use luchs::helper::{COMMAND_TIMEOUT, CommandOutcome, Helper};
+    let page =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/presentation.html");
+    let renderer =
+        std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
+    let mut helper = Helper::spawn(
+        Command::new(renderer)
+            .arg(page)
+            .args(["800", "600", "0", "30"]),
+    )
+    .unwrap();
+    // CLI setup likewise waits for helper initialization before presentation.
+    assert_eq!(
+        helper.command("ping", Duration::from_secs(10)),
+        CommandOutcome::Executed
+    );
+    for (width, height, scale) in [(2048, 2048, 2.), (4096, 4096, 1.), (800, 600, 1.)] {
+        let start = Instant::now();
+        let outcome = helper
+            .send_json_command(
+                serde_json::json!({"type":"resize", "width":width, "height":height, "scale":scale}),
+                COMMAND_TIMEOUT,
+            )
+            .unwrap()
+            .wait();
+        assert_eq!(outcome, CommandOutcome::Executed);
+        eprintln!(
+            "resize {width}x{height} at scale {scale}: ack in {:?}",
+            start.elapsed()
+        );
+    }
+}

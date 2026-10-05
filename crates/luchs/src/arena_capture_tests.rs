@@ -316,3 +316,28 @@ while True:
     assert_eq!(helper.command("cleanup", TIMEOUT), CommandOutcome::Executed);
     assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Executed);
 }
+
+#[test]
+fn failed_draw_ack_preserves_diagnostic_after_writer_exit() {
+    let (mut source, _) = source();
+    let mut helper = helper(
+        "\ncmd = raw_command()\nack(cmd, 'failed', detail='snapshot retry budget exhausted')\n",
+    );
+    source.setup_writer(&helper).unwrap();
+    let draw = source.draw(&helper, 1, 1, TIMEOUT).unwrap().unwrap();
+    let ack = reply(&draw);
+    let deadline = Instant::now() + TIMEOUT;
+    while !helper.ended() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    helper.finish().unwrap();
+    let error = source.complete_draw(&helper, draw, ack).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("snapshot retry budget exhausted"),
+        "{error}"
+    );
+    source.stop().unwrap();
+}

@@ -720,3 +720,16 @@ The locked Rust suite, build, Clippy and formatting passed, as did the native
 resize/focus regression with the revised scheduler. A broader native-affordance
 rerun reported `visibility hidden` and suspended rAF in the current desktop
 session; those same fixtures passed during the earlier live validation above.
+
+The second review added `native_frame_cap_resize_acks_fit_command_timeout`.
+Using the production helper and one-second command timeout, a 2048x2048 logical
+resize at scale 2 acknowledged in 4.936 ms; 4096x4096 at scale 1 took 1.883 ms;
+restoring 800x600 took 1.376 ms. Both large requests reach the 64 MiB pixel cap.
+These timings cover viewport command execution, not snapshot completion, which
+has its own draw deadline. Both native presentation tests passed sequentially.
+
+Linux CI exposed a failed-draw acknowledgement racing with helper EOF. Rust now
+validates an available acknowledgement before reporting writer death, retaining
+the snapshot failure detail while refusing to commit pixels from an exited
+writer. A deterministic dead-writer regression and the existing CLI exhausted
+snapshot retry test passed with this fix.
