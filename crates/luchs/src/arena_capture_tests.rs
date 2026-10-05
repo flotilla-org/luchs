@@ -225,18 +225,14 @@ fn helper_death_and_death_after_ack_never_commit() {
 
 #[test]
 fn paused_resize_releases_writer_and_retries_pending_configuration() {
-    // A one-page payload needs eight pages. Old + new cannot both fit this
-    // budget, but either alone can. The old consumer mapping deliberately pins it.
+    // Both allocations have 128 KiB of pixels, so only one fits the 192 KiB
+    // budget on macOS or Linux. The consumer deliberately pins the old mapping.
     let (mut source, path) = Source::bind_page_with_budget(
         &format!("arena-budget-{}", std::process::id()),
-        1,
-        1,
+        64,
+        64,
         None,
-        if cfg!(target_os = "macos") {
-            192 * 1024
-        } else {
-            160 * 1024
-        },
+        192 * 1024,
     )
     .unwrap();
     let helper = helper(
@@ -244,23 +240,22 @@ fn paused_resize_releases_writer_and_retries_pending_configuration() {
     );
     source.setup_writer(&helper).unwrap();
     let (setup, consumer) = connect(&path);
-    let draw = source.draw(&helper, 1, 1, TIMEOUT).unwrap().unwrap();
+    let draw = source.draw(&helper, 64, 64, TIMEOUT).unwrap().unwrap();
     let ack = reply(&draw);
     source.complete_draw(&helper, draw, ack).unwrap();
-    // 64x64 occupies one full 16 KiB page per slot on macOS (four 4 KiB
-    // pages on Linux). The budget allows the new allocation but not both.
-    let first = source.draw(&helper, 64, 64, TIMEOUT).unwrap();
+    // Change dimensions and stride without changing the payload byte count.
+    let first = source.draw(&helper, 128, 32, TIMEOUT).unwrap();
     assert!(
         first.is_none(),
         "test budget must force a paused replacement"
     );
     assert!(source.mapping.is_none());
     assert!(source.pending_dimensions.is_some());
-    assert!(source.draw(&helper, 64, 64, TIMEOUT).unwrap().is_none());
+    assert!(source.draw(&helper, 128, 32, TIMEOUT).unwrap().is_none());
     drop((consumer, setup));
     let deadline = Instant::now() + TIMEOUT;
     let draw = loop {
-        if let Some(draw) = source.draw(&helper, 64, 64, TIMEOUT).unwrap() {
+        if let Some(draw) = source.draw(&helper, 128, 32, TIMEOUT).unwrap() {
             break draw;
         }
         assert!(
