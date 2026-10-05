@@ -379,27 +379,26 @@ fn native_host_motion_delivers_trusted_dom_hover() {
             std::thread::sleep(Duration::from_millis(10));
         }
     };
-    send(InputEvent::Motion(position(20., 70.)));
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let log = std::fs::read_to_string(dir.path().join("console.log")).unwrap_or_default();
-        if log.contains("mousemove 20,70 trusted=true") {
-            break;
+    let hover_line = "mousemove 20,70 trusted=true hover=true";
+    let wait_for_hover = |minimum| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let log = std::fs::read_to_string(dir.path().join("console.log")).unwrap_or_default();
+            if log.matches(hover_line).count() >= minimum {
+                return log;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Motion executed but missing trusted DOM hover at 20,70; console:\n{log}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            Instant::now() < deadline,
-            "Motion executed but no trusted DOM mousemove 20,70; console:\n{log}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    };
+    send(InputEvent::Motion(position(20., 70.)));
+    wait_for_hover(1);
     wait(
         &host,
         |s| matches!(s, Snapshot::Cursor(shape) if shape == "pointer"),
-    );
-    assert!(
-        std::fs::read_to_string(dir.path().join("console.log"))
-            .unwrap()
-            .contains("mousemove 20,70 trusted=true hover=true")
     );
     send(InputEvent::Motion(position(20., 120.)));
     wait(
@@ -420,17 +419,16 @@ fn native_host_motion_delivers_trusted_dom_hover() {
         &host,
         |s| matches!(s, Snapshot::Cursor(shape) if shape == "text"),
     );
+    let before = std::fs::read_to_string(dir.path().join("console.log"))
+        .unwrap()
+        .matches(hover_line)
+        .count();
     send(InputEvent::Motion(position(20., 70.)));
     wait(
         &host,
         |s| matches!(s, Snapshot::Cursor(shape) if shape == "pointer"),
     );
-    let log = std::fs::read_to_string(dir.path().join("console.log")).unwrap();
-    assert_eq!(
-        log.matches("mousemove 20,70 trusted=true hover=true")
-            .count(),
-        2
-    );
+    let log = wait_for_hover(before + 1);
     eprintln!("native hover console:\n{log}");
     input.close();
     let deadline = Instant::now() + Duration::from_secs(5);

@@ -492,6 +492,10 @@ checks remain recorded above. No experimental hover routing is included.
 
 ## Native host hover diagnosis (2026-10-05)
 
+This section supersedes the unresolved hover finding and the "no experimental
+hover routing" statement in the combined-input section above. Those paragraphs
+record the earlier PR #18 validation.
+
 Issue #19 reproduced on macOS 26.6 (25G72), arm64. A new ignored test starts
 the production CLI and transparent helper, connects one v2 host with required
 SourceText input and required affordances, waits for `window.ready`, then sends

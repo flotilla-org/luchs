@@ -9,4 +9,3 @@ final class CaptureInputWindow: NSWindow {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }
-
