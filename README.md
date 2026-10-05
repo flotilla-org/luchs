@@ -16,7 +16,8 @@ disconnect and shutdown wait for native releases before admitting a replacement.
 
 Page state publishes window, navigation, cursor and document-scroll affordances.
 Navigation and scroll verbs execute in WebKit; host presentation scale and
-visibility hints control capture.
+visibility hints control capture. Preferred logical size resizes the WebKit viewport
+and focus hints dispatch page focus/blur events and control the synthetic caret.
 
 ## Build and install
 
@@ -110,9 +111,19 @@ exclusive reservations and writer exports.
 A timeout, helper death or mismatched draw reply reaps the helper before
 abandoning its slot, preventing late writes into reused storage.
 
-The Swift viewport stays fixed for a run. Rust reconfigures the CPU allocation
-when presentation scale changes its pixel dimensions, exporting the replacement
-before another draw. Capacity-paused replacements retry on later scheduler turns
+Host `preferred_size` resizes the WebKit view and transparent window live. Hints
+coalesce for 50 ms (latest wins) and apply after the current snapshot finishes.
+Logical dimensions round to whole units; oversized requests clamp proportionally
+to the 64 MiB pixel cap at the requested scale. A null preferred size restores
+`--size`. Rust reconfigures the CPU allocation when logical size or scale changes
+its pixel dimensions, exporting the replacement before another draw. Logical
+resize advances the toolkit's input geometry revision; scale alone does not.
+Page-sized scroll input uses the current logical height. Host `focused` dispatches
+window focus/blur events and hides the caret while unfocused, including in frames.
+It never changes AppKit activation, input admission or held-input cleanup.
+Acknowledged focus failures log and retry on the next hint while capture continues.
+Presentation withdrawal or closure restores visible, unfocused, scale 1 and the
+CLI size. Capacity-paused replacements retry on later scheduler turns
 as old allocations retire; leased pixels stay intact. Rust owns `--frames` and
 stops after committing the requested number of changed frames. On orderly
 shutdown it allows up to one second for a pending draw before input cleanup.

@@ -666,3 +666,72 @@ capture test now re-shows identical pixels at the same scale and allocation,
 verifying the existing helper fingerprint reset after an abandoned draw. Cached
 contexts reject dimension/stride changes. Rust event waits distinguish wake,
 timeout and closure; draw reservations remain guarded even if command send fails.
+
+
+## Presentation resize and focus (2026-10-05, issue #7)
+
+Validated on macOS 26.6 (25G72), arm64, Apple Swift 6.4, Rust 1.98.0 and
+SDL 2.32.70. Luchs is based on `eebd2c7`; the implementation is
+[Luchs PR #23](https://github.com/flotilla-org/luchs/pull/23). The producer toolkit and SDL viewer use Jackstay
+`c3b88ec3badc278d986ea97d3e6e6e8801953193` (direct arena input geometry callback).
+The reviewed Luchs pin was `6516094b8f4335b54d06bba8586a64d67ab0d9c6`, which
+consolidates that callback with the copied-frame geometry path and adds cleanup
+and invalid-geometry tests. The native presentation regression passed again
+with this reviewed pin. Jackstay PR #86 was then squash-merged as
+`276900db59b9c651b1f5a83427a6f498265770fd`; both Luchs dependencies now pin
+that merged commit. Its source tree is identical to the reviewed pin.
+
+```sh
+scripts/build-helper.sh
+cargo test --locked --test presentation
+cargo test --locked --test live_macos_presentation -- --ignored --nocapture
+# Build the matching Jackstay library with backend-macos, then its SDL viewer.
+target/debug/luchs --endpoint=luchs-resize-focus-live --stats --size=800x600 testdata/presentation.html
+capture-viewer-sdl --source-endpoint luchs-resize-focus-live --typing cooperative --affordances required --log-affordances
+```
+
+The live SDL window ran on the Retina desktop. Its initial preferred viewport
+was 320x180 at scale 2. Dragging its corner produced 620x416 logical units with
+one card column, then 820x466 with two columns. Shrinking to 520x366 stacked the
+cards again. Desktop screenshots showed those sizes and column counts rendered
+inside the viewer, with the synthetic caret in the focused input. WebKit's
+console recorded the same reflows. Closing the viewer withdrew presentation;
+the page returned to 800x600, two columns, unfocused, with the caret hidden.
+The viewer executable was wrapped in a temporary app bundle for desktop
+automation; its binary and rendering/input code were unchanged.
+
+The native regression used the production helper and real bootstrap host. It
+changed 800x600 to 500x400 at scale 1.5, acquired a 750x600 BGRA frame, and saw
+input geometry revision 2 with logical width 500. The page reported one column
+and `focused=true caret=block`; focus false reported `caret=none` without
+changing geometry. Withdrawal acquired an 800x600 frame and advanced revision
+to 3. SIGTERM exited successfully after releasing the consumer.
+
+The fake-helper test checks acknowledged resize/focus commands, scaled frame
+sizes, unchanged geometry on scale-only updates, latest-wins bursts, and all
+withdrawal defaults. Focus-only changes preserve controller admission and
+emit no cleanup. Size tests cover fractional rounding, the exact cap, very large
+square and narrow requests, and small scales.
+
+
+Review follow-up replaces the timing-dependent burst assertion with a deterministic
+clock test and adds invalid-scale and non-finite-size coverage. A fake helper
+fails the first focus acknowledgement after a successful resize; capture keeps
+publishing at the new size and the next hint retries focus without another resize.
+The locked Rust suite, build, Clippy and formatting passed, as did the native
+resize/focus regression with the revised scheduler. A broader native-affordance
+rerun reported `visibility hidden` and suspended rAF in the current desktop
+session; those same fixtures passed during the earlier live validation above.
+
+The second review added `native_frame_cap_resize_acks_fit_command_timeout`.
+Using the production helper and one-second command timeout, a 2048x2048 logical
+resize at scale 2 acknowledged in 4.936 ms; 4096x4096 at scale 1 took 1.883 ms;
+restoring 800x600 took 1.376 ms. Both large requests reach the 64 MiB pixel cap.
+These timings cover viewport command execution, not snapshot completion, which
+has its own draw deadline. Both native presentation tests passed sequentially.
+
+Linux CI exposed a failed-draw acknowledgement racing with helper EOF. Rust now
+validates an available acknowledgement before reporting writer death, retaining
+the snapshot failure detail while refusing to commit pixels from an exited
+writer. A deterministic dead-writer regression and the existing CLI exhausted
+snapshot retry test passed with this fix.

@@ -85,6 +85,8 @@ An invalid ack schema is a protocol failure.
 | `arena` | Receive exactly one payload fd, map `layout.map_len` bytes read/write, unmap the previous generation, then ack with `generation` |
 | `arena_release` | Unmap the named generation and destroy its contexts, then ack with that generation |
 | `draw` | Validate `slot`, `generation`, `width`, `height`, `stride`; snapshot and draw into that reserved slot; ack with matching generation/slot and a changed frame header, an unchanged report, or no report for a discarded/hidden/loading attempt |
+| `resize` | Apply integer logical `width`/`height` and positive finite `scale` together; validate the scaled 64 MiB pixel cap, resize the window and all WebKit views, invalidate snapshot configuration, then ack |
+| `focus` | Apply boolean `focused` through page window focus/blur events and caret visibility; ack after JavaScript execution; no input cleanup or desktop focus change |
 | `presentation` | Apply `visible` (boolean) and `scale` (positive finite number), validating the resulting pixel size before ack |
 | `mouse_move`, `mouse_down`, `mouse_up` | Deliver a native pointer event with f64 `x`/`y`; down/up require canonical `button` 1 through 5 |
 | `scroll` | Deliver a continuous pixel CGEvent with `dx`/`dy` and accumulated integer `point_dx`/`point_dy` |

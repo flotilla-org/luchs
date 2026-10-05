@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Luchs presentation</title>
+<style>
+  html, body { margin: 0; background: #18212b; color: #eef3f7; font: 18px system-ui; }
+  main { padding: 24px; }
+  h1 { font-size: 28px; }
+  input { font: inherit; padding: 8px; width: 240px; }
+  .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 24px; }
+  article { padding: 24px; background: #29435c; min-height: 120px; }
+  @media (max-width: 650px) { .cards { grid-template-columns: 1fr; } }
+</style>
+<main>
+  <h1>Live resize and focus</h1>
+  <p id="viewport"></p>
+  <input autofocus value="Caret follows host focus">
+  <section class="cards"><article>First card</article><article>Second card</article></section>
+</main>
+<script>
+  function report() {
+    setTimeout(() => {
+      const focused = window.__luchsHostFocused === true;
+      const caret = document.getElementById('luchs-synthetic-caret');
+      const columns = getComputedStyle(document.querySelector('.cards')).gridTemplateColumns.split(' ').length;
+      const status = `${innerWidth}x${innerHeight} columns=${columns} focused=${focused} caret=${caret ? getComputedStyle(caret).display : 'missing'}`;
+      document.getElementById('viewport').textContent = status;
+      console.log('presentation ' + status);
+    }, 50);
+  }
+  for (const name of ['resize', 'focus', 'blur']) window.addEventListener(name, report);
+  window.addEventListener('load', report);
+</script>
