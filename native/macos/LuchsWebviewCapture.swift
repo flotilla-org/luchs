@@ -248,6 +248,8 @@ private struct WriterLayout: Decodable {
 private final class WriterMapping {
     let layout: WriterLayout
     let base: UnsafeMutableRawPointer
+    // Each arena command replaces this whole mapping, so cached slot contexts
+    // cannot outlive their allocation generation or refer to retired memory.
     private var contexts: [UInt32: (width: Int, height: Int, stride: Int, graphics: NSGraphicsContext)] = [:]
     private var colorSpace: CGColorSpace?
     init(_ layout: WriterLayout, fd: Int32) {
@@ -332,6 +334,8 @@ private func readExactly(_ count: Int, allowEOF: Bool = false, descriptor: inout
         if n < 0 && errno == EINTR { continue }
         if n < 0 { fail("command recvmsg failed") }
         if fd >= 0 {
+            // macOS has no MSG_CMSG_CLOEXEC. The helper launches no child
+            // processes, so no fork/exec can race this fallback in our code.
             guard descriptor == nil, fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else {
                 close(fd)
                 fail("unexpected command descriptors")
@@ -1081,7 +1085,10 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             return
         }
         guard let bitmap = arena?.slot(command), let graphicsContext = arena?.graphicsContext(command, image: image)
-        else { fail("failed to create arena BGRA context") }
+        else {
+            emitDrawAck(command, outcome: "failed", detail: "failed to create arena BGRA context")
+            return
+        }
         let context = graphicsContext.cgContext
         // Draw the snapshot's native representation 1:1. Asking NSImage for a
         // screen-scaled CGImage can round 26x17 pixels down to 24x16 on Retina.

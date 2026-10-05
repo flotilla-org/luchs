@@ -64,6 +64,8 @@ impl Mapping {
         if !ack.is_some_and(|ack| {
             ack.outcome == AckOutcome::Executed && ack.generation == Some(generation)
         }) {
+            // Keep the guard active: Drop must reap an unconfirmed writer
+            // before this export can retire and its memory can be reused.
             return Err("renderer arena release failed or timed out".into());
         }
         self.active = false;
