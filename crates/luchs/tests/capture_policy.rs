@@ -75,10 +75,10 @@ while True:
     if not select.select([transport], [], [], .01)[0]: continue
     try: cmd = raw_command()
     except EOFError: break
-    if cmd['type'] == 'capture' and retries: cmd['retry_discard'] = True
+    if cmd['type'] == 'draw' and retries: cmd['retry_discard'] = True
     with open(os.environ['CAPTURE_LOG'], 'a') as log:
         log.write(json.dumps({'type':cmd['type'], 'time':time.monotonic(), **cmd}) + '\n')
-    if cmd['type'] == 'capture':
+    if cmd['type'] == 'draw':
         if retries:
             retries -= 1
             # Match Swift's discarded-snapshot ack: no report and no pixels.
@@ -88,12 +88,7 @@ while True:
         assert visible
         size = round(scale)
         pixels = bytes([revision, 0, 0, 255]) * size * size
-        header = json.dumps({'format':'bgra8','width':size,'height':size,'stride':size*4,'len':len(pixels)}).encode()
-        body = b'\x01' + struct.pack('<I',len(header)) + header + pixels
-        # Deliberately repeat pixels, too: Rust must not republish a bad
-        # renderer's duplicates even when its capture report says unchanged.
-        wire.write(struct.pack('<I',len(body)) + body)
-        ack(cmd, capture={'published':fresh,'snapshot_ns':1000,'publish_ns':100 if fresh else 0})
+        ack(cmd, capture={'published':fresh,'snapshot_ns':1000,'publish_ns':100 if fresh else 0}, pixels=pixels)
         fresh = False
     elif cmd['type'] == 'presentation':
         scale, visible, fresh = cmd['scale'], cmd['visible'], True
@@ -147,7 +142,7 @@ while True:
     wait(|| {
         let captures: Vec<_> = events(&log)
             .into_iter()
-            .filter(|v| v["type"] == "capture")
+            .filter(|v| v["type"] == "draw")
             .collect();
         captures
             .windows(2)
@@ -176,7 +171,7 @@ while True:
         let Some(index) = log.iter().position(|v| v["type"] == "reload") else {
             return false;
         };
-        let Some(next) = log[index + 1..].iter().find(|v| v["type"] == "capture") else {
+        let Some(next) = log[index + 1..].iter().find(|v| v["type"] == "draw") else {
             return false;
         };
         assert!(
@@ -193,7 +188,7 @@ while True:
         let Some(index) = log.iter().position(|v| v["type"] == "page-change") else {
             return false;
         };
-        let Some(next) = log[index + 1..].iter().find(|v| v["type"] == "capture") else {
+        let Some(next) = log[index + 1..].iter().find(|v| v["type"] == "draw") else {
             return false;
         };
         assert!(next["time"].as_f64().unwrap() - log[index]["time"].as_f64().unwrap() < 0.2);
@@ -206,7 +201,7 @@ while True:
         };
         let captures: Vec<_> = log[index + 1..]
             .iter()
-            .filter(|v| v["type"] == "capture")
+            .filter(|v| v["type"] == "draw")
             .take(3)
             .collect();
         if captures.len() < 3 {
@@ -272,7 +267,7 @@ while True:
         .unwrap();
     let capture = log[index + 1..]
         .iter()
-        .find(|v| v["type"] == "capture")
+        .find(|v| v["type"] == "draw")
         .unwrap();
     assert!(capture["time"].as_f64().unwrap() - log[index]["time"].as_f64().unwrap() < 0.2);
     assert_eq!(input.welcome().config.geometry.width, 1.);

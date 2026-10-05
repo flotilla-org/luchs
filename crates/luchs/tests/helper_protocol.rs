@@ -26,40 +26,37 @@ fn python(script: &str) -> Helper {
 }
 
 #[test]
-fn fake_helper_streams_split_records_binary_pixels_and_resizes() {
-    // Exercise descriptor numbers above dash's redirection range deterministically.
+fn fake_helper_streams_split_and_coalesced_control_records() {
     let _occupied: Vec<_> = (0..16)
         .map(|_| std::fs::File::open("/dev/null").unwrap())
         .collect();
-    let first = common::frame(1, &[0, 10, 255, 1]);
-    let second = common::frame(2, b"12345678");
-    let mut helper = fake(&format!(
-        "{}; {}; {}",
-        common::socket_write(&first[..2]),
-        common::socket_write(&first[2..]),
-        common::socket_write(&second)
-    ));
-    let first = helper.receive(TIMEOUT).unwrap().unwrap();
-    assert_eq!(first.pixels, [0, 10, 255, 1]);
-    let second = helper.receive(TIMEOUT).unwrap().unwrap();
-    assert_eq!(second.header.width, 2);
-    assert_eq!(second.pixels, b"12345678");
-    assert!(matches!(
-        helper.receive(TIMEOUT),
-        Err(RecvTimeoutError::Disconnected)
-    ));
+    let bytes = common::control(3, json!({"revision":7}));
+    let (send, receive) = mpsc::channel();
+    let script = format!(
+        "{}; {}",
+        common::socket_write(&bytes[..2]),
+        common::socket_write(&bytes[2..])
+    );
+    let mut helper = Helper::spawn_with_state(
+        Command::new("/bin/sh").args(["-c", &script]),
+        move |state| {
+            send.send(state).unwrap();
+        },
+    )
+    .unwrap();
+    assert_eq!(receive.recv_timeout(TIMEOUT).unwrap()["revision"], 7);
     helper.finish().unwrap();
 }
 
 #[test]
-fn per_id_acks_can_arrive_out_of_order_after_frames() {
+fn per_id_acks_can_arrive_out_of_order_after_state() {
     let mut helper = python(
         r#"
 a = command()
 b = command()
 assert a['type'] == 'reload' and b['type'] == 'ping'
-# Fill the frame mailbox. It must never block control dispatch.
-for _ in range(10): frame()
+# State must never block control dispatch.
+for _ in range(10): control(3, {"revision":7})
 ack(b, 'unsupported')
 control(3, {'url': 'test'})
 ack(a)
@@ -70,8 +67,6 @@ ack(a)
     assert_ne!(a.id(), b.id());
     assert_eq!(a.wait(), CommandOutcome::Executed);
     assert_eq!(b.wait(), CommandOutcome::Unsupported);
-    assert_eq!(helper.dropped_frames(), 8);
-    assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"rgba");
     helper.finish().unwrap();
 }
 
@@ -175,8 +170,7 @@ fn state_event_is_delivered_to_callback() {
 
 #[test]
 fn invalid_records_are_rejected_before_reading_payloads() {
-    let header = json!({"format":"bgra8", "width":1, "height":1, "stride":4, "len":4});
-    let mut cases = vec![
+    let cases = vec![
         vec![0, 0, 0, 0],
         vec![1],
         common::envelope(&[99]),
@@ -186,21 +180,6 @@ fn invalid_records_are_rejected_before_reading_payloads() {
         common::control(3, json!([])),
         common::envelope(&[2, b'{']),
     ];
-    for key in ["format", "width", "height", "stride", "len"] {
-        let mut invalid = header.clone();
-        invalid[key] = match key {
-            "format" => json!("rgba8"),
-            "width" | "height" => json!(0),
-            "stride" => json!(3),
-            _ => json!(5),
-        };
-        let json = serde_json::to_vec(&invalid).unwrap();
-        let mut body = vec![1];
-        body.extend_from_slice(&(json.len() as u32).to_le_bytes());
-        body.extend_from_slice(&json);
-        body.extend_from_slice(b"rgba");
-        cases.push(common::envelope(&body));
-    }
     for bytes in cases {
         assert!(
             read_record(&mut bytes.as_slice()).is_err(),
@@ -215,7 +194,7 @@ fn invalid_records_are_rejected_before_reading_payloads() {
 }
 
 #[test]
-fn oversized_record_control_and_frame_header_are_rejected() {
+fn oversized_records_and_retired_pixel_tag_are_rejected() {
     for (len, tag) in [
         (u32::MAX, 1),
         ((protocol::MAX_CONTROL_BYTES + 1) as u32, 2),
@@ -228,24 +207,7 @@ fn oversized_record_control_and_frame_header_are_rejected() {
             io::ErrorKind::InvalidData
         );
     }
-    let mut bytes = (5000u32).to_le_bytes().to_vec();
-    bytes.push(1);
-    bytes.extend_from_slice(&(4097u32).to_le_bytes());
-    assert_eq!(
-        read_record(&mut bytes.as_slice()).unwrap_err().kind(),
-        io::ErrorKind::InvalidData
-    );
-    let header = serde_json::to_vec(&json!({
-        "format":"bgra8", "width":1, "height":1,
-        "stride":protocol::MAX_FRAME_BYTES + 1, "len":protocol::MAX_FRAME_BYTES + 1,
-    }))
-    .unwrap();
-    let mut bytes = ((5 + header.len() + protocol::MAX_FRAME_BYTES + 1) as u32)
-        .to_le_bytes()
-        .to_vec();
-    bytes.push(1);
-    bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&header);
+    let bytes = common::frame(1, b"rgba");
     assert_eq!(
         read_record(&mut bytes.as_slice()).unwrap_err().kind(),
         io::ErrorKind::InvalidData
@@ -337,7 +299,7 @@ fn helper_exit_disconnects_pending_acks_as_uncertain() {
 
 #[test]
 fn pending_slots_and_blocked_command_writes_are_bounded() {
-    let mut helper = python("for _ in range(64): command()\nframe()\ntime.sleep(60)\n");
+    let mut helper = python("for _ in range(64): command()\ncontrol(3, {})\ntime.sleep(60)\n");
     let pending: Vec<_> = (0..MAX_PENDING_COMMANDS)
         .map(|_| helper.send_command("ping", TIMEOUT).unwrap())
         .collect();
@@ -347,7 +309,7 @@ fn pending_slots_and_blocked_command_writes_are_bounded() {
     );
     drop(pending);
     // Confirm the helper has consumed all small commands and stopped reading.
-    helper.receive(TIMEOUT).unwrap().unwrap();
+    let _ = helper.receive_event(TIMEOUT);
     let start = Instant::now();
     for _ in 0..16 {
         match helper.send_command(&"x".repeat(120 * 1024), Duration::from_millis(100)) {
@@ -366,9 +328,8 @@ fn pending_slots_and_blocked_command_writes_are_bounded() {
 }
 
 #[test]
-fn socket_eof_disconnects_commands_without_losing_the_final_frame() {
-    let mut helper = python("frame()\nwire.close()\ntransport.close()\ntime.sleep(0.1)\n");
-    helper.receive(TIMEOUT).unwrap().unwrap();
+fn socket_eof_disconnects_commands() {
+    let mut helper = python("wire.close()\ntransport.close()\ntime.sleep(0.1)\n");
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Uncertain);
     assert!(matches!(
@@ -378,36 +339,10 @@ fn socket_eof_disconnects_commands_without_losing_the_final_frame() {
 }
 
 #[test]
-fn frame_decode_reuses_returned_pixel_storage() {
-    let bytes = common::frame(2, b"12345678");
-    let buffer = Vec::with_capacity(8);
-    let pointer = buffer.as_ptr();
-    let mut pool = vec![buffer];
-    let Record::Frame(frame) = protocol::read_record_reusing(&mut bytes.as_slice(), &mut pool)
-        .unwrap()
-        .unwrap()
-    else {
-        panic!()
-    };
-    assert_eq!(frame.pixels.as_ptr(), pointer);
-    assert_eq!(frame.pixels, b"12345678");
-    pool.push(frame.pixels);
-    let Record::Frame(frame) = protocol::read_record_reusing(&mut bytes.as_slice(), &mut pool)
-        .unwrap()
-        .unwrap()
-    else {
-        panic!()
-    };
-    assert_eq!(frame.pixels.as_ptr(), pointer);
-}
-
-#[test]
 fn stdout_is_unused_and_cannot_corrupt_socket_framing() {
-    let helper = fake(&format!(
-        "printf 'not a protocol record'; {}",
-        common::socket_write(&common::frame(1, b"bgra"))
-    ));
-    assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"bgra");
+    let mut helper = python("print('not a protocol record')\nack(command())\n");
+    assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Executed);
+    helper.finish().unwrap();
 }
 
 #[test]
@@ -494,12 +429,10 @@ fn child_closed_stdio() {
         r#"
 assert transport.fileno() > 2
 cmd = raw_command()
-frame()
 ack(cmd)
 "#,
     );
     let pending = helper.send_command("ping", TIMEOUT).unwrap();
-    assert_eq!(helper.receive(TIMEOUT).unwrap().unwrap().pixels, b"rgba");
     assert_eq!(pending.wait(), CommandOutcome::Executed);
     helper.finish().unwrap();
     std::process::exit(0);
@@ -511,7 +444,7 @@ fn cloned_command_ports_share_ids_without_holding_writer_while_waiting() {
         r#"
 commands=[command() for _ in range(8)]
 assert len({c['id'] for c in commands})==8
-for _ in range(4): frame()
+for _ in range(4): control(3, {})
 for c in reversed(commands): ack(c)
 "#,
     );

@@ -571,3 +571,87 @@ combined click/text/title/scroll/navigation test. The locked workspace build,
 Swift helper build, and native recovery/URL policy tests passed. The desktop
 focus test is separate from the headless policy suite because it requires a
 logged-in macOS session.
+
+## Direct arena snapshots (2026-10-05, issue #13)
+
+Validated in the logged-in macOS 26.6 (25G72), arm64 desktop with Rust 1.98.0
+and Apple Swift 6.4. Jackstay remains pinned to
+`e5ad1a61e7317e0c6287216330b6104c5d415e96`; no Jackstay change was needed.
+The implementation is the commit adding this section, based on Luchs
+`5e45a1f7884b05ce11f4062508008a342cb71056`.
+
+The helper receives only the writable payload object with `SCM_RIGHTS`. Rust
+reserves a slot, the helper draws the native WebKit representation into its
+BGRA mapping, and an acknowledgement permits Rust to commit that slot.
+Retired frame tag 1 now fails the protocol. There is no socket pixel fallback.
+
+The explicit full-frame destination writes per snapshot fall from three in the
+frame-path slice to one: previously the CGContext draw, the Rust socket receive
+buffer fill and the toolkit's arena copy; now only the CGContext draw into the
+slot. This count excludes framework-internal WebKit work and kernel transport
+copies, and does not count hashing reads. `copies_per_frame=1` in stats records
+that path invariant, rather than a hardware performance-counter measurement.
+
+### Timing
+
+Release Rust binaries and `swiftc -O` helpers ran at `--fps=30` with no consumer.
+The static fixture used a dark background and one heading, matching the workload
+described in the frame-path timing section above. Each static run lasted ten
+seconds before SIGTERM. The animated fixture changed the heading in each rAF;
+`--frames=90` stopped after 90 committed changed frames. The 1600x1200 output is
+the same pixel count as the earlier Retina measurement.
+
+| Path and workload | Pixels | Snapshots | Published | Skipped | Copies | Mean snapshot ms | Mean publish ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Frame-path slice, historical static run | 800x600 | 33 | 1 | 32 | 3 | 2.422 | 27.461 |
+| Direct arena, static ten seconds | 800x600 | 27 | 1 | 26 | 1 | 1.018 | 2.240 |
+| Frame-path slice, historical static run | 1600x1200 | 34 | 1 | 33 | 3 | 3.311 | 39.205 |
+| Direct arena, static ten seconds | 1600x1200 | 26 | 1 | 25 | 1 | 3.569 | 6.748 |
+| Direct arena, animated 90 publications | 1600x1200 | 90 | 90 | 0 | 1 | 2.587 | 5.213 |
+
+The two static publish means each contain a single cold publication and come
+from separate runs. They do not establish a steady-state speedup. The new
+animated row measures repeated changed publications; there is no matching
+historical animated row. Publish time now covers drawing and hashing through
+completion of the slot write. The earlier path also included draining all pixels
+to the socket. The small JSON acknowledgement and Rust commit are outside the
+helper's timing window.
+
+Reproduce the fixtures and commands with:
+
+```sh
+cargo build --release --locked
+scripts/build-helper.sh target/release
+measurement=$(mktemp -d)
+cat > "$measurement/static.html" <<'HTML'
+<!doctype html><style>body{margin:0;background:#18212b;color:white}</style><h1>Frame path measurement</h1>
+HTML
+cat > "$measurement/animated.html" <<'HTML'
+<!doctype html><style>body{margin:0;background:#18212b;color:white}</style><h1 id="heading">Frame path measurement</h1><script>let n=0;function tick(){heading.textContent="Frame path measurement "+(++n);requestAnimationFrame(tick)}requestAnimationFrame(tick)</script>
+HTML
+# Run each size separately, then send SIGTERM after ten seconds.
+target/release/luchs --size=800x600 --fps=30 --stats "$measurement/static.html"
+target/release/luchs --size=1600x1200 --fps=30 --stats "$measurement/static.html"
+target/release/luchs --size=1600x1200 --fps=30 --stats --frames=90 "$measurement/animated.html"
+```
+
+All runs exited successfully. Flotilla retains the raw stderr stats as an artifact.
+
+### Validation
+
+The 60 ordinary Rust tests passed, as did workspace build, Clippy with warnings
+denied and Rust 1.98 formatting. Fake helpers map the actual exported fd and
+write known binary patterns; real consumers observe byte-exact frames across
+resize while an old lease stays valid. Unchanged, hidden, timeout, helper death
+(including death after ack), invalid ID/slot/generation/header and capacity-paused
+resize cases verify abandonment or retry. Resize unmaps the helper's old writer
+before requesting the replacement, keeping it from pinning a paused allocation.
+
+The production Swift helper compiled and its native recovery/URL tests passed.
+All nine ignored live macOS tests passed sequentially: native ping/reload/watch,
+socket EOF, hidden/unchanged draws and scale, odd fractional pixel dimensions,
+slow-load command service, native input/cleanup, page affordances, and combined
+input with affordances, plus the native trusted-hover regression from PR #20.
+The separate desktop-focus test passed after the rebase. The live CLI consumers acquired red and blue pixels
+through bootstrap v2. SIGTERM completes an active draw before ordered native input
+cleanup and removes the endpoint.

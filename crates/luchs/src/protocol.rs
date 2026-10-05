@@ -6,18 +6,16 @@ use serde_json::{Map, Value};
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_CONTROL_BYTES: usize = 128 * 1024;
-pub const MAX_HEADER_BYTES: usize = 4096;
-pub const FRAME_TAG: u8 = 1;
 pub const ACK_TAG: u8 = 2;
 pub const STATE_TAG: u8 = 3;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Format {
     #[serde(rename = "bgra8")]
     Bgra8,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Header {
     pub format: Format,
     pub width: u32,
@@ -46,6 +44,9 @@ pub struct Ack {
     pub outcome: AckOutcome,
     pub detail: Option<String>,
     pub capture: Option<CaptureReport>,
+    pub generation: Option<u64>,
+    pub slot: Option<u32>,
+    pub frame: Option<Header>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,7 +58,6 @@ pub struct CaptureReport {
 
 #[derive(Debug)]
 pub enum Record {
-    Frame(Frame),
     Ack(Ack),
     State(Map<String, Value>),
 }
@@ -74,22 +74,8 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn read_u32(reader: &mut impl Read) -> io::Result<usize> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes) as usize)
-}
-
-/// Validate sizes before allocating or reading their payloads. EOF is clean
-/// only between records, never inside an envelope, header or pixel buffer.
+/// Only acknowledgements and state travel over the socket. Tag 1 is retired.
 pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
-    read_record_reusing(reader, &mut Vec::new())
-}
-
-pub fn read_record_reusing(
-    reader: &mut impl Read,
-    buffers: &mut Vec<Vec<u8>>,
-) -> io::Result<Option<Record>> {
     let mut first = [0];
     loop {
         match reader.read(&mut first) {
@@ -105,41 +91,12 @@ pub fn read_record_reusing(
     let mut rest = [0; 3];
     reader.read_exact(&mut rest)?;
     let len = u32::from_le_bytes([first[0], rest[0], rest[1], rest[2]]) as usize;
-    if len == 0 || len > 1 + 4 + MAX_HEADER_BYTES + MAX_FRAME_BYTES {
+    if len == 0 || len > MAX_CONTROL_BYTES {
         return Err(invalid("invalid helper record length"));
     }
     let mut tag = [0];
     reader.read_exact(&mut tag)?;
     match tag[0] {
-        FRAME_TAG => {
-            if len < 5 {
-                return Err(invalid("short frame record"));
-            }
-            let header_len = read_u32(reader)?;
-            if header_len == 0 || header_len > MAX_HEADER_BYTES || header_len > len - 5 {
-                return Err(invalid("invalid frame header length"));
-            }
-            let mut json = [0; MAX_HEADER_BYTES];
-            reader.read_exact(&mut json[..header_len])?;
-            let header: Header = serde_json::from_slice(&json[..header_len])?;
-            let row_bytes = u64::from(header.width) * 4;
-            let pixel_len = u64::from(header.stride) * u64::from(header.height);
-            if header.width == 0
-                || header.height == 0
-                || u64::from(header.stride) < row_bytes
-                || pixel_len != header.len as u64
-                || header.len > MAX_FRAME_BYTES
-                || header.len != len - 5 - header_len
-            {
-                return Err(invalid(
-                    "invalid BGRA frame dimensions, stride, format, or length",
-                ));
-            }
-            let mut pixels = buffers.pop().unwrap_or_default();
-            pixels.resize(header.len, 0);
-            reader.read_exact(&mut pixels)?;
-            Ok(Some(Record::Frame(Frame { header, pixels })))
-        }
         ACK_TAG | STATE_TAG => {
             if len > MAX_CONTROL_BYTES {
                 return Err(invalid("oversized control record"));

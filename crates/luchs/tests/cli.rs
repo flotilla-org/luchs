@@ -92,6 +92,13 @@ while True:
     BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut endpoint)
         .unwrap();
+    if endpoint.trim().is_empty() {
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "CLI exited during setup: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     while !pid.exists() || !log.exists() {
         assert!(Instant::now() < deadline);
@@ -178,20 +185,13 @@ while True:
     assert_eq!(unsafe { libc::kill(helper_pid, 0) }, -1);
 }
 
-// Immediate helper EOF must flush its final frame and stop without any consumer.
+// Helper EOF before a completed draw must stop without publishing or waiting for a consumer.
 #[test]
-fn immediate_helper_eof_without_consumer_stops_successfully() {
+fn immediate_helper_eof_without_consumer_never_publishes() {
     let dir = tempfile::tempdir().unwrap();
     let helper = dir.path().join("helper");
     // Fake only the renderer subprocess boundary.
-    std::fs::write(
-        &helper,
-        format!(
-            "#!/bin/sh\n{}\n",
-            common::socket_write(&common::frame(1, b"rgba"))
-        ),
-    )
-    .unwrap();
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_luchs"))
         .arg("--helper")
@@ -220,8 +220,8 @@ fn immediate_helper_eof_without_consumer_stops_successfully() {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    assert!(status.success(), "{stderr}");
-    assert!(stderr.contains("stopped after 1 frames"));
+    assert!(!status.success(), "{stderr}");
+    assert!(!stderr.contains("stopped after 1 frames"));
     let mut endpoint = String::new();
     child
         .stdout
@@ -235,7 +235,7 @@ fn immediate_helper_eof_without_consumer_stops_successfully() {
 // A malformed helper frame must fail the CLI, remove its endpoint via Drop,
 // and reap a helper still blocked on stdin; explicit Source::stop is bypassed.
 #[test]
-fn invalid_helper_frame_drops_source_and_reaps_helper() {
+fn invalid_helper_record_drops_source_and_reaps_helper() {
     let dir = tempfile::tempdir().unwrap();
     let helper = dir.path().join("helper");
     let pid = dir.path().join("helper-pid");
@@ -290,7 +290,7 @@ exec sleep 60
         .unwrap()
         .read_to_string(&mut endpoint)
         .unwrap();
-    assert!(!endpoint.trim().is_empty());
+
     assert!(
         !std::path::Path::new(endpoint.trim()).exists(),
         "endpoint leaked: {}",
@@ -452,7 +452,7 @@ fn exhausted_snapshot_retry_diagnostic_reaches_cli() {
             common::PYTHON_PROTOCOL,
             r#"
 cmd = raw_command()
-assert cmd['type'] == 'capture'
+assert cmd['type'] == 'draw'
 ack(cmd, 'failed', detail='snapshot failed after 3 consecutive attempts: unexpected pixel size')
 "#
         ),
@@ -496,6 +496,13 @@ fn helper_crash_during_input_preserves_renderer_error_and_removes_endpoint() {
     BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut endpoint)
         .unwrap();
+    if endpoint.trim().is_empty() {
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "CLI exited during setup: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let connected = jackstay::bootstrap::connect_v2(
         jackstay::local::Stream::connect(endpoint.trim()).unwrap(),
         jackstay::bootstrap::InputRequest::Required(jackstay::input::Mode::Physical),
