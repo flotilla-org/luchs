@@ -1,14 +1,14 @@
 mod common;
 
 use luchs::{
-    helper::{CommandOutcome, Helper, MAX_PENDING_COMMANDS},
+    helper::{CommandOutcome, Helper, HelperEvent, MAX_PENDING_COMMANDS},
     protocol::{self, Record, read_record},
 };
 use serde_json::json;
 use std::{
     io,
     process::Command,
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -237,7 +237,7 @@ fn malformed_record_stops_and_reaps_without_waiting_for_drop() {
         common::socket_write(&common::envelope(&[99]))
     ));
     assert_eq!(
-        helper.receive(TIMEOUT).unwrap().unwrap_err().kind(),
+        helper.receive_event(TIMEOUT).unwrap_err().kind(),
         io::ErrorKind::InvalidData
     );
     assert_reaped(&pid_path);
@@ -256,7 +256,7 @@ fn panicking_state_callback_fails_and_reaps_helper() {
         panic!("test callback")
     })
     .unwrap();
-    let error = helper.receive(TIMEOUT).unwrap().unwrap_err();
+    let error = helper.receive_event(TIMEOUT).unwrap_err();
     assert!(error.to_string().contains("state callback panicked"));
     assert_reaped(&pid_path);
     drop(helper);
@@ -317,7 +317,7 @@ fn pending_slots_and_blocked_command_writes_are_bounded() {
             Err(error) => {
                 assert_eq!(error.kind(), io::ErrorKind::TimedOut);
                 assert!(start.elapsed() < Duration::from_secs(2));
-                let error = helper.receive(TIMEOUT).unwrap().unwrap_err();
+                let error = helper.receive_event(TIMEOUT).unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::TimedOut);
                 assert!(error.to_string().contains("command write timed out"));
                 return;
@@ -333,8 +333,8 @@ fn socket_eof_disconnects_commands() {
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Uncertain);
     assert!(matches!(
-        helper.receive(TIMEOUT),
-        Err(RecvTimeoutError::Disconnected)
+        helper.receive_event(TIMEOUT),
+        Ok(HelperEvent::Closed)
     ));
 }
 
@@ -359,7 +359,7 @@ raw_command()
     let start = Instant::now();
     assert!(matches!(
         helper.receive_event(Duration::from_millis(500)),
-        Err(RecvTimeoutError::Timeout)
+        Ok(HelperEvent::Timeout)
     ));
     assert!(
         start.elapsed() >= Duration::from_millis(450),
@@ -373,7 +373,7 @@ raw_command()
     let start = Instant::now();
     assert!(matches!(
         helper.receive_event(TIMEOUT),
-        Err(RecvTimeoutError::Timeout)
+        Ok(HelperEvent::Wake)
     ));
     assert!(
         start.elapsed() < Duration::from_millis(200),
@@ -384,7 +384,7 @@ raw_command()
     let start = Instant::now();
     assert!(matches!(
         helper.receive_event(TIMEOUT),
-        Err(RecvTimeoutError::Timeout)
+        Ok(HelperEvent::Wake)
     ));
     assert_eq!(pending.wait(), CommandOutcome::Executed);
     assert!(
@@ -394,7 +394,7 @@ raw_command()
     let start = Instant::now();
     assert!(matches!(
         helper.receive_event(TIMEOUT),
-        Err(RecvTimeoutError::Timeout)
+        Ok(HelperEvent::Wake)
     ));
     assert!(
         start.elapsed() < Duration::from_millis(300),

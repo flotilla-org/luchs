@@ -86,7 +86,7 @@ while True:
     source.setup_writer(&helper).unwrap();
     let (mut setup, mut consumer) = connect(&path);
     let draw = source.draw(&helper, 1, 1, TIMEOUT).unwrap().unwrap();
-    let generation = draw.reservation.as_ref().unwrap().slot().generation;
+    let generation = draw.reservation.slot().generation;
     let ack = reply(&draw);
     source.complete_draw(&helper, draw, ack).unwrap();
     let AcquireOutcome::Frame(old) = consumer.acquire_latest(0).unwrap() else {
@@ -94,7 +94,7 @@ while True:
     };
     assert_eq!(old.bytes(), [0, 10, 255, 1]);
     let draw = source.draw(&helper, 3, 2, TIMEOUT).unwrap().unwrap();
-    assert!(draw.reservation.as_ref().unwrap().slot().generation > generation);
+    assert!(draw.reservation.slot().generation > generation);
     let ack = reply(&draw);
     source.complete_draw(&helper, draw, ack).unwrap();
     assert!(matches!(
@@ -220,6 +220,7 @@ fn helper_death_and_death_after_ack_never_commit() {
             AcquireOutcome::Empty
         ));
         drop((setup, consumer));
+        source.stop().unwrap();
     }
 }
 
@@ -274,7 +275,7 @@ fn paused_resize_releases_writer_and_retries_pending_configuration() {
 fn hiding_before_draw_completion_abandons_changed_pixels() {
     let (mut source, path) = source();
     let helper = helper(
-        "cmd=raw_command()\nack(cmd, capture={'published':True,'snapshot_ns':10,'publish_ns':10})\ntime.sleep(60)\n",
+        "while True:\n    cmd=raw_command()\n    ack(cmd, capture={'published':True,'snapshot_ns':10,'publish_ns':10})\n",
     );
     let (setup, consumer) = connect(&path);
     let draw = source.draw(&helper, 1, 1, TIMEOUT).unwrap().unwrap();
@@ -291,4 +292,27 @@ fn hiding_before_draw_completion_abandons_changed_pixels() {
     ));
     drop((setup, consumer));
     source.stop().unwrap();
+}
+
+#[test]
+fn stopping_with_live_writer_unmaps_it_and_keeps_helper_available_for_cleanup() {
+    let (mut source, _) = source();
+    let mut helper = helper(
+        r#"
+while True:
+    cmd=raw_command()
+    if cmd['type'] == 'draw': ack(cmd, capture={'published':True,'snapshot_ns':10,'publish_ns':10})
+    else:
+        assert cmd['type'] in ['cleanup', 'ping']
+        assert allocation is None
+        ack(cmd)
+"#,
+    );
+    source.attach_input(&helper);
+    let draw = source.draw(&helper, 1, 1, TIMEOUT).unwrap().unwrap();
+    let ack = reply(&draw);
+    source.complete_draw(&helper, draw, ack).unwrap();
+    source.stop().unwrap();
+    assert_eq!(helper.command("cleanup", TIMEOUT), CommandOutcome::Executed);
+    assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Executed);
 }

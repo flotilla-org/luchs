@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -121,6 +121,13 @@ impl Drop for PendingCommand {
     fn drop(&mut self) {
         self.shared.state.lock().unwrap().pending.remove(&self.id);
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HelperEvent {
+    Wake,
+    Timeout,
+    Closed,
 }
 
 /// Owns the process and a socket demultiplexer for acknowledgements and state.
@@ -249,36 +256,23 @@ impl Helper {
         Wake(self.shared.clone())
     }
 
-    pub fn receive(&self, timeout: Duration) -> Result<io::Result<()>, RecvTimeoutError> {
-        self.receive_inner(timeout, false)
-    }
-
-    /// Return Timeout early for an ack, state or host notification, so the
-    /// scheduler can re-evaluate deadlines without polling between captures.
-    pub fn receive_event(&self, timeout: Duration) -> Result<io::Result<()>, RecvTimeoutError> {
-        self.receive_inner(timeout, true)
-    }
-
-    fn receive_inner(
-        &self,
-        timeout: Duration,
-        events: bool,
-    ) -> Result<io::Result<()>, RecvTimeoutError> {
+    /// Wait for an ack, state, host wake, deadline or stream closure.
+    pub fn receive_event(&self, timeout: Duration) -> io::Result<HelperEvent> {
         let deadline = Instant::now() + timeout;
         let mut state = self.shared.state.lock().unwrap();
         loop {
             if let Some(error) = state.error.take() {
-                return Ok(Err(error));
+                return Err(error);
             }
             if state.ended {
-                return Err(RecvTimeoutError::Disconnected);
+                return Ok(HelperEvent::Closed);
             }
-            if events && std::mem::take(&mut state.wake_pending) {
-                return Err(RecvTimeoutError::Timeout);
+            if std::mem::take(&mut state.wake_pending) {
+                return Ok(HelperEvent::Wake);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(RecvTimeoutError::Timeout);
+                return Ok(HelperEvent::Timeout);
             }
             state = self.shared.ready.wait_timeout(state, left).unwrap().0;
         }
@@ -348,6 +342,10 @@ impl Helper {
 }
 
 impl CommandSender {
+    pub(crate) fn ended(&self) -> bool {
+        self.shared.state.lock().unwrap().ended
+    }
+
     pub fn terminate(&self) {
         end_stream(
             &self.shared,

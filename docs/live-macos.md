@@ -609,6 +609,10 @@ the same pixel count as the earlier Retina measurement.
 | Direct arena, static ten seconds | 1600x1200 | 26 | 1 | 25 | 1 | 3.569 | 6.748 |
 | Direct arena, animated 90 publications | 1600x1200 | 90 | 90 | 0 | 1 | 2.587 | 5.213 |
 
+The timing samples were collected at `5a31d9bac32a6faf2b6f5acdbfb969c399ad3862`,
+before the review follow-ups below. Those changes add no pixel copy and retain
+the same helper timing boundary.
+
 The two static publish means each contain a single cold publication and come
 from separate runs. They do not establish a steady-state speedup. The new
 animated row measures repeated changed publications; there is no matching
@@ -639,7 +643,7 @@ All runs exited successfully. Flotilla retains the raw stderr stats as an artifa
 
 ### Validation
 
-The 60 ordinary Rust tests passed, as did workspace build, Clippy with warnings
+The 61 ordinary Rust tests passed, as did workspace build, Clippy with warnings
 denied and Rust 1.98 formatting. Fake helpers map the actual exported fd and
 write known binary patterns; real consumers observe byte-exact frames across
 resize while an old lease stays valid. Unchanged, hidden, timeout, helper death
@@ -655,3 +659,10 @@ input with affordances, plus the native trusted-hover regression from PR #20.
 The separate desktop-focus test passed after the rebase. The live CLI consumers acquired red and blue pixels
 through bootstrap v2. SIGTERM completes an active draw before ordered native input
 cleanup and removes the endpoint.
+
+Review follow-up adds an explicit unmap before toolkit shutdown, with a fake
+helper confirming cleanup and ping still execute afterward. The native hidden
+capture test now re-shows identical pixels at the same scale and allocation,
+verifying the existing helper fingerprint reset after an abandoned draw. Cached
+contexts reject dimension/stride changes. Rust event waits distinguish wake,
+timeout and closure; draw reservations remain guarded even if command send fails.

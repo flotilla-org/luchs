@@ -248,7 +248,7 @@ private struct WriterLayout: Decodable {
 private final class WriterMapping {
     let layout: WriterLayout
     let base: UnsafeMutableRawPointer
-    private var contexts: [UInt32: NSGraphicsContext] = [:]
+    private var contexts: [UInt32: (width: Int, height: Int, stride: Int, graphics: NSGraphicsContext)] = [:]
     private var colorSpace: CGColorSpace?
     init(_ layout: WriterLayout, fd: Int32) {
         defer { close(fd) }
@@ -273,7 +273,10 @@ private final class WriterMapping {
     func graphicsContext(_ command: HelperCommand, image: NSImage) -> NSGraphicsContext? {
         guard let pointer = slot(command), let index = command.slot,
               let width = command.width, let height = command.height, let stride = command.stride else { return nil }
-        if let context = contexts[index] { return context }
+        if let context = contexts[index] {
+            guard context.width == width, context.height == height, context.stride == stride else { return nil }
+            return context.graphics
+        }
         if colorSpace == nil { colorSpace = image.cgImage(forProposedRect: nil, context: nil, hints: nil)?.colorSpace }
         guard let space = colorSpace,
               let context = CGContext(data: pointer, width: width, height: height,
@@ -281,7 +284,7 @@ private final class WriterMapping {
                   bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue)
         else { return nil }
         let result = NSGraphicsContext(cgContext: context, flipped: false)
-        contexts[index] = result
+        contexts[index] = (width, height, stride, result)
         return result
     }
 

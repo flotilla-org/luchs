@@ -7,7 +7,7 @@ use crate::{
     helper::{CommandSender, Helper, PendingCommand},
     protocol::{Ack, AckOutcome, Header},
 };
-use jackstay::acquisition::arena::{CpuReservation, WriterExport};
+use jackstay::acquisition::arena::{CpuReservation, WriterExport, WriterSlot};
 
 pub(crate) struct Mapping {
     pub export: WriterExport,
@@ -46,6 +46,11 @@ impl Mapping {
     /// Unmap before resizing: keeping this export charged can otherwise prevent
     /// a capacity-paused replacement from ever obtaining its memory budget.
     pub fn release(mut self) -> Result<()> {
+        if self.sender.ended() {
+            self.sender.terminate(); // verified exit before export retirement
+            self.active = false;
+            return Ok(());
+        }
         let generation = self.export.descriptor().generation;
         let ack = self
             .sender
@@ -73,11 +78,30 @@ impl Drop for Mapping {
     }
 }
 
-pub struct Draw {
-    pub(crate) command: Option<PendingCommand>,
-    pub(crate) reservation: Option<CpuReservation>,
-    pub(crate) header: Header,
+pub(crate) struct Reservation {
+    slot: Option<CpuReservation>,
     sender: CommandSender,
+}
+impl Reservation {
+    pub fn slot(&self) -> WriterSlot {
+        self.slot.as_ref().unwrap().slot()
+    }
+    pub fn complete(&mut self) -> CpuReservation {
+        self.slot.take().unwrap()
+    }
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.slot.is_some() {
+            self.sender.terminate();
+        }
+    }
+}
+
+pub struct Draw {
+    pub(crate) command: PendingCommand,
+    pub(crate) reservation: Reservation,
+    pub(crate) header: Header,
 }
 impl Draw {
     pub(crate) fn start(
@@ -89,33 +113,35 @@ impl Draw {
         let sender = helper.command_sender();
         let slot = reservation.slot();
         // Arm before writing: a partial send is also a potentially live delegate.
-        let mut draw = Self {
-            command: None,
-            reservation: Some(reservation),
-            header,
+        let reservation = Reservation {
+            slot: Some(reservation),
             sender,
         };
-        draw.command = Some(draw.sender.send_json_command(
+        let command = reservation.sender.send_json_command(
             serde_json::json!({
                 "type":"draw", "slot":slot.slot, "generation":slot.generation,
-                "width":draw.header.width, "height":draw.header.height, "stride":draw.header.stride,
+                "width":header.width, "height":header.height, "stride":header.stride,
             }),
             timeout,
-        )?);
-        Ok(draw)
+        )?;
+        Ok(Self {
+            command,
+            reservation,
+            header,
+        })
     }
     pub fn remaining(&self) -> Duration {
-        self.command.as_ref().unwrap().remaining()
+        self.command.remaining()
     }
     pub fn poll(&self) -> Option<Ack> {
-        self.command.as_ref().unwrap().poll()
+        self.command.poll()
     }
     pub fn expired(&self) -> bool {
-        self.command.as_ref().unwrap().expired()
+        self.command.expired()
     }
     pub(crate) fn validate(&self, ack: &Ack) -> Result<()> {
-        let slot = self.reservation.as_ref().unwrap().slot();
-        if ack.id != self.command.as_ref().unwrap().id() {
+        let slot = self.reservation.slot();
+        if ack.id != self.command.id() {
             return Err("renderer draw id mismatch".into());
         }
         if ack.generation != Some(slot.generation) || ack.slot != Some(slot.slot) {
@@ -137,12 +163,5 @@ impl Draw {
             return Err("renderer draw frame without publication report".into());
         }
         Ok(())
-    }
-}
-impl Drop for Draw {
-    fn drop(&mut self) {
-        if self.reservation.is_some() {
-            self.sender.terminate();
-        }
     }
 }

@@ -229,7 +229,8 @@ Unmatched acks, including late acks and duplicate acks, are discarded. They
 cannot satisfy a different waiter or revise an outcome already returned. This
 keeps retired-ID bookkeeping bounded; helpers still owe exactly one ack for
 each command. `Helper::ignored_acks()` counts these discarded replies, and the
-CLI logs a nonzero count at shutdown. `execution_outcome()` maps `executed` to Jackstay `Executed`,
+CLI logs a nonzero count at shutdown. `receive_event` distinguishes wake, deadline
+and clean closure with `HelperEvent`; malformed records return an I/O error. `execution_outcome()` maps `executed` to Jackstay `Executed`,
 `unsupported` to `Unsupported`, `failed` to `Uncertain`, and timeout/disconnection
 to `Uncertain`. The CLI uses a one-second reload deadline. Unsupported reload
 is fatal because it means the helper cannot implement watch. Failed or uncertain
@@ -314,7 +315,8 @@ Skipped frames report zero publish time. Hidden/loading attempts have no report.
 the mean times and `copies_per_frame=1`. The copy count describes the explicit
 full-frame destination writes in this path; it excludes WebKit internals and
 hashing reads. Orderly shutdown allows up to one second to complete a pending
-draw before native input cleanup.
+draw, then acknowledges unmap while keeping the helper alive for native input
+cleanup. Helper termination follows toolkit shutdown.
 
 The helper compares an FNV-1a fingerprint of dimensions and native pixels with
 its last changed draw. A match acknowledges unchanged and writes no frame header.

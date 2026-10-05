@@ -341,14 +341,28 @@ fn native_skip_scale_and_hidden_capture() {
     assert_eq!(
         helper
             .send_json_command(
-                json!({"type":"presentation", "scale":2., "visible":false}),
+                json!({"type":"presentation", "scale":1., "visible":false}),
                 TIMEOUT
             )
             .unwrap()
             .wait(),
         CommandOutcome::Executed
     );
-    assert!(helper.capture((64, 64)).is_none());
+    assert!(helper.capture((32, 32)).is_none());
+    assert_eq!(
+        helper
+            .send_json_command(
+                json!({"type":"presentation", "scale":1., "visible":true}),
+                TIMEOUT
+            )
+            .unwrap()
+            .wait(),
+        CommandOutcome::Executed
+    );
+    // NativeCapture abandoned the first changed draw. Re-show must reset the
+    // helper fingerprint even though this mapping, scale and pixels are identical.
+    let frame = helper.capture((32, 32)).unwrap();
+    assert_eq!(&frame.pixels[..4], &[0, 0, 255, 255]);
     assert_eq!(
         helper
             .send_json_command(

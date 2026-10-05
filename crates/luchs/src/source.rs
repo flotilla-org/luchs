@@ -4,7 +4,7 @@ use crate::{
     affordances::{LoadPolicy, PageState},
     capture::CapturePolicy,
     cli::Cli,
-    helper::{CommandOutcome, Helper},
+    helper::{CommandOutcome, Helper, HelperEvent},
     protocol::Frame,
 };
 use jackstay::{
@@ -20,7 +20,6 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::RecvTimeoutError,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -310,7 +309,7 @@ impl Source {
             return Err("renderer died during draw".into());
         }
         draw.validate(&ack)?;
-        let reservation = draw.reservation.take().unwrap();
+        let reservation = draw.reservation.complete();
         if !visible {
             if let Some(report) = ack.capture.as_mut() {
                 report.published = false;
@@ -352,7 +351,12 @@ impl Source {
         self.presentation.lock().unwrap().take()
     }
 
-    pub fn stop(self) -> Result<()> {
+    pub fn stop(mut self) -> Result<()> {
+        // Unmap pixels without terminating the helper: native input cleanup still
+        // needs its command endpoint while the toolkit stops.
+        if let Some(mapping) = self.mapping.take() {
+            mapping.release()?;
+        }
         self.source.stop()?;
         Ok(())
     }
@@ -388,6 +392,8 @@ impl CaptureStats {
         }
     }
     fn log(&self, received: u64) {
+        // One explicit destination write is a path invariant, not a runtime
+        // hardware counter; kernel/WebKit internals and hashing reads are excluded.
         eprintln!(
             "luchs: stats snapshots={} published={received} skipped={} copies_per_frame=1 mean_snapshot_ms={:.3} mean_publish_ms={:.3}",
             self.snapshots,
@@ -447,11 +453,9 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             policy.wait(Instant::now()).min(watch_wait)
         };
         match helper.receive_event(timeout) {
-            Ok(result) => {
-                result?;
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
+            Ok(HelperEvent::Wake | HelperEvent::Timeout) => {}
+            Err(error) => return Err(error.into()),
+            Ok(HelperEvent::Closed) => {
                 source.page.helper_stopped();
                 helper.finish()?;
                 pending_capture.take();
@@ -590,7 +594,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             if helper.ended() || Instant::now() >= deadline {
                 return Err("renderer stopped or timed out during final draw".into());
             }
-            let _ = helper.receive_event(deadline.saturating_duration_since(Instant::now()));
+            helper.receive_event(deadline.saturating_duration_since(Instant::now()))?;
         }
     }
     eprintln!("luchs: stopped after {received} frames");
