@@ -8,6 +8,7 @@ repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 destination=${1:-"$repo/target/debug"}
 mkdir -p "$destination"
 swiftc -O -parse-as-library -framework AppKit -framework WebKit \
+    "$repo/native/macos/CaptureInputWindow.swift" \
     "$repo/native/macos/SnapshotRecovery.swift" \
     "$repo/native/macos/PageAffordances.swift" \
     "$repo/native/macos/LuchsWebviewCapture.swift" \

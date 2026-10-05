@@ -489,3 +489,85 @@ machine. The existing direct native motion path is retained; investigation is
 tracked in [#19](https://github.com/flotilla-org/luchs/issues/19). Native clicks do
 produce pointer-driven cursor state, and the original visible-window cursor
 checks remain recorded above. No experimental hover routing is included.
+
+## Native host hover diagnosis (2026-10-05)
+
+This section supersedes the unresolved hover finding and the "no experimental
+hover routing" statement in the combined-input section above. Those paragraphs
+record the earlier PR #18 validation.
+
+Issue #19 reproduced on macOS 26.6 (25G72), arm64. A new ignored test starts
+the production CLI and transparent helper, connects one v2 host with required
+SourceText input and required affordances, waits for `window.ready`, then sends
+Motion at logical (20,70) over a link at top=60. Its page listener only records
+native events; it never dispatches JavaScript events.
+
+```sh
+scripts/build-helper.sh
+cargo test --locked --test live_macos_affordances \
+  native_host_motion_delivers_trusted_dom_hover -- --ignored --nocapture
+```
+
+Before the fix, two runs failed in 3.51 and 3.40 seconds: the host received
+`Outcome::Executed`, but the console had no `mousemove 20,70 trusted=true`.
+Removing the input field and all other page behavior preserved the failure.
+Four hypotheses, ranked before probes, were responder routing, key/front-window
+hover gating, event coordinates/window identity, and window mouse-event flags.
+Temporary native instrumentation and helper variants stayed outside the checkout.
+
+| Isolated probe | Result |
+| --- | --- |
+| Original `WKWebView.mouseMoved(with:)` | No DOM motion; window key=false, main=false |
+| Use the original NSEvent without CGEvent round-trip | No DOM motion |
+| `ignoresMouseEvents=false`, with original routing | No DOM motion |
+| `NSWindow.sendEvent`, with original window status | No DOM motion |
+| Forward to the `.mouseMoved` tracking-area owner | No DOM motion with key=false |
+| Report local key status, with original routing | No DOM motion |
+| Report local main status, with tracking-owner routing | No DOM motion |
+| Report local key status, with tracking-owner routing | Trusted DOM motion and cursor `pointer` |
+
+`acceptsMouseMovedEvents` was already true. Before and after CGEvent conversion,
+the event's window number matched the capture window and its location was
+(20,410), the correct AppKit position for logical (20,70) in a 480-point view.
+The frontmost application stayed `work.flotilla.wheelhouse` during these probes.
+
+There are two necessary changes. WKWebView inherits the responder's mouseMoved
+implementation; WebKit receives native hover through an AppKit tracking-area
+owner. Its embedded page also needs local key status for hover delivery on this
+system. The routing diagnosis agrees with [WebKit bug 323489](https://bugs.webkit.org/show_bug.cgi?id=323489)
+and its [native regression tests](https://github.com/WebKit/WebKit/blob/cc84d838c54ffb5a424cbea22c15f3fe1ac09cf1/Tools/TestWebKitAPI/Tests/WebKit/WebPage/WebPageMouseEventsTests.swift).
+Those tests use a window subclass that reports key status.
+
+`CaptureInputWindow` reports `isKeyWindow=true` to WebKit while refusing eligibility
+for AppKit key/main status. The helper retains its prohibited activation policy
+and orders the transparent, mouse-ignoring window without calling `makeKey`,
+`makeMain`, or activation methods. This gives the page local focus (including
+`document.hasFocus()`), so page focus behavior differs from the old inactive page.
+It does not transfer desktop focus. The live window test asserts the distinction:
+
+```sh
+scripts/test-hover-window.sh
+# Capture input window: local key status, no AppKit key/main window or activation,
+# frontmost application preserved
+```
+
+Hover forwarding uses the owner exposed by the public AppKit tracking-area API
+and its `mouseMoved:` selector. It does not name WebKit private classes or call
+private WebKit selectors. If no capable owner exists, the helper returns
+`unsupported` instead of acknowledging the inherited no-op. This still depends
+on WebKit retaining a mouse-moved tracking area; the live regression detects
+changes in that behavior on future macOS versions.
+
+After the fix, the minimized test passes and records `mousemove 20,70 trusted=true
+hover=true`, proving both trusted DOM delivery and CSS `:hover`. It observes
+cursor `pointer`, moves off the link to `default`, clicks the input to `text`,
+then hovers the link again and verifies a second trusted event and `pointer`.
+Input cleanup and SIGTERM shutdown pass. A separate scratch monitor sampled the
+frontmost process every 5 ms throughout this production test; it stayed unchanged.
+
+All nine ignored live macOS tests passed sequentially, including the existing
+combined click/text/title/scroll/navigation test. The locked workspace build,
+54 ordinary Rust tests, Clippy with denied warnings, Rust 1.98 formatting,
+Swift helper build, and native recovery/URL policy tests passed. The desktop
+focus test is separate from the headless policy suite because it requires a
+logged-in macOS session.

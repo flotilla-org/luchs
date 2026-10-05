@@ -317,3 +317,133 @@ fn native_input_and_affordances_share_one_required_host() {
     }
     assert!(process.0.wait().unwrap().success());
 }
+
+#[test]
+#[ignore = "requires built Swift helper and live macOS desktop"]
+fn native_host_motion_delivers_trusted_dom_hover() {
+    use jackstay::input::{Action, Event as InputEvent, Mode, Outcome, Position, Status};
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("hover.html");
+    std::fs::write(&first, r##"<!doctype html><title>Hover probe</title>
+<style>html,body{margin:0}input{position:absolute;left:0;top:0;width:300px;height:40px}a{position:absolute;left:0;top:60px;width:200px;height:40px}</style>
+<input>
+<a href="#next">Hover target</a>
+<script>window.addEventListener('mousemove',e=>console.log('mousemove '+e.clientX+','+e.clientY+' trusted='+e.isTrusted+' hover='+document.querySelector('a').matches(':hover')))</script>"##).unwrap();
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_luchs"))
+            .arg("--size=640x480")
+            .arg(&first)
+            .env("LUCHS_CONSOLE_LOG", dir.path().join("console.log"))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut endpoint = String::new();
+    BufReader::new(process.0.stdout.take().unwrap())
+        .read_line(&mut endpoint)
+        .unwrap();
+    let connected = connect_v2(
+        Stream::connect(endpoint.trim()).unwrap(),
+        InputRequest::Required(Mode::SourceText),
+        ChannelRequest::Required,
+    )
+    .unwrap();
+    let host = connected.affordances.unwrap();
+    let input = connected.input.unwrap();
+    // SAFETY: the production source owns the arena; this test keeps grants private.
+    let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
+    let consumer = setup.attach(1).unwrap();
+    wait(&host, |s| matches!(s, Snapshot::Window(w) if w.ready));
+    let position = |x, y| Position {
+        revision: input.welcome().config.geometry.revision,
+        x,
+        y,
+    };
+    let send = |event| {
+        let sequence = input.send(event).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(Status::Completed {
+                sequence: completed,
+                outcome,
+            }) = input.poll()
+            {
+                assert_eq!(completed, sequence);
+                assert_eq!(outcome, Outcome::Executed);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native input acknowledgement timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let hover_line = "mousemove 20,70 trusted=true hover=true";
+    let wait_for_hover = |minimum| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let log = std::fs::read_to_string(dir.path().join("console.log")).unwrap_or_default();
+            if log.matches(hover_line).count() >= minimum {
+                return log;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Motion executed but missing trusted DOM hover at 20,70; console:\n{log}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    send(InputEvent::Motion(position(20., 70.)));
+    wait_for_hover(1);
+    wait(
+        &host,
+        |s| matches!(s, Snapshot::Cursor(shape) if shape == "pointer"),
+    );
+    send(InputEvent::Motion(position(20., 120.)));
+    wait(
+        &host,
+        |s| matches!(s, Snapshot::Cursor(shape) if shape == "default"),
+    );
+    send(InputEvent::Button {
+        button: 1,
+        action: Action::Down,
+        position: position(20., 20.),
+    });
+    send(InputEvent::Button {
+        button: 1,
+        action: Action::Up,
+        position: position(20., 20.),
+    });
+    wait(
+        &host,
+        |s| matches!(s, Snapshot::Cursor(shape) if shape == "text"),
+    );
+    let before = std::fs::read_to_string(dir.path().join("console.log"))
+        .unwrap()
+        .matches(hover_line)
+        .count();
+    send(InputEvent::Motion(position(20., 70.)));
+    wait(
+        &host,
+        |s| matches!(s, Snapshot::Cursor(shape) if shape == "pointer"),
+    );
+    let log = wait_for_hover(before + 1);
+    eprintln!("native hover console:\n{log}");
+    input.close();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(Status::Closed { clean, .. }) = input.poll() {
+            assert!(clean, "native input cleanup failed");
+            break;
+        }
+        assert!(Instant::now() < deadline, "native input cleanup timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop((input, host, consumer, setup));
+    // SAFETY: this signal targets the test's own child.
+    unsafe {
+        libc::kill(process.0.id() as i32, libc::SIGTERM);
+    }
+    assert!(process.0.wait().unwrap().success());
+}

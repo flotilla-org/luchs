@@ -383,7 +383,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         let container = NSView(frame: rect)
         container.addSubview(view)
 
-        let captureWindow = NSWindow(
+        let captureWindow = CaptureInputWindow(
             contentRect: rect,
             styleMask: [.borderless],
             backing: .buffered,
@@ -895,7 +895,16 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             case .leftMouseDragged: target.mouseDragged(with: event)
             case .rightMouseDragged: target.rightMouseDragged(with: event)
             case .otherMouseDragged: target.otherMouseDragged(with: event)
-            default: target.mouseMoved(with: event)
+            default:
+                // WKWebView inherits NSResponder's mouseMoved no-op. WebKit
+                // receives hover through its own AppKit tracking-area owner.
+                // WebKit currently exposes one primary mouse-moved area here.
+                // Select one owner to avoid duplicate DOM events; the live
+                // regression must be rerun if WebKit changes these areas.
+                let selector = #selector(NSResponder.mouseMoved(with:))
+                guard let owner = target.trackingAreas.first(where: { $0.options.contains(.mouseMoved) })?.owner as? NSObject,
+                    owner.responds(to: selector) else { return "unsupported" }
+                owner.perform(selector, with: event)
             }
             for button in heldButtons.keys { if let held = heldButtons[button] { heldButtons[button] = HeldButton(point: point, view: held.view, count: held.count) } }
         case "scroll":

@@ -128,7 +128,9 @@ both scroll axes. Window readiness latches after the first completed navigation
 and published frame for a helper lifetime. Later loads update navigation loading;
 helper replacement resets readiness. Titles, history and loading follow the active WebKit view,
 including popups. Cursor changes follow the last pointer position in the page;
-host pointer motion reaches WebKit through the native input executor.
+host pointer motion reaches WebKit through its native tracking-area owner.
+The embedded page has local input focus; the transparent helper cannot become
+AppKit's key/main window or activate on the desktop.
 
 Only `document.scrollingElement` is represented. Scroll positions and dimensions
 use CSS pixels; nested scrollers are excluded. Small steps are 40 pixels and
@@ -152,6 +154,10 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo +1.98.0 fmt --all --check
 ```
+
+On a logged-in macOS desktop, `scripts/test-hover-window.sh` checks desktop focus
+preservation. The ignored `native_host_motion_delivers_trusted_dom_hover` test
+checks trusted native motion, CSS hover, cursor transitions and clean teardown.
 
 CI runs these checks on macOS and Linux, plus helper compilation on macOS.
 Tests spawn fake helpers without WebKit and exercise framed records, ack
