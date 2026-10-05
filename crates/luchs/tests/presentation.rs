@@ -6,7 +6,7 @@ use jackstay::{
     input::{Event, Mode},
     local::Stream,
 };
-use luchs::capture::Viewport;
+use luchs::capture::{PRESENTATION_DEBOUNCE, PresentationDebounce, Viewport};
 use std::{
     io::{BufRead, BufReader},
     os::unix::fs::PermissionsExt,
@@ -90,9 +90,13 @@ fn fake_host_resize_geometry_focus_bursts_and_withdrawal() {
             common::PYTHON_PROTOCOL,
             r#"
 width, height, scale, fresh = 32, 24, 1, True
+fail_focus = True
 while True:
     try: cmd = raw_command()
     except EOFError: break
+    if cmd['type'] == 'focus':
+        cmd['focus_failed'] = fail_focus
+        fail_focus = False
     with open(os.environ['PRESENTATION_LOG'], 'a') as log:
         log.write(json.dumps(cmd) + '\n')
     if cmd['type'] == 'resize':
@@ -102,6 +106,8 @@ while True:
         assert cmd['width'] == round(width * scale) and cmd['height'] == round(height * scale)
         ack(cmd, capture={'published':fresh, 'snapshot_ns':1, 'publish_ns':1})
         fresh = False
+    elif cmd['type'] == 'focus' and cmd['focus_failed']:
+        ack(cmd, 'failed', 'navigation replaced the document')
     else: ack(cmd)
 "#
         ),
@@ -166,6 +172,26 @@ while True:
             .iter()
             .any(|v| v["type"] == "resize" && v["width"] == 80 && v["scale"] == 2.)
     );
+    // Resize remains applied and captures continue after an acknowledged focus
+    // failure. The same next hint retries focus without resizing a second time.
+    assert!(
+        events(&log)
+            .iter()
+            .any(|v| v["type"] == "focus" && v["focus_failed"] == true)
+    );
+    host.publish(hint.clone()).unwrap();
+    wait(|| {
+        events(&log)
+            .iter()
+            .any(|v| v["type"] == "focus" && v["focused"] == true && v["focus_failed"] == false)
+    });
+    assert_eq!(
+        events(&log)
+            .iter()
+            .filter(|v| v["type"] == "resize")
+            .count(),
+        1
+    );
     // Focus changes alone never synthesize input cleanup or revoke the controller.
     let cleanups = events(&log)
         .iter()
@@ -208,11 +234,8 @@ while True:
         || matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Frame(f) if f.descriptor().width == 80),
     );
     assert_eq!(input.welcome().config.geometry.revision, 2);
-    // Pace the burst below the debounce interval; only its last size is applied.
-    let resizes = events(&log)
-        .iter()
-        .filter(|v| v["type"] == "resize")
-        .count();
+    // Real-host bursts converge to the last viewport; exact timing is tested
+    // separately with explicit Instants, independent of CI scheduling stalls.
     for width in [90., 100., 110.] {
         host.publish(Presentation {
             preferred_size: Some(Size { width, height: 60. }),
@@ -221,20 +244,13 @@ while True:
             ..Default::default()
         })
         .unwrap();
-        std::thread::sleep(Duration::from_millis(15));
     }
     wait(|| {
         events(&log)
             .iter()
             .any(|v| v["type"] == "resize" && v["width"] == 110)
     });
-    assert_eq!(
-        events(&log)
-            .iter()
-            .filter(|v| v["type"] == "resize")
-            .count(),
-        resizes + 1
-    );
+
     wait(|| {
         matches!(
             consumer.acquire_latest(0).unwrap(),
@@ -294,4 +310,57 @@ while True:
         libc::kill(process.0.id() as i32, libc::SIGTERM);
     }
     wait(|| process.0.try_wait().unwrap().is_some());
+}
+
+#[test]
+fn debounce_replaces_the_hint_and_restarts_its_deadline() {
+    let now = Instant::now();
+    let mut debounce = PresentationDebounce::default();
+    debounce.push(Presentation::default(), now);
+    let latest = Presentation {
+        focused: true,
+        ..Default::default()
+    };
+    let last_hint = now + Duration::from_millis(40);
+    debounce.push(latest.clone(), last_hint);
+    assert!(debounce.take_due(now + PRESENTATION_DEBOUNCE).is_none());
+    assert!(
+        debounce
+            .take_due(last_hint + PRESENTATION_DEBOUNCE - Duration::from_nanos(1))
+            .is_none()
+    );
+    assert_eq!(
+        debounce.take_due(last_hint + PRESENTATION_DEBOUNCE),
+        Some(latest)
+    );
+    assert!(debounce.deadline().is_none());
+}
+
+#[test]
+fn invalid_scales_preserve_previous_scale_and_nonfinite_sizes_use_default() {
+    let mut hint = Presentation {
+        preferred_size: Some(Size {
+            width: 800.,
+            height: 600.,
+        }),
+        ..Default::default()
+    };
+    for scale in [0., -1., f64::NAN, f64::INFINITY, 1e9] {
+        hint.scale = scale;
+        let viewport = Viewport::resolve((320, 240), &hint, 1.5);
+        assert_eq!(viewport.scale, 1.5);
+        assert_eq!(viewport.pixels, (1200, 900));
+    }
+    for (width, height) in [
+        (f64::INFINITY, 600.),
+        (800., f64::INFINITY),
+        (f64::NAN, 600.),
+    ] {
+        hint.preferred_size = Some(Size { width, height });
+        hint.scale = 1.;
+        assert_eq!(
+            Viewport::resolve((320, 240), &hint, 1.5).logical,
+            (320, 240)
+        );
+    }
 }

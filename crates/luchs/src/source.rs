@@ -2,7 +2,7 @@
 use crate::{
     Result,
     affordances::{LoadPolicy, PageState},
-    capture::{CapturePolicy, PRESENTATION_DEBOUNCE, Viewport},
+    capture::{CapturePolicy, PresentationDebounce, Viewport},
     cli::Cli,
     helper::{CommandOutcome, Helper, HelperEvent},
     protocol::Frame,
@@ -445,8 +445,8 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         pixels: (cli.size.0, cli.size.1),
         scale: 1.,
     };
-    let mut focused = false;
-    let mut pending_presentation = None;
+    let mut focused = Some(false);
+    let mut pending_presentation = PresentationDebounce::default();
     let mut pending_capture: Option<crate::arena_capture::Draw> = None;
     let mut stats = CaptureStats::default();
     println!("{path}");
@@ -467,16 +467,13 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         } else {
             policy.wait(Instant::now()).min(watch_wait)
         };
-        let timeout =
-            pending_presentation
-                .as_ref()
-                .map_or(timeout, |(_, deadline): &(_, Instant)| {
-                    if pending_capture.is_none() {
-                        timeout.min(deadline.saturating_duration_since(Instant::now()))
-                    } else {
-                        timeout
-                    }
-                });
+        let timeout = pending_presentation.deadline().map_or(timeout, |deadline| {
+            if pending_capture.is_none() {
+                timeout.min(deadline.saturating_duration_since(Instant::now()))
+            } else {
+                timeout
+            }
+        });
         match helper.receive_event(timeout) {
             Ok(HelperEvent::Wake | HelperEvent::Timeout) => {}
             Err(error) => return Err(error.into()),
@@ -494,7 +491,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             policy.wake(Instant::now());
         }
         if let Some(hint) = source.presentation() {
-            pending_presentation = Some((hint, Instant::now() + PRESENTATION_DEBOUNCE));
+            pending_presentation.push(hint, Instant::now());
         }
         if pending_verb
             .as_ref()
@@ -528,33 +525,50 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             }
         }
         if pending_capture.is_none()
-            && pending_presentation
-                .as_ref()
-                .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+            && let Some(hint) = pending_presentation.take_due(Instant::now())
         {
-            let (hint, _) = pending_presentation.take().unwrap();
             let next = Viewport::resolve((cli.size.0, cli.size.1), &hint, viewport.scale);
-            let mut commands = Vec::new();
             if next != viewport {
-                commands.push(serde_json::json!({"type":"resize", "width":next.logical.0, "height":next.logical.1, "scale":next.scale}));
-            }
-            if hint.focused != focused {
-                commands.push(serde_json::json!({"type":"focus", "focused":hint.focused}));
-            }
-            commands.push(serde_json::json!({"type":"presentation", "visible":hint.visible, "scale":next.scale}));
-            for command in commands {
-                let kind = command["type"].as_str().unwrap().to_owned();
-                let outcome = helper
-                    .send_json_command(command, crate::helper::COMMAND_TIMEOUT)?
-                    .wait();
+                let outcome = helper.send_json_command(
+                    serde_json::json!({"type":"resize", "width":next.logical.0, "height":next.logical.1, "scale":next.scale}),
+                    crate::helper::COMMAND_TIMEOUT,
+                )?.wait();
                 if outcome != CommandOutcome::Executed {
-                    return Err(format!("renderer {kind}: {outcome:?}").into());
+                    return Err(format!("renderer resize: {outcome:?}").into());
+                }
+                // Commit each acknowledged effect independently. A later focus
+                // failure must not leave Rust drawing with the old viewport.
+                viewport = next;
+                *source.logical_size.lock().unwrap() =
+                    (f64::from(viewport.logical.0), f64::from(viewport.logical.1));
+            }
+            if focused != Some(hint.focused) {
+                let outcome = helper
+                    .send_json_command(
+                        serde_json::json!({"type":"focus", "focused":hint.focused}),
+                        crate::helper::COMMAND_TIMEOUT,
+                    )?
+                    .wait();
+                match outcome {
+                    CommandOutcome::Executed => focused = Some(hint.focused),
+                    CommandOutcome::Failed(detail) => {
+                        // Navigation can invalidate JavaScript execution. Focus
+                        // is advisory; mark it unknown and retry on the next hint.
+                        focused = None;
+                        eprintln!(
+                            "luchs: renderer focus failed: {detail:?}; retrying on next hint"
+                        );
+                    }
+                    outcome => return Err(format!("renderer focus: {outcome:?}").into()),
                 }
             }
-            viewport = next;
-            focused = hint.focused;
-            *source.logical_size.lock().unwrap() =
-                (f64::from(viewport.logical.0), f64::from(viewport.logical.1));
+            let outcome = helper.send_json_command(
+                serde_json::json!({"type":"presentation", "visible":hint.visible, "scale":viewport.scale}),
+                crate::helper::COMMAND_TIMEOUT,
+            )?.wait();
+            if outcome != CommandOutcome::Executed {
+                return Err(format!("renderer presentation: {outcome:?}").into());
+            }
             policy.presentation(hint.visible, viewport.scale, Instant::now());
         }
         if pending_capture.is_none()

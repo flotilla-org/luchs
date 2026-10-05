@@ -671,8 +671,8 @@ timeout and closure; draw reservations remain guarded even if command send fails
 ## Presentation resize and focus (2026-10-05, issue #7)
 
 Validated on macOS 26.6 (25G72), arm64, Apple Swift 6.4, Rust 1.98.0 and
-SDL 2.32.70. Luchs is based on `eebd2c7`; the implementation is the commit adding
-this section. The producer toolkit and SDL viewer use Jackstay
+SDL 2.32.70. Luchs is based on `eebd2c7`; the implementation is
+[Luchs PR #23](https://github.com/flotilla-org/luchs/pull/23). The producer toolkit and SDL viewer use Jackstay
 `c3b88ec3badc278d986ea97d3e6e6e8801953193` (direct arena input geometry callback).
 The final Luchs pin is `6516094b8f4335b54d06bba8586a64d67ab0d9c6`, which
 consolidates that callback with the copied-frame geometry path and adds cleanup
@@ -710,3 +710,13 @@ sizes, unchanged geometry on scale-only updates, latest-wins bursts, and all
 withdrawal defaults. Focus-only changes preserve controller admission and
 emit no cleanup. Size tests cover fractional rounding, the exact cap, very large
 square and narrow requests, and small scales.
+
+
+Review follow-up replaces the timing-dependent burst assertion with a deterministic
+clock test and adds invalid-scale and non-finite-size coverage. A fake helper
+fails the first focus acknowledgement after a successful resize; capture keeps
+publishing at the new size and the next hint retries focus without another resize.
+The locked Rust suite, build, Clippy and formatting passed, as did the native
+resize/focus regression with the revised scheduler. A broader native-affordance
+rerun reported `visibility hidden` and suspended rAF in the current desktop
+session; those same fixtures passed during the earlier live validation above.

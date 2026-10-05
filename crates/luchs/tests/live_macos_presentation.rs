@@ -117,5 +117,4 @@ fn native_resize_reflows_and_focus_controls_caret() {
     }
     wait(|| process.0.try_wait().unwrap().is_some());
     assert!(process.0.wait().unwrap().success());
-    eprintln!("{}", std::fs::read_to_string(log).unwrap());
 }

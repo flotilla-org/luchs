@@ -121,6 +121,7 @@ resize advances the toolkit's input geometry revision; scale alone does not.
 Page-sized scroll input uses the current logical height. Host `focused` dispatches
 window focus/blur events and hides the caret while unfocused, including in frames.
 It never changes AppKit activation, input admission or held-input cleanup.
+Acknowledged focus failures log and retry on the next hint while capture continues.
 Presentation withdrawal or closure restores visible, unfocused, scale 1 and the
 CLI size. Capacity-paused replacements retry on later scheduler turns
 as old allocations retire; leased pixels stay intact. Rust owns `--frames` and
