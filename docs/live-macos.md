@@ -666,3 +666,47 @@ capture test now re-shows identical pixels at the same scale and allocation,
 verifying the existing helper fingerprint reset after an abandoned draw. Cached
 contexts reject dimension/stride changes. Rust event waits distinguish wake,
 timeout and closure; draw reservations remain guarded even if command send fails.
+
+
+## Presentation resize and focus (2026-10-05, issue #7)
+
+Validated on macOS 26.6 (25G72), arm64, Apple Swift 6.4, Rust 1.98.0 and
+SDL 2.32.70. Luchs is based on `eebd2c7`; the implementation is the commit adding
+this section. The producer toolkit and SDL viewer use Jackstay
+`c3b88ec3badc278d986ea97d3e6e6e8801953193` (direct arena input geometry callback).
+The final Luchs pin is `6516094b8f4335b54d06bba8586a64d67ab0d9c6`, which
+consolidates that callback with the copied-frame geometry path and adds cleanup
+and invalid-geometry tests. The native presentation regression passed again
+with this final pin.
+
+```sh
+scripts/build-helper.sh
+cargo test --locked --test presentation
+cargo test --locked --test live_macos_presentation -- --ignored --nocapture
+# Build the matching Jackstay library with backend-macos, then its SDL viewer.
+target/debug/luchs --endpoint=luchs-resize-focus-live --stats --size=800x600 testdata/presentation.html
+capture-viewer-sdl --source-endpoint luchs-resize-focus-live --typing cooperative --affordances required --log-affordances
+```
+
+The live SDL window ran on the Retina desktop. Its initial preferred viewport
+was 320x180 at scale 2. Dragging its corner produced 620x416 logical units with
+one card column, then 820x466 with two columns. Shrinking to 520x366 stacked the
+cards again. Desktop screenshots showed those sizes and column counts rendered
+inside the viewer, with the synthetic caret in the focused input. WebKit's
+console recorded the same reflows. Closing the viewer withdrew presentation;
+the page returned to 800x600, two columns, unfocused, with the caret hidden.
+The viewer executable was wrapped in a temporary app bundle for desktop
+automation; its binary and rendering/input code were unchanged.
+
+The native regression used the production helper and real bootstrap host. It
+changed 800x600 to 500x400 at scale 1.5, acquired a 750x600 BGRA frame, and saw
+input geometry revision 2 with logical width 500. The page reported one column
+and `focused=true caret=block`; focus false reported `caret=none` without
+changing geometry. Withdrawal acquired an 800x600 frame and advanced revision
+to 3. SIGTERM exited successfully after releasing the consumer.
+
+The fake-helper test checks acknowledged resize/focus commands, scaled frame
+sizes, unchanged geometry on scale-only updates, latest-wins bursts, and all
+withdrawal defaults. Focus-only changes preserve controller admission and
+emit no cleanup. Size tests cover fractional rounding, the exact cap, very large
+square and narrow requests, and small scales.

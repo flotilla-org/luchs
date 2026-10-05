@@ -22,6 +22,9 @@ impl Executor {
             scroll: ScrollRemainder::default(),
         }
     }
+    pub fn set_viewport_height(&mut self, height: f64) {
+        self.viewport_height = height;
+    }
     pub fn attach(&mut self, sender: CommandSender) {
         self.sender = Some(sender);
     }

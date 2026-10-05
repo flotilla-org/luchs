@@ -2,7 +2,7 @@
 use crate::{
     Result,
     affordances::{LoadPolicy, PageState},
-    capture::CapturePolicy,
+    capture::{CapturePolicy, PRESENTATION_DEBOUNCE, Viewport},
     cli::Cli,
     helper::{CommandOutcome, Helper, HelperEvent},
     protocol::Frame,
@@ -30,7 +30,7 @@ struct PageProducer {
     load_policy: LoadPolicy,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
-    logical_size: (f64, f64),
+    logical_size: Arc<Mutex<(f64, f64)>>,
     input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
 }
 impl Producer for PageProducer {
@@ -45,13 +45,18 @@ impl Producer for PageProducer {
         if let Some(sender) = sender {
             self.input.attach(sender);
         }
+        self.input
+            .set_viewport_height(self.logical_size.lock().unwrap().1);
         self.input.execute(work)
     }
     fn snapshots(&mut self) -> Vec<jackstay::affordances::Snapshot> {
         self.page.snapshots()
     }
     fn input_size(&mut self, _width: u32, _height: u32) -> (f64, f64) {
-        self.logical_size
+        *self.logical_size.lock().unwrap()
+    }
+    fn input_geometry(&mut self) -> Option<(f64, f64)> {
+        Some(*self.logical_size.lock().unwrap())
     }
     fn affordance(&mut self, event: jackstay::affordances::Event) {
         use jackstay::affordances::{Domain, Event, Presentation, Snapshot};
@@ -85,6 +90,7 @@ pub struct Source {
     started: Instant,
     sequence: u64,
     mapping: Option<crate::arena_capture::Mapping>,
+    logical_size: Arc<Mutex<(f64, f64)>>,
     dimensions: (u32, u32, u32),
     pending_dimensions: Option<(u32, u32, u32)>,
 }
@@ -117,6 +123,7 @@ impl Source {
         let presentation = Arc::new(Mutex::new(None));
         let wake = Arc::new(Mutex::new(None));
         let input_sender = Arc::new(Mutex::new(None));
+        let logical_size = Arc::new(Mutex::new((f64::from(width), f64::from(height))));
         let source = Builder::new(
             endpoint,
             ArenaConfig {
@@ -144,7 +151,7 @@ impl Source {
                 load_policy,
                 presentation: presentation.clone(),
                 wake: wake.clone(),
-                logical_size: (f64::from(width), f64::from(height)),
+                logical_size: logical_size.clone(),
                 input: crate::input::Executor::new(f64::from(height)),
                 input_sender: input_sender.clone(),
             },
@@ -165,6 +172,7 @@ impl Source {
                 started: Instant::now(),
                 sequence: 0,
                 mapping: None,
+                logical_size,
                 dimensions: (width, height, width * 4),
                 pending_dimensions: None,
             },
@@ -432,6 +440,13 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     source.setup_writer(&helper)?;
     *source.wake.lock().unwrap() = Some(helper.wake_handle());
     let mut policy = CapturePolicy::new(cli.fps, Instant::now());
+    let mut viewport = Viewport {
+        logical: (cli.size.0, cli.size.1),
+        pixels: (cli.size.0, cli.size.1),
+        scale: 1.,
+    };
+    let mut focused = false;
+    let mut pending_presentation = None;
     let mut pending_capture: Option<crate::arena_capture::Draw> = None;
     let mut stats = CaptureStats::default();
     println!("{path}");
@@ -452,6 +467,16 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
         } else {
             policy.wait(Instant::now()).min(watch_wait)
         };
+        let timeout =
+            pending_presentation
+                .as_ref()
+                .map_or(timeout, |(_, deadline): &(_, Instant)| {
+                    if pending_capture.is_none() {
+                        timeout.min(deadline.saturating_duration_since(Instant::now()))
+                    } else {
+                        timeout
+                    }
+                });
         match helper.receive_event(timeout) {
             Ok(HelperEvent::Wake | HelperEvent::Timeout) => {}
             Err(error) => return Err(error.into()),
@@ -469,28 +494,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             policy.wake(Instant::now());
         }
         if let Some(hint) = source.presentation() {
-            // Keep visibility authoritative even if the proposed scale is too large.
-            let width = (cli.size.0 as f64 * hint.scale).round();
-            let height = (cli.size.1 as f64 * hint.scale).round();
-            let scale = if width >= 1.0
-                && height >= 1.0
-                && width * height * 4.0 <= crate::protocol::MAX_FRAME_BYTES as f64
-            {
-                hint.scale
-            } else {
-                eprintln!("luchs: ignoring scale hint beyond capture limits");
-                policy.scale
-            };
-            let presentation = serde_json::json!({
-                "type": "presentation", "visible": hint.visible, "scale": scale
-            });
-            let outcome = helper
-                .send_json_command(presentation, crate::helper::COMMAND_TIMEOUT)?
-                .wait();
-            if outcome != CommandOutcome::Executed {
-                return Err(format!("renderer presentation: {outcome:?}").into());
-            }
-            policy.presentation(hint.visible, scale, Instant::now());
+            pending_presentation = Some((hint, Instant::now() + PRESENTATION_DEBOUNCE));
         }
         if pending_verb
             .as_ref()
@@ -524,14 +528,44 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             }
         }
         if pending_capture.is_none()
+            && pending_presentation
+                .as_ref()
+                .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+        {
+            let (hint, _) = pending_presentation.take().unwrap();
+            let next = Viewport::resolve((cli.size.0, cli.size.1), &hint, viewport.scale);
+            let mut commands = Vec::new();
+            if next != viewport {
+                commands.push(serde_json::json!({"type":"resize", "width":next.logical.0, "height":next.logical.1, "scale":next.scale}));
+            }
+            if hint.focused != focused {
+                commands.push(serde_json::json!({"type":"focus", "focused":hint.focused}));
+            }
+            commands.push(serde_json::json!({"type":"presentation", "visible":hint.visible, "scale":next.scale}));
+            for command in commands {
+                let kind = command["type"].as_str().unwrap().to_owned();
+                let outcome = helper
+                    .send_json_command(command, crate::helper::COMMAND_TIMEOUT)?
+                    .wait();
+                if outcome != CommandOutcome::Executed {
+                    return Err(format!("renderer {kind}: {outcome:?}").into());
+                }
+            }
+            viewport = next;
+            focused = hint.focused;
+            *source.logical_size.lock().unwrap() =
+                (f64::from(viewport.logical.0), f64::from(viewport.logical.1));
+            policy.presentation(hint.visible, viewport.scale, Instant::now());
+        }
+        if pending_capture.is_none()
             && !command_socket_closed
             && !helper.ended()
             && policy.due(Instant::now())
         {
             match source.draw(
                 &helper,
-                (cli.size.0 as f64 * policy.scale).round() as u32,
-                (cli.size.1 as f64 * policy.scale).round() as u32,
+                viewport.pixels.0,
+                viewport.pixels.1,
                 Duration::from_secs(10),
             ) {
                 Ok(command) => {

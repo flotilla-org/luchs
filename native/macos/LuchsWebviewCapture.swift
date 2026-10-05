@@ -90,6 +90,32 @@ private let caretScriptSource = """
     `;
     document.head.appendChild(style);
 
+    window.__luchsHostFocused = false;
+    window.__luchsApplyHostFocus = focused => {
+      const changed = window.__luchsHostFocused !== focused;
+      window.__luchsHostFocused = focused;
+      window.dispatchEvent(new CustomEvent('luchs-host-focus', {detail: focused}));
+      if (changed) window.dispatchEvent(new Event(focused ? 'focus' : 'blur'));
+      for (let i = 0; i < frames.length; i++) {
+        frames[i].postMessage({type: 'luchs-host-focus', focused}, '*');
+      }
+    };
+    // Cross-origin frames cannot be reached through evaluateJavaScript. Each
+    // injected caret receives presentation focus from its immediate parent.
+    window.addEventListener('message', event => {
+      if (event.data?.type === 'luchs-host-focus' && window !== parent && event.source === parent
+          && typeof event.data.focused === 'boolean') {
+        window.__luchsApplyHostFocus(event.data.focused);
+      } else if (event.data?.type === 'luchs-focus-request') {
+        for (let i = 0; i < frames.length; i++) {
+          if (event.source === frames[i]) {
+            event.source.postMessage({type: 'luchs-host-focus', focused: window.__luchsHostFocused}, '*');
+          }
+        }
+      }
+    });
+    if (window !== parent) parent.postMessage({type: 'luchs-focus-request'}, '*');
+
     const caret = document.createElement("div");
     caret.id = "luchs-synthetic-caret";
     document.documentElement.appendChild(caret);
@@ -106,7 +132,7 @@ private let caretScriptSource = """
     };
     const update = () => {
       const active = document.activeElement;
-      if (!active || !textLikeInput(active) || active.disabled || active.readOnly) {
+      if (!window.__luchsHostFocused || !active || !textLikeInput(active) || active.disabled || active.readOnly) {
         caret.style.display = "none";
         return;
       }
@@ -148,6 +174,10 @@ private let caretScriptSource = """
       caret.style.height = `${Math.round(caretHeight)}px`;
     };
     window.__luchsUpdateCaret = update;
+    window.addEventListener("luchs-host-focus", event => {
+      window.__luchsHostFocused = event.detail;
+      update();
+    });
     let queued = false;
     const schedule = () => {
       if (queued) return;
@@ -300,6 +330,7 @@ private struct HelperCommand: Decodable {
     let type: String
     let scale: Double?
     let visible: Bool?
+    let focused: Bool?
     let x: Double?, y: Double?, dx: Double?, dy: Double?
     let pointDx: Int64?, pointDy: Int64?
     let button: Int?, press: UInt64?, keyCode: UInt16?, modifiers: UInt32?
@@ -312,7 +343,7 @@ private struct HelperCommand: Decodable {
     let direction: String?
     enum CodingKeys: String, CodingKey {
         case layout, slot, generation, width, height, stride
-        case id, type, scale, visible, x, y, dx, dy, button, press, modifiers, logical, text, scope, cooperative
+        case id, type, scale, visible, focused, x, y, dx, dy, button, press, modifiers, logical, text, scope, cooperative
         case url, axis, position, step, direction
         case pointDx = "point_dx", pointDy = "point_dy", keyCode = "key_code", isRepeat = "repeat"
     }
@@ -395,8 +426,8 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     // persistent for this binary (under ~/Library/WebKit), so a login made in
     // one run is still there in the next.
     private let pageURL: URL
-    private let width: Int
-    private let height: Int
+    private var width: Int
+    private var height: Int
     private var window: NSWindow?
     private var webView: WKWebView?
     // Windows the page opened (OAuth sign-in, target=_blank), newest last.
@@ -416,6 +447,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     private var configuredBacking = 0.0
     private var scale = 1.0
     private var visible = true
+    private var focused = false
     private var arena: WriterMapping?
     private var fingerprint: UInt64?
     private var emittedFrames = 0
@@ -536,6 +568,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             navigationFinished = true
             publishPageState()
         }
+        applyFocus(webView, completion: nil)
         reportActivity()
     }
 
@@ -564,6 +597,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         if let view = activeView {
             loaded = !view.isLoading
             observePage(view)
+            applyFocus(view, completion: nil)
             view.evaluateJavaScript("window.__luchsPublishPageState && window.__luchsPublishPageState()", completionHandler: nil)
         }
         debugLog("popup \(index + 1) closed by the page; \(popups.isEmpty ? "main view" : "popup \(popups.count)") is active")
@@ -694,6 +728,37 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             // Never park the command reader behind page loading. Navigation
             // completion wakes Rust; ping, reload and visibility remain usable.
             if !loaded { emitDrawAck(command, outcome: "executed") } else { capture(command) }
+        case "resize":
+            guard let width = command.width, let height = command.height, let scale = command.scale,
+                  width > 0, height > 0, scale.isFinite, scale > 0 else {
+                emitAck(command.id, outcome: "failed", detail: "invalid resize")
+                return
+            }
+            let pw = (Double(width) * scale).rounded(), ph = (Double(height) * scale).rounded()
+            guard pw >= 1 && ph >= 1 && pw * ph * 4 <= Double(maxFrameBytes) else {
+                emitAck(command.id, outcome: "failed", detail: "pixel size exceeds capture limit")
+                return
+            }
+            self.width = width
+            self.height = height
+            self.scale = scale
+            window?.setContentSize(NSSize(width: width, height: height))
+            let rect = NSRect(x: 0, y: 0, width: width, height: height)
+            webView?.frame = rect
+            for popup in popups { popup.frame = rect }
+            window?.contentView?.layoutSubtreeIfNeeded()
+            configuredScale = 0
+            fingerprint = nil
+            emitAck(command.id, outcome: "executed")
+        case "focus":
+            guard let focused = command.focused, let view = activeView else {
+                emitAck(command.id, outcome: "failed", detail: "invalid focus or active view unavailable")
+                return
+            }
+            self.focused = focused
+            applyFocus(view) { error in
+                emitAck(command.id, outcome: error == nil ? "executed" : "failed", detail: error?.localizedDescription)
+            }
         case "presentation":
             guard let scale = command.scale, let visible = command.visible,
                   scale.isFinite, scale > 0 else {
@@ -1024,6 +1089,15 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         default: return "unsupported"
         }
         return "executed"
+    }
+
+    private func applyFocus(_ view: WKWebView, completion: ((Error?) -> Void)?) {
+        // Presentation focus is page state only. Never change AppKit activation,
+        // first responder, controller admission, or native held-input state.
+        let value = focused ? "true" : "false"
+        view.evaluateJavaScript("window.__luchsApplyHostFocus && window.__luchsApplyHostFocus(\(value))") {
+            _, error in completion?(error)
+        }
     }
 
     private func capture(_ command: HelperCommand) {

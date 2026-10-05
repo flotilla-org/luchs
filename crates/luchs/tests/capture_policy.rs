@@ -90,6 +90,9 @@ while True:
         pixels = bytes([revision, 0, 0, 255]) * size * size
         ack(cmd, capture={'published':fresh,'snapshot_ns':1000,'publish_ns':100 if fresh else 0}, pixels=pixels)
         fresh = False
+    elif cmd['type'] == 'resize':
+        scale, fresh = cmd['scale'], True
+        ack(cmd)
     elif cmd['type'] == 'presentation':
         scale, visible, fresh = cmd['scale'], cmd['visible'], True
         ack(cmd)
