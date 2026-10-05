@@ -674,10 +674,12 @@ Validated on macOS 26.6 (25G72), arm64, Apple Swift 6.4, Rust 1.98.0 and
 SDL 2.32.70. Luchs is based on `eebd2c7`; the implementation is
 [Luchs PR #23](https://github.com/flotilla-org/luchs/pull/23). The producer toolkit and SDL viewer use Jackstay
 `c3b88ec3badc278d986ea97d3e6e6e8801953193` (direct arena input geometry callback).
-The final Luchs pin is `6516094b8f4335b54d06bba8586a64d67ab0d9c6`, which
+The reviewed Luchs pin was `6516094b8f4335b54d06bba8586a64d67ab0d9c6`, which
 consolidates that callback with the copied-frame geometry path and adds cleanup
 and invalid-geometry tests. The native presentation regression passed again
-with this final pin.
+with this reviewed pin. Jackstay PR #86 was then squash-merged as
+`276900db59b9c651b1f5a83427a6f498265770fd`; both Luchs dependencies now pin
+that merged commit. Its source tree is identical to the reviewed pin.
 
 ```sh
 scripts/build-helper.sh
