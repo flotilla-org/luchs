@@ -1035,3 +1035,45 @@ committed for reproduction, with a once-per-second console counter. Startup,
 background page timers and desktop load are included in this acceptance run;
 these timings are not a controlled speedup comparison. `copies_per_frame=1`
 remains the implementation's copy-count invariant, not a hardware counter.
+
+## Physical scroll devices (2026-10-06, issue #17)
+
+Hands-on run of the [#17](https://github.com/flotilla-org/luchs/issues/17)
+checklist, plus the physical thumb drag that
+[Jackstay #87](https://github.com/flotilla-org/jackstay/issues/87) needed. Same
+macOS 26.6 (25G72), arm64, Retina desktop and SDL 2.32.70 as the section above.
+Devices were a Logitech MX Master 2 (ratchet and free-spin wheel, thumb wheel)
+and the built-in trackpad. No source was changed.
+
+| Component | Tested revision |
+| --- | --- |
+| Luchs `main` | `0c3391872855ef95328cd74a2c3d965eaf7e88e6` |
+| Jackstay `main`, SDL viewer and Luchs pin | `5fcc8dc285dcb059f9ceb9f976cfb3b8db8b15e2` |
+
+```sh
+LUCHS_INPUT_TRACE=1 LUCHS_CONSOLE_LOG=/tmp/console.log \
+  luchs --endpoint=manual-check --size=800x600 testdata/live-acceptance.html
+capture-viewer-sdl --source-endpoint manual-check \
+  --typing cooperative --affordances required --log-affordances
+```
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Overlay thumb, physical drag | Pass | Page and thumb moved together in both directions; #87 closed as an automation limitation |
+| Notched wheel (ratchet) | Pass | `y` moved in 40-pixel steps per notch, down to 1240 and back to 0; faster spins gave 160/240-pixel steps from macOS acceleration; no lost notches or reversals |
+| Free-spin wheel | Pass | Smooth, with correct direction |
+| Horizontal (thumb wheel) | Pass | `x` moved 0 → 75 → 0 within the 264-pixel range |
+| Trackpad smoothness and momentum | Pass | 3–4-pixel steps at slow speed, monotonic ramps up to 30–70 pixels and back down after release, no snapping |
+| Trackpad direction and Natural scrolling | **Fail** | Viewer scrolls opposite to native apps with Natural scrolling on, and matches them with it off: [Jackstay #88](https://github.com/flotilla-org/jackstay/issues/88) |
+
+The direction failure comes from the scroll-unit rule in Jackstay's
+`docs/design/input.md`, which tells SDL controllers to undo
+`SDL_MOUSEWHEEL_FLIPPED`. On Cocoa, SDL's deltas already include the user's
+inversion, so the viewer reverses it. The MX wheel was not affected in this
+session, probably because macOS did not mark it direction-inverted; this was not
+verified. Retest trackpad and wheel direction with Natural scrolling on and off
+once #88 is fixed.
+
+During the run, enlarging the viewer window made the viewer exit cleanly after
+`input send: 13` (`FT_STATUS_STALE`). The Luchs source survived and accepted a
+new viewer. Filed as [Jackstay #89](https://github.com/flotilla-org/jackstay/issues/89).
