@@ -31,7 +31,8 @@ swiftc -O -parse-as-library \
 # Headless writer-import tests link the pinned Jackstay dylib, built exactly as
 # scripts/build-helper.sh builds it. Its install name is @rpath/libjackstay.dylib,
 # so the test binary finds the copy beside it through the @executable_path rpath.
-jackstay_include=$(dirname "$("$repo/scripts/pinned-jackstay.sh" manifest)")/include
+jackstay_manifest=$("$repo/scripts/pinned-jackstay.sh" manifest)
+jackstay_include=$(dirname "$jackstay_manifest")/include
 "$repo/scripts/pinned-jackstay.sh" dylib "$temporary"
 swiftc -O -parse-as-library -I "$jackstay_include" -L "$temporary" -ljackstay \
     -Xlinker -rpath -Xlinker @executable_path \
