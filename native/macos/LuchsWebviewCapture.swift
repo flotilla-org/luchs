@@ -268,14 +268,6 @@ private let activityRecord: Data = {
     return record
 }()
 
-private struct WriterLayout: Decodable {
-    let arena_scope: [UInt8]
-    let generation: UInt64
-    let map_len: UInt64
-    let slot_capacity: UInt64
-    let slots: UInt32
-}
-
 // Jackstay owns the payload mapping and validates each delegated slot identity.
 private final class WriterMapping {
     let layout: WriterLayout
@@ -285,19 +277,8 @@ private final class WriterMapping {
     private var contexts: [UInt32: (width: Int, height: Int, stride: Int, graphics: NSGraphicsContext)] = [:]
     private var colorSpace: CGColorSpace?
     init(_ layout: WriterLayout, fd: Int32) {
-        var object: ft_os_object = fd
-        // Import consumes the fd on success and on layout validation failure.
-        // Close it ourselves only if the C API did not take ownership.
-        defer { if object != FT_OS_OBJECT_NONE { close(object) } }
-        guard layout.arena_scope.count == 16 else { fail("arena scope must contain 16 bytes") }
-        var descriptor = ft_cpu_writer_descriptor()
-        withUnsafeMutableBytes(of: &descriptor.arena_scope) { $0.copyBytes(from: layout.arena_scope) }
-        descriptor.generation = layout.generation
-        descriptor.map_len = layout.map_len
-        descriptor.slot_capacity = layout.slot_capacity
-        descriptor.slots = layout.slots
-        let status = ft_cpu_writer_import(&descriptor, &object, &handle)
-        guard status == FT_STATUS_OK, handle != nil else { fail("Jackstay writer import failed (status \(status))") }
+        do { handle = try importWriter(layout, fd: fd) }
+        catch { fail(String(describing: error)) }
         self.layout = layout
     }
     deinit {

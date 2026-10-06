@@ -802,3 +802,14 @@ the three-run publish averages are 4.542 ms versus 4.306 ms; their ranges overla
 These short desktop samples cannot establish a small timing regression or
 speedup. Static publish means each contain only one cold publication. Raw stats
 and native test output are retained as Flotilla artifacts.
+
+Review follow-up extracts the production writer import into `WriterImport.swift`
+and runs its tests from the existing macOS CI helper-build step, without WebKit
+or a desktop session. A real C producer/export supplies the positive import.
+Malformed JSON scope lengths (0, 15, 17) and C-rejected zero generation, length,
+capacity, slot count and insufficient mapping length all release the received fd;
+the export's original fd remains open. Successful writer destruction releases its
+owned fd. The helper/native tests and all 12 live tests passed after extraction.
+Build dependency mutations also verified that missing `python3` and `otool`
+produce diagnostics naming the missing tool. README now explains that an
+external `--helper PATH` must have its dylib in its own directory.
