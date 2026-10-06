@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Luchs animated measurement</title>
+<style>body { margin: 0; background: #18212b; color: white; }</style>
+<h1 id="heading">Frame path measurement</h1>
+<script>
+  let frames = 0;
+  function tick() {
+    heading.textContent = "Frame path measurement " + (++frames);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+  setInterval(() => console.log("animation frames=" + frames), 1000);
+</script>

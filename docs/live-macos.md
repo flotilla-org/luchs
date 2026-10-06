@@ -818,3 +818,209 @@ Second re-review adds symbolic names to the import API's error statuses while
 retaining their numbers. The headless invalid-layout cases verify the actual
 `FT_STATUS_ERROR` diagnostic and fd release. The macOS CI helper-build step
 leaves `LUCHS_SKIP_NATIVE_TESTS` unset, so it executes these tests by default.
+
+## End-to-end SDL acceptance (2026-10-06, issue #25)
+
+Ran the [#25 checklist](https://github.com/flotilla-org/luchs/issues/25) from
+[#8](https://github.com/flotilla-org/luchs/issues/8) in the logged-in macOS
+26.6 (25G72), arm64 desktop. Ten items passed; item 3 failed its native automated
+thumb-drag check. The failure is filed as
+[Jackstay #87](https://github.com/flotilla-org/jackstay/issues/87). No runtime
+source or dependency pin was changed. Physical wheel and trackpad testing remains
+outside this slice in [#17](https://github.com/flotilla-org/luchs/issues/17).
+
+| Component | Tested revision / version |
+| --- | --- |
+| Luchs current `main` | `dbd7aa086c9ee4c18c7fa7eaa9917b936948817d` |
+| Jackstay current `main`, SDL viewer and both Luchs dependency pins | `5fcc8dc285dcb059f9ceb9f976cfb3b8db8b15e2` (ABI 0.13) |
+| Rust | 1.98.0 (`88d9e12ae`) |
+| Swift | Apple Swift 6.4 (`swiftlang-6.4.0.34.1`) |
+| SDL | 2.32.70 |
+
+Both checkouts matched freshly fetched `origin/main` before building. The viewer
+executable was copied unchanged into `/tmp/Luchs25Viewer.app`, with
+`NSHighResolutionCapable=true`, so desktop automation could select it. The
+production helper retained its transparent, mouse-ignoring window and prohibited
+activation policy. No visible-helper variant or modified viewer was used.
+
+The evidence archive is Flotilla raw-test-output
+`artifact/artifact-9067d61edc23c6f3deb50e49cb315f44ed19b5587e0d116b6fec9c798db61c97`
+(SHA-256 `3a31ed7ffabcad8719c2a6d8a72c032967eed68743f06951ec2301d6d3dc685b`).
+It contains the build recordings, source/viewer console logs, screenshots,
+measurement commands/results, and the standalone C probes described below.
+These are fresh results; earlier dated sections retain their original scope.
+
+### Build and live commands
+
+```sh
+# Jackstay, at the main revision above:
+cargo build --workspace --locked --features backend-macos
+cmake -S tools/capture-viewer-sdl -B build/viewer
+cmake --build build/viewer
+ctest --test-dir build/viewer --output-on-failure
+
+# Luchs, at the main revision above:
+cargo build --release --locked
+scripts/build-helper.sh target/release
+install -d "$HOME/.local/bin"
+install target/release/luchs target/release/luchs-webview-capture \
+  target/release/libjackstay.dylib "$HOME/.local/bin/"
+
+LUCHS_INPUT_TRACE=1 LUCHS_CONSOLE_LOG=/tmp/interactive-console.log \
+  luchs --endpoint=luchs25-interactive --stats --size=800x600 testdata/interactive.html
+# Connect one mode at a time, retaining the source between viewers:
+capture-viewer-sdl --source-endpoint luchs25-interactive \
+  --typing cooperative --affordances required --log-affordances
+# Repeat with --typing text and --typing physical.
+
+LUCHS_INPUT_TRACE=1 LUCHS_CONSOLE_LOG=/tmp/page-console.log \
+  luchs --endpoint=luchs25-page --stats --size=800x600 testdata/live-acceptance.html
+capture-viewer-sdl --source-endpoint luchs25-page \
+  --typing cooperative --affordances required --log-affordances
+```
+
+Both builds succeeded. The helper build passed SocketRights, snapshot recovery,
+URL policy/symlink containment and writer-import tests. `otool -L` confirmed
+`@rpath/libjackstay.dylib`; byte comparisons confirmed all three installed files
+matched the staged release files. All 19 SDL CTests passed, including typing,
+scroll, cursor, presentation and navigation contracts. Those offline tests are
+supporting evidence, separate from the live observations below.
+
+| # | Result | Live evidence |
+| --- | --- | --- |
+| 1 | PASS | Current-main builds, native helper checks, installation of the three matching files, and 19/19 SDL CTests as above. |
+| 2 | PASS | In `interactive.html`, the click readout reached `clicks 1`. Cooperative typing plus Cmd+A/C/Right/V produced `CoopCoop`; physical mode produced `PhysicalPhysical`. Text mode inserted `Text` and kept it unchanged during the shortcut sequence, matching its documented suppression of all keys. Screenshots: `cooperative.png`, `text.png`, `text-shortcuts.png`, `physical.png`. |
+| 3 | FAIL | Precise scroll moved the long document to y=2089; track clicks moved it to 1549, 1009 and 469. A synthetic two-Line input moved it from 0 to 80. The overlay thumb followed these content changes, but repeated native automated thumb drags left the position unchanged. See the method and failure below. |
+| 4 | PASS | Host pointer gestures over the link and input published cursor tags 5 (`pointer`) and 10 (`text`), with 1 (`default`) between them. No page click was needed to establish those hover tags. The SDL log confirms both transitions; screenshots are `hover-link.png` and `hover-text.png`. The screenshots' automation cursor overlay does not independently establish the system cursor shape. |
+| 5 | PASS | Clicking the page's title button changed the visible native window title and window-domain snapshot to `Title changed by the page` (`title-retina.png`). |
+| 6 | PASS | Toolbar was visible. Typing the second fixture's file URL loaded `Second affordance page`; Back restored the changed title and prior scroll position; Forward returned to the second page; Reload logged another navigation completion. Typing `file:///etc/hosts` left that page visible and logged rejection (`navigation-rejection.png`). |
+| 7 | PASS | Resizing from an 800x600 logical viewport to 500x500 changed two card columns to one. Clicking the resized input and typing produced `AfterResize` at the correct field, also recorded in the console (`resize-input.png`). |
+| 8 | PASS | The Retina viewer received 1600x1200 pixels for an 800x600 logical viewport, and 1000x1000 after the 500x500 resize. Desktop inspection showed sharp text and borders at those matching drawable sizes (`title-retina.png`, `resize-input.png`). |
+| 9 | PASS | While minimized, an independent media observer saw sequence 514 unchanged for 50 seconds while the page's timer advanced. Restoring the viewer resumed publication. The observer requested neither input nor affordances, so it sent no competing presentation hint. |
+| 10 | PASS | Each ten-second static run published exactly one frame and skipped every subsequent completed snapshot: 27 skips at 800x600, 28 at 1600x1200. This covers the one-second idle threshold and reports actual `--stats` skips. |
+| 11 | PASS | Static and animated stats at both pixel sizes are recorded in the table below. All four runs exited zero. |
+
+### Input, scrolling and navigation excerpts
+
+The native helper trace records cooperative Command-key delivery, including
+`code=8` (`c`) and `code=9` (`v`) with `flags=1048576`. The fixture screenshots
+show the resulting duplicate strings. Text mode's unchanged `Text` after the
+same shortcuts is expected behavior, not an editing failure: that mode sends
+committed text and suppresses physical keys, including Command and arrows.
+
+Precise scrolling used desktop automation's synthetic scroll over the actual
+SDL window. For the Line case, a standalone C probe connected to the same live
+source over bootstrap v2 with required SourceText input, sent Motion at (100,100)
+and a `FT_INPUT_SCROLL_LINE` event with y=2, waited for executed completions, and
+closed input cleanly. The unchanged SDL viewer was connected with `--observe`
+and required affordances during this probe. This verifies Line execution and
+its resulting SDL content/overlay state; it does not claim a live non-precise
+Cocoa device event through SDL's wheel adapter. That translator has separate
+passing CTest coverage; physical device evidence belongs to #17.
+
+```text
+# Native precise scroll through SDL:
+input scroll dx=-0.0 dy=2640.0 fixed=-2640.0 native=0.0,-2640.0 precise=true
+console.log scroll x=0 y=2089
+# SDL after the scroll, then three track clicks:
+affordances domain=scroll withdrawn=0 x=0/783 y=2089/2689 capabilities=3
+affordances domain=scroll withdrawn=0 x=0/783 y=1549/2689 capabilities=3
+affordances domain=scroll withdrawn=0 x=0/783 y=1009/2689 capabilities=3
+affordances domain=scroll withdrawn=0 x=0/783 y=469/2689 capabilities=3
+# Standalone synthetic Line probe, with SDL observing:
+geometry=320x180 revision=6
+kind=3 scroll_unit=0 y=100.0 sequence=1 outcome=0
+kind=5 scroll_unit=2 y=2.0 sequence=2 outcome=0
+input_cleanup=completed
+# Native helper and SDL:
+input scroll dx=0.0 dy=80.0 fixed=-80.0 native=0.0,-80.0 precise=true
+console.log scroll x=0 y=80
+affordances domain=scroll withdrawn=0 x=0/303 y=80/2957 capabilities=3
+# Hover, title, resize and URL refusal:
+affordances domain=cursor withdrawn=0 cursor=5
+affordances domain=cursor withdrawn=0 cursor=1
+affordances domain=cursor withdrawn=0 cursor=10
+affordances domain=window withdrawn=0 ready=1 title=Title changed by the page
+source frame=1600x1200
+console.log viewport 800x600 columns=2
+console.log viewport 500x500 columns=1
+console.log input AfterResize
+source frame=1000x1000
+rejected navigation.load: file:///etc/hosts
+```
+
+The failed native thumb gestures started inside the visible vertical thumb at
+screenshot (1590,940), ending at (1590,250), and at (1590,930), ending at
+(1590,700). The 800x600 logical page occupied screenshot x=0..1599,
+y=120..1319; at y=1549 the overlay thumb occupied approximately y=811..1079.
+Both gestures left y=1549 unchanged. Further attempts at y=469 and at the top
+of a 500x500 viewport also produced no changed scroll snapshot. Track clicks
+remained effective. All viewer sources were unchanged, and no input rejection
+or helper error appeared. Jackstay #87 retains these reproduction steps and
+requests a physical mouse drag to distinguish native automation delivery from
+a viewer defect. This verification does not assign a root cause or fix it.
+
+### Minimized publication and page clock
+
+A standalone C observer attached to `luchs25-page` using bootstrap v2, no input,
+no affordances, and a one-frame holding reservation. It sampled the latest
+frame descriptor every 20 ms, released every acquired lease immediately, and
+logged sequence and dimensions once per second. Repeated acquisitions of a
+retained frame are not counted as new publication.
+
+After minimizing through the native window button, the test inspected Finder
+rather than the viewer. Reading the viewer's accessibility state immediately
+after minimizing reactivates it in this automation environment and invalidates
+the hidden interval; the reported interval avoids that side effect.
+
+```text
+# Independent media observer during the uninterrupted minimized interval:
+elapsed=104.023 sequence=514 observed_changes=353 pixels=1000x1000
+elapsed=154.008 sequence=514 observed_changes=353 pixels=1000x1000
+# Helper console during that interval; its timer continued at the background rate:
+501.774 console.log timer 49
+549.773 console.log timer 73
+# After restoring the viewer:
+elapsed=171.073 sequence=590 observed_changes=426 pixels=1000x1000
+```
+
+The timer runs without publishing its changed pixels while hidden. On final
+SIGTERM the source stopped, reaped its helper and exited successfully. The
+observation viewer reported `affordances_cleanup=completed`. The long interactive
+run's aggregate stats were `snapshots=4981 published=1076 skipped=3905
+copies_per_frame=1 mean_snapshot_ms=4.097 mean_publish_ms=1.862`; these combine
+navigation, editing, resizing and visibility changes and are not a benchmark.
+
+### Static and animated measurements
+
+Release Luchs and the optimized Swift helper ran at `--fps=30`. Each static
+run used `testdata/static.html`, ran for ten seconds from process launch, then
+received SIGTERM. Each animated run used `testdata/animated.html` and stopped
+at 90 changed publications. Runs were sequential, without a viewer connected
+to the measured endpoint. The separate live viewer above establishes Retina
+scale-hint delivery; the 1600x1200 CLI runs here reproduce that pixel count
+without a host-dependent initial resize.
+
+```sh
+luchs --stats --fps=30 --size=800x600 testdata/static.html
+luchs --stats --fps=30 --size=1600x1200 testdata/static.html
+# Send SIGTERM to each static process after ten seconds.
+luchs --stats --fps=30 --frames=90 --size=800x600 testdata/animated.html
+luchs --stats --fps=30 --frames=90 --size=1600x1200 testdata/animated.html
+```
+
+| Workload | Pixels | Snapshots | Published | Skipped | Copies | Mean snapshot ms | Mean publish ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Static, ten seconds | 800x600 | 28 | 1 | 27 | 1 | 3.279 | 12.064 |
+| Static, ten seconds | 1600x1200 | 29 | 1 | 28 | 1 | 5.221 | 6.108 |
+| Animated, 90 publications | 800x600 | 90 | 90 | 0 | 1 | 1.264 | 0.952 |
+| Animated, 90 publications | 1600x1200 | 90 | 90 | 0 | 1 | 1.444 | 2.953 |
+
+These rows sit alongside the earlier dated tables without replacing them.
+The static fixture differs from the earlier one-heading scratch page; its
+single cold publication cannot establish steady-state publish throughput.
+The animated fixture uses the earlier heading-changing rAF workload, now
+committed for reproduction, with a once-per-second console counter. Startup,
+background page timers and desktop load are included in this acceptance run;
+these timings are not a controlled speedup comparison. `copies_per_frame=1`
+remains the implementation's copy-count invariant, not a hardware counter.
