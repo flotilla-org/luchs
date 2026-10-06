@@ -851,8 +851,14 @@ measurement commands/results, and the standalone C probes described below.
 The raw archive is scheduled to expire on 2026-10-13. Retrieve it before that
 date if screenshots or probe sources are needed; the checklist, commands, key
 log excerpts and measurement tables remain in this repository after expiry.
-The archive can be retrieved with `flotilla artifact get` and its identity above,
-using `--output /tmp/luchs25-evidence.tar.gz`.
+Retrieve the archive with:
+
+```sh
+flotilla artifact get \
+  artifact/artifact-9067d61edc23c6f3deb50e49cb315f44ed19b5587e0d116b6fec9c798db61c97 \
+  --output /tmp/luchs25-evidence.tar.gz
+```
+
 These are fresh results; earlier dated sections retain their original scope.
 
 ### Build and live commands
