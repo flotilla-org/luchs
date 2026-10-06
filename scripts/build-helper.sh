@@ -17,16 +17,9 @@ mkdir -p "$destination"
 # Jackstay checkout. Its headers and dylib must match the Rust core's revision.
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
-jackstay_manifest=$("$repo/scripts/pinned-jackstay.sh")
+jackstay_manifest=$("$repo/scripts/pinned-jackstay.sh" manifest)
 jackstay_include=$(dirname "$jackstay_manifest")/include
-# Always optimize the writer dylib, including for a debug helper destination.
-# This separate cache adds a cold Jackstay compile on the first helper/CI build.
-if ! cargo build --manifest-path "$jackstay_manifest" --locked --release --lib -p jackstay \
-    --target-dir "$repo/target/jackstay-helper"; then
-    echo "Could not build pinned Jackstay with its committed lockfile: $jackstay_manifest" >&2
-    exit 1
-fi
-cp "$repo/target/jackstay-helper/release/libjackstay.dylib" "$temporary/"
+"$repo/scripts/pinned-jackstay.sh" dylib "$temporary"
 if ! otool -D "$temporary/libjackstay.dylib" | grep -Fx '@rpath/libjackstay.dylib' >/dev/null; then
     echo 'Jackstay dylib must have install name @rpath/libjackstay.dylib' >&2
     exit 1
