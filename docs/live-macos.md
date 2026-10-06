@@ -823,7 +823,7 @@ leaves `LUCHS_SKIP_NATIVE_TESTS` unset, so it executes these tests by default.
 
 Ran the [#25 checklist](https://github.com/flotilla-org/luchs/issues/25) from
 [#8](https://github.com/flotilla-org/luchs/issues/8) in the logged-in macOS
-26.6 (25G72), arm64 desktop. Ten items passed; item 3 failed its native automated
+26.6 (25G72), arm64 desktop. 10 of 11 items passed; item 3 failed its native automated
 thumb-drag check. The failure is filed as
 [Jackstay #87](https://github.com/flotilla-org/jackstay/issues/87). No runtime
 source or dependency pin was changed. Physical wheel and trackpad testing remains
@@ -848,6 +848,11 @@ The evidence archive is Flotilla raw-test-output
 (SHA-256 `3a31ed7ffabcad8719c2a6d8a72c032967eed68743f06951ec2301d6d3dc685b`).
 It contains the build recordings, source/viewer console logs, screenshots,
 measurement commands/results, and the standalone C probes described below.
+The raw archive is scheduled to expire on 2026-10-13. Retrieve it before that
+date if screenshots or probe sources are needed; the checklist, commands, key
+log excerpts and measurement tables remain in this repository after expiry.
+The archive can be retrieved with `flotilla artifact get` and its identity above,
+using `--output /tmp/luchs25-evidence.tar.gz`.
 These are fresh results; earlier dated sections retain their original scope.
 
 ### Build and live commands

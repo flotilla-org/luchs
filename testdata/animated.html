@@ -4,6 +4,7 @@
 <style>body { margin: 0; background: #18212b; color: white; }</style>
 <h1 id="heading">Frame path measurement</h1>
 <script>
+  const heading = document.getElementById('heading');
   let frames = 0;
   function tick() {
     heading.textContent = "Frame path measurement " + (++frames);

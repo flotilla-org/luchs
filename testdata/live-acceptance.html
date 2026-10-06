@@ -17,12 +17,15 @@
   <p id="viewport"></p>
   <input aria-label="Acceptance input" placeholder="Text cursor">
   <button id="title">Change title</button>
+  <!-- Optional manual scroll check; not exercised in the recorded acceptance. -->
   <button id="scroll">Scroll to 700</button>
   <p id="clock">Timer 0</p>
   <section class="cards"><article>First card</article><article>Second card</article></section>
   <div class="long"></div>
 </main>
 <script>
+  const viewport = document.getElementById('viewport');
+  const clock = document.getElementById('clock');
   function report() {
     const columns = getComputedStyle(document.querySelector('.cards')).gridTemplateColumns.split(' ').length;
     const status = `${innerWidth}x${innerHeight} columns=${columns}`;
