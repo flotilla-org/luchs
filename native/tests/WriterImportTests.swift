@@ -66,7 +66,9 @@ struct WriterImportTests {
         } catch let error as WriterImportError {
             switch error {
             case .malformedScope: precondition(malformedScope)
-            case .status(let status): precondition(!malformedScope && status != FT_STATUS_OK)
+            case .status(let status):
+                precondition(!malformedScope && status == FT_STATUS_ERROR)
+                precondition(error.description == "Jackstay writer import failed (FT_STATUS_ERROR \(status))")
             }
         }
         precondition(fcntl(fd, F_GETFD) == -1 && errno == EBADF, "rejected import leaked the received fd")

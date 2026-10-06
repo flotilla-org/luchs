@@ -813,3 +813,8 @@ owned fd. The helper/native tests and all 12 live tests passed after extraction.
 Build dependency mutations also verified that missing `python3` and `otool`
 produce diagnostics naming the missing tool. README now explains that an
 external `--helper PATH` must have its dylib in its own directory.
+
+Second re-review adds symbolic names to the import API's error statuses while
+retaining their numbers. The headless invalid-layout cases verify the actual
+`FT_STATUS_ERROR` diagnostic and fd release. The macOS CI helper-build step
+leaves `LUCHS_SKIP_NATIVE_TESTS` unset, so it executes these tests by default.

@@ -16,7 +16,15 @@ enum WriterImportError: Error, CustomStringConvertible {
     var description: String {
         switch self {
         case .malformedScope: return "arena scope must contain 16 bytes"
-        case .status(let status): return "Jackstay writer import failed (status \(status))"
+        case .status(let status):
+            let name: String
+            switch status {
+            case FT_STATUS_INVALID_ARGUMENT: name = "FT_STATUS_INVALID_ARGUMENT"
+            case FT_STATUS_ERROR: name = "FT_STATUS_ERROR"
+            case FT_STATUS_CLOSED: name = "FT_STATUS_CLOSED"
+            default: name = "unknown status"
+            }
+            return "Jackstay writer import failed (\(name) \(status))"
         }
     }
 }
