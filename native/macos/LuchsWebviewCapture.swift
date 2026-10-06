@@ -1,6 +1,7 @@
 import Cocoa
 import WebKit
 import Carbon
+import Jackstay
 
 private let defaultWidth = 800
 private let defaultHeight = 600
@@ -267,40 +268,38 @@ private let activityRecord: Data = {
     return record
 }()
 
-private struct WriterLayout: Decodable {
-    let generation: UInt64
-    let map_len: Int
-    let slot_capacity: Int
-    let slots: UInt32
-}
-
-// Contains payload bytes only. The helper does not read arena bookkeeping.
+// Jackstay owns the payload mapping and validates each delegated slot identity.
 private final class WriterMapping {
     let layout: WriterLayout
-    let base: UnsafeMutableRawPointer
-    // Each arena command replaces this whole mapping, so cached slot contexts
+    private var handle: OpaquePointer?
+    // Each arena command replaces this whole writer, so cached slot contexts
     // cannot outlive their allocation generation or refer to retired memory.
     private var contexts: [UInt32: (width: Int, height: Int, stride: Int, graphics: NSGraphicsContext)] = [:]
     private var colorSpace: CGColorSpace?
     init(_ layout: WriterLayout, fd: Int32) {
-        defer { close(fd) }
-        var info = stat()
-        guard layout.generation > 0, layout.slots > 0, layout.slot_capacity > 0,
-              layout.map_len > 0, layout.slot_capacity <= layout.map_len / Int(layout.slots),
-              fstat(fd, &info) == 0, info.st_size >= layout.map_len,
-              let address = mmap(nil, layout.map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
-              address != MAP_FAILED else { fail("invalid arena writer mapping") }
+        do { handle = try importWriter(layout, fd: fd) }
+        catch { fail(String(describing: error)) }
         self.layout = layout
-        self.base = address
     }
-    deinit { contexts.removeAll(); munmap(base, layout.map_len) }
+    deinit {
+        contexts.removeAll()
+        ft_cpu_writer_destroy(&handle)
+    }
     func slot(_ command: HelperCommand) -> UnsafeMutableRawPointer? {
-        guard command.generation == layout.generation, let slot = command.slot, slot < layout.slots,
+        guard let scope = command.arena_scope, scope.count == 16,
+              let generation = command.generation, let index = command.slot,
               let width = command.width, let height = command.height, let stride = command.stride,
               width > 0, height > 0, width <= maxFrameBytes / 4,
-              stride == width * 4, height <= maxFrameBytes / stride,
-              stride * height <= layout.slot_capacity else { return nil }
-        return base.advanced(by: Int(slot) * layout.slot_capacity)
+              stride == width * 4, height <= maxFrameBytes / stride else { return nil }
+        var slot = ft_cpu_writer_slot()
+        withUnsafeMutableBytes(of: &slot.arena_scope) { $0.copyBytes(from: scope) }
+        slot.generation = generation
+        slot.slot = index
+        var bytes: UnsafeMutablePointer<UInt8>?
+        var length = 0
+        guard ft_cpu_writer_slot_view(handle, &slot, &bytes, &length) == FT_STATUS_OK,
+              let bytes, stride * height <= length else { return nil }
+        return UnsafeMutableRawPointer(bytes)
     }
     func graphicsContext(_ command: HelperCommand, image: NSImage) -> NSGraphicsContext? {
         guard let pointer = slot(command), let index = command.slot,
@@ -324,6 +323,7 @@ private final class WriterMapping {
 
 private struct HelperCommand: Decodable {
     let layout: WriterLayout?
+    let arena_scope: [UInt8]?
     let slot: UInt32?, generation: UInt64?
     let width: Int?, height: Int?, stride: Int?
     let id: UInt64
@@ -342,7 +342,7 @@ private struct HelperCommand: Decodable {
     let step: String?
     let direction: String?
     enum CodingKeys: String, CodingKey {
-        case layout, slot, generation, width, height, stride
+        case layout, arena_scope, slot, generation, width, height, stride
         case id, type, scale, visible, focused, x, y, dx, dy, button, press, modifiers, logical, text, scope, cooperative
         case url, axis, position, step, direction
         case pointDx = "point_dx", pointDy = "point_dy", keyCode = "key_code", isRepeat = "repeat"
@@ -1205,6 +1205,13 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
 @main
 private enum LuchsWebviewCapture {
     static func main() {
+        // Clang cannot import the cast in FT_ABI_VERSION; reconstruct the
+        // header value from its components, as Jackstay's Swift smoke does.
+        let FT_ABI_VERSION = UInt32((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR)
+        let version = ft_abi_version()
+        guard version == FT_ABI_VERSION else {
+            fail("Jackstay ABI mismatch: helper expects \(FT_ABI_VERSION), library reports \(version)")
+        }
         let args = CommandLine.arguments
         guard args.count >= 2 else {
             fail("usage: luchs-webview-capture path/to/fragment.html [width height [frame_count fps]]")

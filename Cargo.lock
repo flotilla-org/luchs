@@ -296,7 +296,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jackstay"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/jackstay?rev=276900db59b9c651b1f5a83427a6f498265770fd#276900db59b9c651b1f5a83427a6f498265770fd"
+source = "git+https://github.com/flotilla-org/jackstay?rev=5fcc8dc285dcb059f9ceb9f976cfb3b8db8b15e2#5fcc8dc285dcb059f9ceb9f976cfb3b8db8b15e2"
 dependencies = [
  "cc",
  "libc",
@@ -309,7 +309,7 @@ dependencies = [
 [[package]]
 name = "jackstay-producer"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/jackstay?rev=276900db59b9c651b1f5a83427a6f498265770fd#276900db59b9c651b1f5a83427a6f498265770fd"
+source = "git+https://github.com/flotilla-org/jackstay?rev=5fcc8dc285dcb059f9ceb9f976cfb3b8db8b15e2#5fcc8dc285dcb059f9ceb9f976cfb3b8db8b15e2"
 dependencies = [
  "jackstay",
 ]

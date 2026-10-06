@@ -735,3 +735,86 @@ validates an available acknowledgement before reporting writer death, retaining
 the snapshot failure detail while refusing to commit pixels from an exited
 writer. A deterministic dead-writer regression and the existing CLI exhausted
 snapshot retry test passed with this fix.
+
+## Jackstay C writer API (2026-10-06, issue #22)
+
+Validated on macOS 26.6 (25G72), arm64, Apple Swift 6.4, Rust 1.98.0 and
+SDL 2.32.70. This change is based on Luchs `08c379e`; both Rust dependencies and
+the helper's headers/dylib pin Jackstay `5fcc8dc285dcb059f9ceb9f976cfb3b8db8b15e2`.
+
+The locked workspace build, 66 ordinary Rust tests, denied-warning Clippy and
+Rust 1.98 formatting passed. Helper builds in debug and release destinations,
+the native descriptor/recovery/URL tests, and the desktop-focus test passed.
+All 12 ignored live macOS tests passed sequentially:
+
+```sh
+scripts/build-helper.sh
+cargo test --locked --test live_macos --test live_macos_affordances \
+  --test live_macos_presentation -- --ignored --nocapture --test-threads=1
+scripts/test-hover-window.sh
+```
+
+The new regression draws into a cached slot, rejects a foreign scope, stale
+generation and out-of-range index, and then re-exports after a viewport resize.
+It rejects the old generation using dimensions valid for the replacement,
+rejects stale release, releases the current writer, and imports/draws again.
+The existing real-host test also verifies resize and withdrawal through the
+production Rust scheduler. A grep for `mmap` or arithmetic involving
+`slot_capacity` in the Swift helper returns no matches.
+
+A helper and dylib copied into a fresh temporary directory loaded without DYLD
+path overrides. Removing that adjacent dylib produced
+`Library not loaded: @rpath/libjackstay.dylib`. Replacing it with a disposable C
+stub reporting ABI 14 produced `Jackstay ABI mismatch: helper expects 13, library
+reports 14` and exited with status 1 before WebKit startup. Build checks verify
+the install name, helper dependency and `@executable_path` rpath with `otool`.
+
+The matching SDL viewer displayed `testdata/presentation.html` from the release
+CLI through bootstrap v2. Its visible frame showed the page heading and
+`320x180 columns=1`. Closing the viewer and sending SIGTERM to Luchs completed
+successfully, with `copies_per_frame=1`.
+
+### Timing comparison
+
+Used the same static and animated fixtures and commands as the issue #13
+measurement above. Each static run lasted ten seconds; each animated run ended
+after 90 changed publications. The baseline helper was compiled with `swiftc -O`
+from this branch's base commit, with its original arena mapping. Both helpers
+used this change's release Rust binary, isolating the helper change.
+
+| Helper / workload | Pixels | Snapshots | Published | Skipped | Copies | Mean snapshot ms | Mean publish ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline, static | 800x600 | 29 | 1 | 28 | 1 | 2.222 | 0.979 |
+| C writer API, static | 800x600 | 27 | 1 | 26 | 1 | 1.979 | 0.981 |
+| Baseline, static | 1600x1200 | 26 | 1 | 25 | 1 | 4.432 | 3.554 |
+| C writer API, static | 1600x1200 | 27 | 1 | 26 | 1 | 4.889 | 3.158 |
+| Baseline, animated run 1 | 1600x1200 | 90 | 90 | 0 | 1 | 2.552 | 3.921 |
+| C writer API, animated run 1 | 1600x1200 | 90 | 90 | 0 | 1 | 2.484 | 4.265 |
+| C writer API, animated run 2 | 1600x1200 | 90 | 90 | 0 | 1 | 2.919 | 4.943 |
+| Baseline, animated run 2 | 1600x1200 | 90 | 90 | 0 | 1 | 1.794 | 4.664 |
+| C writer API, animated run 3 | 1600x1200 | 90 | 90 | 0 | 1 | 1.879 | 4.417 |
+| Baseline, animated run 3 | 1600x1200 | 90 | 90 | 0 | 1 | 1.578 | 4.333 |
+
+All runs exited successfully. The one-copy frame path, static unchanged skips
+and all 90 animated publications are preserved. The C API animated publish means
+remain below the issue #13 measurement of 5.213 ms. Against the current baseline,
+the three-run publish averages are 4.542 ms versus 4.306 ms; their ranges overlap.
+These short desktop samples cannot establish a small timing regression or
+speedup. Static publish means each contain only one cold publication. Raw stats
+and native test output are retained as Flotilla artifacts.
+
+Review follow-up extracts the production writer import into `WriterImport.swift`
+and runs its tests from the existing macOS CI helper-build step, without WebKit
+or a desktop session. A real C producer/export supplies the positive import.
+Malformed JSON scope lengths (0, 15, 17) and C-rejected zero generation, length,
+capacity, slot count and insufficient mapping length all release the received fd;
+the export's original fd remains open. Successful writer destruction releases its
+owned fd. The helper/native tests and all 12 live tests passed after extraction.
+Build dependency mutations also verified that missing `python3` and `otool`
+produce diagnostics naming the missing tool. README now explains that an
+external `--helper PATH` must have its dylib in its own directory.
+
+Second re-review adds symbolic names to the import API's error statuses while
+retaining their numbers. The headless invalid-layout cases verify the actual
+`FT_STATUS_ERROR` diagnostic and fd release. The macOS CI helper-build step
+leaves `LUCHS_SKIP_NATIVE_TESTS` unset, so it executes these tests by default.

@@ -7,8 +7,12 @@ and carry no protocol bytes. Stderr carries diagnostics. The socket carries one 
 No pixel bytes travel over the socket.
 
 One helper process owns each engine and uses `takeSnapshot`, without Screen
-Recording permission. Rust reserves and commits Jackstay CPU slots; the helper maps only their payload
-object and draws snapshots directly into the reserved slot. It does not link Jackstay.
+Recording permission. Rust reserves and commits Jackstay CPU slots; the helper
+imports their payload object through Jackstay's C writer API and draws snapshots directly into the
+reserved slot. Both processes build against the same pinned Jackstay revision.
+The helper loads the packaged `libjackstay.dylib` through its `@executable_path`
+rpath and checks `ft_abi_version()` against the header's `FT_ABI_VERSION` before
+starting WebKit.
 
 ## Envelopes and limits
 
@@ -82,9 +86,9 @@ An invalid ack schema is a protocol failure.
 | --- | --- |
 | `ping` | The main thread has handled the command; ack `executed` |
 | `reload` | Apply a cache-bypassing reload request to the main page view; ack `executed` after the WebKit load/reload call returns |
-| `arena` | Receive exactly one payload fd, map `layout.map_len` bytes read/write, unmap the previous generation, then ack with `generation` |
-| `arena_release` | Unmap the named generation and destroy its contexts, then ack with that generation |
-| `draw` | Validate `slot`, `generation`, `width`, `height`, `stride`; snapshot and draw into that reserved slot; ack with matching generation/slot and a changed frame header, an unchanged report, or no report for a discarded/hidden/loading attempt |
+| `arena` | Receive exactly one payload fd, import `layout` with `ft_cpu_writer_import`, destroy the previous writer and its contexts, then ack with `generation` |
+| `arena_release` | Destroy the named generation with `ft_cpu_writer_destroy` and release its contexts, then ack with that generation |
+| `draw` | Validate `arena_scope`, `generation`, `slot` through `ft_cpu_writer_slot_view`, check BGRA dimensions/stride against the returned view length; snapshot and draw into that reserved slot; ack with matching generation/slot and a changed frame header, an unchanged report, or no report for a discarded/hidden/loading attempt |
 | `resize` | Apply integer logical `width`/`height` and positive finite `scale` together; validate the scaled 64 MiB pixel cap, resize the window and all WebKit views, invalidate snapshot configuration, then ack |
 | `focus` | Apply boolean `focused` through page window focus/blur events and caret visibility; ack after JavaScript execution; no input cleanup or desktop focus change |
 | `presentation` | Apply `visible` (boolean) and `scale` (positive finite number), validating the resulting pixel size before ack |
@@ -247,11 +251,11 @@ policy.
 
 At setup Rust exports Jackstay's writable payload object. An `arena` command
 carries its descriptor and exactly one fd in `SCM_RIGHTS`, attached to the first
-command byte. Ancillary receipt uses `recvmsg` even across split reads. The helper
-validates the object length and layout, maps it shared read/write, closes the fd,
-and acknowledges its allocation generation. No Jackstay bookkeeping is exported.
-`arena_scope` is carried in the layout; the helper uses the generation and slot
-bounds within this one process lifetime.
+command byte. Ancillary receipt uses `recvmsg` even across split reads. Jackstay
+validates the object length and layout, maps it shared read/write and consumes the
+fd. The helper acknowledges its allocation generation. No Jackstay bookkeeping
+is exported. `arena_scope` is carried unchanged in both the layout and each draw;
+Jackstay validates the scope, generation and slot bounds.
 
 ```json
 {"id":1,"type":"arena","layout":{"arena_scope":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"generation":1,"map_len":131072,"slot_capacity":16384,"slots":8}}
@@ -259,10 +263,13 @@ bounds within this one process lifetime.
 ```
 
 The numbers above illustrate a layout, not a portable page-size assumption.
-Slot N starts at `N * slot_capacity` in the payload mapping. Rust retains the
-writer export until unmap acknowledgement or verified helper exit. Before resize,
+The helper passes the exact `ft_cpu_writer_descriptor` fields (`arena_scope` as
+16 bytes, `generation`, `map_len`, `slot_capacity` as unsigned 64-bit values,
+`slots` as unsigned 32-bit) to `ft_cpu_writer_import`. Import consumes the received
+`ft_os_object`, including on layout validation failure. Jackstay owns mapping,
+layout validation and slot addressing. Rust retains the writer export until unmap acknowledgement or verified helper exit. Before resize,
 it sends `arena_release {generation}`; the helper destroys its contexts and
-mapping before acknowledging that generation. Rust then releases the old export,
+writer before acknowledging that generation. Rust then releases the old export,
 reconfigures, and exports the replacement. A capacity pause uses
 `advance_reconfiguration` on later scheduler turns, so an old consumer lease or
 mapping can retire without restarting the transition. This also prevents a
@@ -271,12 +278,15 @@ writer export from permanently pinning a paused allocation.
 For each snapshot Rust reserves one exclusive slot and sends:
 
 ```json
-{"id":3,"type":"draw","slot":0,"generation":2,"width":800,"height":600,"stride":3200}
+{"id":3,"type":"draw","arena_scope":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"slot":0,"generation":2,"width":800,"height":600,"stride":3200}
 ```
 
-The helper rejects stale generations, out-of-range slots, invalid dimensions,
-stride other than `width * 4`, payloads beyond the slot capacity or 64 MiB cap,
-and dimensions inconsistent with the current presentation scale. It draws native
+Each draw supplies all `ft_cpu_writer_slot` fields unchanged from Rust's
+reservation: `arena_scope`, unsigned 64-bit `generation`, unsigned 32-bit `slot`.
+The C API rejects foreign scopes, stale generations and out-of-range slots, even
+when the helper has a cached CGContext for that index. The helper rejects invalid
+dimensions, stride other than `width * 4`, payloads beyond the returned view length
+or 64 MiB cap, and dimensions inconsistent with the current presentation scale. It draws native
 little-endian premultiplied BGRA directly into that slot, then replies:
 
 ```json

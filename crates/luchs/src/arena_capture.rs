@@ -121,7 +121,8 @@ impl Draw {
         };
         let command = reservation.sender.send_json_command(
             serde_json::json!({
-                "type":"draw", "slot":slot.slot, "generation":slot.generation,
+                "type":"draw", "arena_scope":slot.arena_scope,
+                "slot":slot.slot, "generation":slot.generation,
                 "width":header.width, "height":header.height, "stride":header.stride,
             }),
             timeout,
