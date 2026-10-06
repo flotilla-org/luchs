@@ -17,18 +17,7 @@ mkdir -p "$destination"
 # Jackstay checkout. Its headers and dylib must match the Rust core's revision.
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
-cargo metadata --manifest-path "$repo/Cargo.toml" --locked --format-version 1 > "$temporary/metadata.json"
-jackstay_manifest=$(python3 - "$temporary/metadata.json" <<'PYTHON'
-import json, sys
-with open(sys.argv[1]) as file:
-    packages = json.load(file)["packages"]
-core, = [p for p in packages if p["name"] == "jackstay"]
-producer, = [p for p in packages if p["name"] == "jackstay-producer"]
-if core["source"] != producer["source"] or not core["source"].startswith("git+"):
-    sys.exit("Jackstay and its producer toolkit must use the same pinned git revision")
-print(core["manifest_path"])
-PYTHON
-)
+jackstay_manifest=$("$repo/scripts/pinned-jackstay.sh")
 jackstay_include=$(dirname "$jackstay_manifest")/include
 # Always optimize the writer dylib, including for a debug helper destination.
 # This separate cache adds a cold Jackstay compile on the first helper/CI build.
@@ -61,15 +50,3 @@ if ! otool -l "$temporary/luchs-webview-capture" | grep -F 'path @executable_pat
     exit 1
 fi
 cp "$temporary/libjackstay.dylib" "$temporary/luchs-webview-capture" "$destination/"
-
-# The existing macOS CI job invokes this script. Validate the shared recovery
-# policy alongside the helper without requiring a new workflow step.
-if [ "${LUCHS_SKIP_NATIVE_TESTS:-0}" != 1 ]; then
-    "$repo/scripts/test-helper.sh"
-    swiftc -O -parse-as-library -I "$jackstay_include" -L "$temporary" -ljackstay \
-        -Xlinker -rpath -Xlinker @executable_path \
-        "$repo/native/macos/WriterImport.swift" \
-        "$repo/native/tests/WriterImportTests.swift" \
-        -o "$temporary/writer-import-tests"
-    "$temporary/writer-import-tests"
-fi

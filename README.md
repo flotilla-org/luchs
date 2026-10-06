@@ -37,9 +37,9 @@ with an `@executable_path` rpath, checks the dylib's `@rpath/libjackstay.dylib`
 install name, and stages both files in the destination directory. The helper
 checks the header/library ABI version at startup and fails on a mismatch.
 
-The helper build also tests native recovery and headless writer imports. Set
-`LUCHS_SKIP_NATIVE_TESTS=1` when building to skip that extra test compilation;
-`scripts/test-helper.sh` runs it separately.
+`scripts/test-helper.sh` runs the native helper tests (socket rights, snapshot
+recovery, page affordances and headless writer imports) on macOS; CI runs it
+after the helper build.
 
 The helper and `libjackstay.dylib` must sit beside the `luchs` executable.
 `--helper PATH` overrides its location, including for fake helpers on Linux.
