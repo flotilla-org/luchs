@@ -86,7 +86,7 @@ impl NativeCapture {
         let pending = self
             .helper
             .send_json_command(
-                serde_json::json!({"type":"draw", "slot":slot.slot,
+                serde_json::json!({"type":"draw", "arena_scope":slot.arena_scope, "slot":slot.slot,
             "generation":slot.generation, "width":size.0, "height":size.1, "stride":size.0 * 4}),
                 TIMEOUT,
             )
@@ -144,6 +144,123 @@ fn request_frame(helper: &mut NativeCapture) -> luchs::protocol::Frame {
         assert!(Instant::now() < deadline, "no native frame");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+#[ignore = "requires built Swift helper and a live macOS desktop"]
+fn native_writer_rejects_stale_and_foreign_slots_after_reexport() {
+    use luchs::protocol::AckOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let html = dir.path().join("page.html");
+    page(&html, "red");
+    let renderer =
+        std::path::Path::new(env!("CARGO_BIN_EXE_luchs")).with_file_name("luchs-webview-capture");
+    let helper = Helper::spawn(
+        Command::new(renderer)
+            .arg(html)
+            .args(["32", "32", "0", "15"]),
+    )
+    .unwrap();
+    let mut helper = NativeCapture::new(helper, 32, 32);
+    assert_eq!(&request_frame(&mut helper).pixels[..4], &[0, 0, 255, 255]);
+    let reservation = helper.arena.reserve().unwrap().unwrap();
+    let slot = reservation.slot();
+    let mut valid = serde_json::json!({"type":"draw", "arena_scope":slot.arena_scope,
+        "generation":slot.generation, "slot":slot.slot, "width":32, "height":32, "stride":128});
+    // Exercise validation after a context has been cached for this slot too.
+    assert_eq!(
+        helper
+            .send_json_command(valid.clone(), TIMEOUT)
+            .unwrap()
+            .wait_ack()
+            .unwrap()
+            .outcome,
+        AckOutcome::Executed
+    );
+    for field in ["generation", "arena_scope", "slot"] {
+        let mut invalid = valid.clone();
+        match field {
+            "generation" => invalid[field] = (slot.generation + 1).into(),
+            "arena_scope" => {
+                let mut foreign = slot.arena_scope;
+                foreign[0] ^= 1;
+                invalid[field] = serde_json::json!(foreign);
+            }
+            _ => invalid[field] = u32::MAX.into(),
+        }
+        assert_eq!(
+            helper
+                .send_json_command(invalid, TIMEOUT)
+                .unwrap()
+                .wait_ack()
+                .unwrap()
+                .outcome,
+            AckOutcome::Failed,
+            "{field}"
+        );
+    }
+    helper.arena.abandon(reservation).unwrap();
+    assert_eq!(
+        helper
+            .send_json_command(
+                serde_json::json!({"type":"resize",
+        "width":48,"height":48,"scale":1}),
+                TIMEOUT
+            )
+            .unwrap()
+            .wait(),
+        CommandOutcome::Executed
+    );
+    // NativeCapture installs the replacement while the old export is retained.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(frame) = helper.capture((48, 48)) {
+            assert_eq!(&frame.pixels[..4], &[0, 0, 255, 255]);
+            break;
+        }
+        assert!(Instant::now() < deadline, "no resized native frame");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    valid["width"] = 48.into();
+    valid["height"] = 48.into();
+    valid["stride"] = 192.into();
+    assert_eq!(
+        helper
+            .send_json_command(valid, TIMEOUT)
+            .unwrap()
+            .wait_ack()
+            .unwrap()
+            .outcome,
+        AckOutcome::Failed
+    );
+    assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Executed);
+    let generation = helper.export.as_ref().unwrap().descriptor().generation;
+    assert_ne!(generation, slot.generation);
+    assert_eq!(
+        helper
+            .send_json_command(
+                serde_json::json!({"type":"arena_release",
+        "generation":slot.generation}),
+                TIMEOUT
+            )
+            .unwrap()
+            .wait(),
+        CommandOutcome::Failed(Some("stale arena release".into()))
+    );
+    assert_eq!(
+        helper
+            .send_json_command(
+                serde_json::json!({"type":"arena_release",
+        "generation":generation}),
+                TIMEOUT
+            )
+            .unwrap()
+            .wait(),
+        CommandOutcome::Executed
+    );
+    helper.export = None;
+    assert_eq!(helper.command("ping", TIMEOUT), CommandOutcome::Executed);
+    assert_eq!(&request_frame(&mut helper).pixels[..4], &[0, 0, 255, 255]);
 }
 
 #[test]

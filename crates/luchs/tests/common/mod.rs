@@ -95,6 +95,7 @@ def ack(cmd, outcome='executed', detail=None, capture=None, pixels=None):
         obj.update(generation=cmd['generation'], slot=cmd['slot'])
         if capture and capture['published']:
             assert cmd['generation'] == layout['generation']
+            assert cmd['arena_scope'] == layout['arena_scope']
             count = cmd['stride'] * cmd['height']
             if pixels is None: pixels = b'rgba' * (count // 4)
             assert len(pixels) == count

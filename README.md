@@ -27,15 +27,22 @@ Use Rust/Cargo and, on macOS, Xcode Command Line Tools with `swiftc`:
 cargo build --release --locked
 scripts/build-helper.sh target/release
 install -d "$HOME/.local/bin"
-install target/release/luchs target/release/luchs-webview-capture "$HOME/.local/bin/"
+install target/release/luchs target/release/luchs-webview-capture \
+    target/release/libjackstay.dylib "$HOME/.local/bin/"
 ```
+
+The helper build resolves Jackstay from Cargo's locked git dependency and builds
+that revision's `libjackstay.dylib` and Swift module headers. It links the helper
+with an `@executable_path` rpath, checks the dylib's `@rpath/libjackstay.dylib`
+install name, and stages both files in the destination directory. The helper
+checks the header/library ABI version at startup and fails on a mismatch.
 
 The helper build also validates its native recovery policy. Set
 `LUCHS_SKIP_NATIVE_TESTS=1` when building to skip that extra test compilation;
 `scripts/test-helper.sh` runs it separately.
 
-The helper must sit beside the `luchs` executable. `--helper PATH` overrides its
-location, including for fake helpers on Linux. The Rust workspace builds and
+The helper and `libjackstay.dylib` must sit beside the `luchs` executable.
+`--helper PATH` overrides its location, including for fake helpers on Linux. The Rust workspace builds and
 tests on macOS and Linux without WebKit; only `scripts/build-helper.sh` compiles
 the Swift renderer. Linux has no real renderer yet.
 
