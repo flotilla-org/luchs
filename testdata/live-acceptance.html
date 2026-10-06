@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Luchs live acceptance</title>
+<style>
+  html, body { margin: 0; background: #18212b; color: #eef3f7; font: 18px system-ui; }
+  main { padding: 24px; }
+  a { color: #83caff; }
+  input, button { font: inherit; padding: 8px; }
+  .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 24px; }
+  article { padding: 24px; background: #29435c; min-height: 120px; }
+  .long { height: 2200px; background: repeating-linear-gradient(#29435c 0 2px, transparent 2px 100px); }
+  @media (max-width: 650px) { .cards { grid-template-columns: 1fr; } }
+</style>
+<main>
+  <h1>Live acceptance</h1>
+  <p><a href="affordances-next.html">Open the second page</a></p>
+  <p id="viewport"></p>
+  <input aria-label="Acceptance input" placeholder="Text cursor">
+  <button id="title">Change title</button>
+  <!-- Optional manual scroll check; not exercised in the recorded acceptance. -->
+  <button id="scroll">Scroll to 700</button>
+  <p id="clock">Timer 0</p>
+  <section class="cards"><article>First card</article><article>Second card</article></section>
+  <div class="long"></div>
+</main>
+<script>
+  const viewport = document.getElementById('viewport');
+  const clock = document.getElementById('clock');
+  function report() {
+    const columns = getComputedStyle(document.querySelector('.cards')).gridTemplateColumns.split(' ').length;
+    const status = `${innerWidth}x${innerHeight} columns=${columns}`;
+    viewport.textContent = status;
+    console.log('viewport ' + status);
+  }
+  addEventListener('load', report);
+  addEventListener('resize', report);
+  addEventListener('scroll', () => console.log(`scroll x=${scrollX} y=${scrollY}`));
+  document.querySelector('input').addEventListener('input', event => console.log('input ' + event.target.value));
+  document.querySelector('#title').addEventListener('click', () => { document.title = 'Title changed by the page'; console.log('title changed'); });
+  document.querySelector('#scroll').addEventListener('click', () => scrollTo(0, 700));
+  let seconds = 0;
+  setInterval(() => { clock.textContent = 'Timer ' + (++seconds); console.log('timer ' + seconds); }, 1000);
+</script>
