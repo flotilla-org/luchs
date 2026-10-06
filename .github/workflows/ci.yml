@@ -28,3 +28,5 @@ jobs:
       - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
       - if: runner.os == 'macOS'
         run: scripts/build-helper.sh
+      - if: runner.os == 'macOS'
+        run: scripts/test-helper.sh
