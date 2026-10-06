@@ -1042,7 +1042,7 @@ Hands-on run of the [#17](https://github.com/flotilla-org/luchs/issues/17)
 checklist, plus the physical thumb drag that
 [Jackstay #87](https://github.com/flotilla-org/jackstay/issues/87) needed. Same
 macOS 26.6 (25G72), arm64, Retina desktop and SDL 2.32.70 as the section above.
-Devices were a Logitech MX Master 2S (ratchet and free-spin wheel, thumb wheel)
+Devices were a Logitech MX Master 2 (ratchet and free-spin wheel, thumb wheel)
 and the built-in trackpad. No source was changed.
 
 | Component | Tested revision |
