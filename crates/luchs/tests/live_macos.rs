@@ -1,9 +1,11 @@
 //! Requires scripts/build-helper.sh and a logged-in macOS desktop.
 #![cfg(target_os = "macos")]
+mod common;
 
+use common::{Want, connect_tracks};
 use jackstay::{
     acquisition::{arena::AcquireOutcome, socket::CpuSetupClient},
-    bootstrap::{ChannelRequest, InputRequest, connect_v2},
+    input::Mode,
     local::Stream,
 };
 use luchs::helper::{CommandOutcome, Helper};
@@ -317,12 +319,12 @@ fn native_ping_reload_and_watch() {
     BufReader::new(process.0.stdout.take().unwrap())
         .read_line(&mut endpoint)
         .unwrap();
-    let connected = connect_v2(
+    let connected = connect_tracks(
         Stream::connect(endpoint.trim()).unwrap(),
-        InputRequest::None,
-        ChannelRequest::None,
-    )
-    .unwrap();
+        Want::No,
+        Mode::Cooperative,
+        Want::No,
+    );
     // SAFETY: the child CLI is the conforming sole producer of this grant.
     let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
     let consumer = setup.attach(1).unwrap();
@@ -799,6 +801,9 @@ const scroller=document.querySelector('#scroll'); scroller.addEventListener('scr
                 y,
                 unit,
                 position: Position { y: 150.25, ..p },
+                phase: None,
+                momentum_phase: None,
+                inverted_from_device: None,
             }),
         );
     }

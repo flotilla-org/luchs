@@ -1,9 +1,11 @@
-//! Production WebKit + required v2 affordances. SDL gestures are recorded separately.
+//! Production WebKit + a required affordances track. SDL gestures are recorded separately.
 #![cfg(target_os = "macos")]
+mod common;
+use common::{Want, connect_tracks};
 use jackstay::{
     acquisition::socket::CpuSetupClient,
     affordances::{Domain, Event, Host, Snapshot, Verb},
-    bootstrap::{ChannelRequest, InputRequest, connect_v2},
+    input::Mode,
     local::Stream,
 };
 use serde_json::{Value, json};
@@ -70,12 +72,12 @@ fn native_page_state_navigation_scroll_and_rejection_log() {
     BufReader::new(process.0.stdout.take().unwrap())
         .read_line(&mut endpoint)
         .unwrap();
-    let connected = connect_v2(
+    let connected = connect_tracks(
         Stream::connect(endpoint.trim()).unwrap(),
-        InputRequest::None,
-        ChannelRequest::Required,
-    )
-    .unwrap();
+        Want::No,
+        Mode::Cooperative,
+        Want::Required,
+    );
     let host = connected.affordances.unwrap();
     // SAFETY: the production source owns the arena; this test keeps grants private.
     let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
@@ -197,7 +199,7 @@ fn native_page_state_navigation_scroll_and_rejection_log() {
 #[test]
 #[ignore = "requires built Swift helper and live macOS desktop"]
 fn native_input_and_affordances_share_one_required_host() {
-    use jackstay::input::{Action, Event as InputEvent, Mode, Outcome, Position, Status};
+    use jackstay::input::{Action, Event as InputEvent, Outcome, Position, Status};
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("input-and-state.html");
     let second = dir.path().join("next.html");
@@ -219,12 +221,12 @@ fn native_input_and_affordances_share_one_required_host() {
     BufReader::new(process.0.stdout.take().unwrap())
         .read_line(&mut endpoint)
         .unwrap();
-    let connected = connect_v2(
+    let connected = connect_tracks(
         Stream::connect(endpoint.trim()).unwrap(),
-        InputRequest::Required(Mode::SourceText),
-        ChannelRequest::Required,
-    )
-    .unwrap();
+        Want::Required,
+        Mode::SourceText,
+        Want::Required,
+    );
     let host = connected.affordances.unwrap();
     let input = connected.input.unwrap();
     // SAFETY: the production source owns the arena; this test keeps grants private.
@@ -321,7 +323,7 @@ fn native_input_and_affordances_share_one_required_host() {
 #[test]
 #[ignore = "requires built Swift helper and live macOS desktop"]
 fn native_host_motion_delivers_trusted_dom_hover() {
-    use jackstay::input::{Action, Event as InputEvent, Mode, Outcome, Position, Status};
+    use jackstay::input::{Action, Event as InputEvent, Outcome, Position, Status};
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("hover.html");
     std::fs::write(&first, r##"<!doctype html><title>Hover probe</title>
@@ -342,12 +344,12 @@ fn native_host_motion_delivers_trusted_dom_hover() {
     BufReader::new(process.0.stdout.take().unwrap())
         .read_line(&mut endpoint)
         .unwrap();
-    let connected = connect_v2(
+    let connected = connect_tracks(
         Stream::connect(endpoint.trim()).unwrap(),
-        InputRequest::Required(Mode::SourceText),
-        ChannelRequest::Required,
-    )
-    .unwrap();
+        Want::Required,
+        Mode::SourceText,
+        Want::Required,
+    );
     let host = connected.affordances.unwrap();
     let input = connected.input.unwrap();
     // SAFETY: the production source owns the arena; this test keeps grants private.

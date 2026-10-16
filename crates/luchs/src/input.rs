@@ -79,6 +79,7 @@ impl Executor {
                 y,
                 unit,
                 position: p,
+                ..
             } => {
                 let factor = match unit {
                     ScrollUnit::Pixel => 1.0,

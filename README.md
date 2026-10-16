@@ -2,8 +2,8 @@
 
 Luchs is a page viewer that publishes frames as a Jackstay source. Its Rust core
 owns the CLI, renderer process and CPU producer; the first renderer is the
-macOS `WKWebView` helper extracted from Katzensteg. A bootstrap v2 Jackstay
-consumer can present the page. SDL is a reference consumer, not Luchs's primary presenter.
+macOS `WKWebView` helper extracted from Katzensteg. A Jackstay consumer that
+speaks the track handshake can present the page. SDL is a reference consumer, not Luchs's primary presenter.
 
 This repository implements the frame-producing slice of
 [Jackstay's split](https://github.com/flotilla-org/jackstay/issues/32).
@@ -60,22 +60,25 @@ luchs --endpoint=my-web-page https://example.com
 ```
 
 Luchs prints its source socket path on stdout and diagnostics on stderr. Connect
-the SDL viewer by the configured endpoint name, using the pinned ABI 0.13 build:
+the SDL viewer by the configured endpoint name, using the pinned ABI 0.17 build:
 
 ```sh
 capture-viewer-sdl --source-endpoint my-page --typing cooperative --affordances optional
 ```
 
-Bootstrap v2 is required. Build the SDL viewer against the exact Jackstay revision
-pinned here; use `--source-endpoint` for its v2 path. Add `--observe` for frames
-without input, or choose `--typing text` / `--typing physical` to exercise those
-modes. V1-only consumers cannot connect.
-Rust consumers use `jackstay::bootstrap::connect_v2` with optional or no controls.
+Jackstay's v3 track handshake is required. Luchs offers one video, one input and
+one affordances track (`jackstay_producer::{VIDEO, INPUT, AFFORDANCES}`); a
+consumer selects video and any of the others. Build the SDL viewer against the
+exact Jackstay revision pinned here and use `--source-endpoint`. Add `--observe`
+for frames without input, or choose `--typing text` / `--typing physical` to
+exercise those modes. Consumers on bootstrap v1 or v2 cannot connect.
+Rust consumers use `jackstay::handshake::connect` and then `select`. Frames carry
+host time, stamped when they are published.
 
 The endpoint lives in Jackstay's private per-user runtime directory and the
 socket mode is `0600`. Its default name is `luchs-<pid>`; `--endpoint` chooses a
 name, not an arbitrary socket path. Jackstay checks peer ownership and Luchs
-uses `jackstay_producer::Builder` and bootstrap v2 before CPU setup.
+uses `jackstay_producer::Builder` and the track handshake before CPU setup.
 Consumers may join, leave, or die while the renderer keeps running. The producer
 has eight resources, one retained frame, one producer reserve and at most three
 arena incarnations, with `max_connections=16` bounding simultaneous toolkit

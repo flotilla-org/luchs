@@ -1,8 +1,8 @@
 mod common;
+use common::{Want, connect_tracks};
 use jackstay::{
     acquisition::{arena::AcquireOutcome, socket::CpuSetupClient},
     affordances::{Presentation, Size},
-    bootstrap::{ChannelRequest, InputRequest, connect_v2},
     input::{Event, Mode},
     local::Stream,
 };
@@ -128,12 +128,12 @@ while True:
     BufReader::new(process.0.stdout.take().unwrap())
         .read_line(&mut path)
         .unwrap();
-    let connected = connect_v2(
+    let connected = connect_tracks(
         Stream::connect(path.trim()).unwrap(),
-        InputRequest::Required(Mode::Cooperative),
-        ChannelRequest::Required,
-    )
-    .unwrap();
+        Want::Required,
+        Mode::Cooperative,
+        Want::Required,
+    );
     let host = connected.affordances.unwrap();
     let input = connected.input.unwrap();
     let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };

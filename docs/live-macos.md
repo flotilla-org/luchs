@@ -1077,3 +1077,19 @@ once #88 is fixed.
 During the run, enlarging the viewer window made the viewer exit cleanly after
 `input send: 13` (`FT_STATUS_STALE`). The Luchs source survived and accepted a
 new viewer. Filed as [Jackstay #89](https://github.com/flotilla-org/jackstay/issues/89).
+
+## Track handshake v3 migration (2026-10-16)
+
+Jackstay is now pinned to `bdf1d39ee2d95fa663820d4eaed6b0bcfe8345ac` (ABI 0.17),
+which replaces bootstrap v2 with the v3 track handshake (Jackstay #119). Luchs
+publishes through `jackstay_producer`, which offers video, input and affordances
+tracks. Frames no longer declare `MediaTime`: the timestamp is left zero and
+publishing stamps host time (Jackstay #120). Scroll input gains phase, momentum
+and device-inversion fields; Luchs ignores them for now.
+
+On Linux, the locked workspace build, 66 ordinary Rust tests, denied-warning
+Clippy (also for `aarch64-apple-darwin`) and Rust 1.98 formatting passed. The
+helper build and the live macOS checks are pending: present
+`testdata/interactive.html` through the SDL viewer at this revision on a live
+macOS desktop, run the `live_macos*` suites, and append the results here.
+

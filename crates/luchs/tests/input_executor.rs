@@ -117,7 +117,10 @@ cmd=command(); assert cmd['type']=='text' and not cmd['cooperative']; ack(cmd)
                 x: 0.0,
                 y,
                 unit,
-                position: position()
+                position: position(),
+                phase: None,
+                momentum_phase: None,
+                inverted_from_device: None,
             }))),
             Outcome::Executed
         );
@@ -250,6 +253,9 @@ fn scroll(x: f64, y: f64, unit: ScrollUnit) -> Work {
         y,
         unit,
         position: position(),
+        phase: None,
+        momentum_phase: None,
+        inverted_from_device: None,
     }))
 }
 
