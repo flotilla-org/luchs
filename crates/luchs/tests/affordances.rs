@@ -1,9 +1,10 @@
 mod common;
 
+use common::{Want, connect_tracks};
 use jackstay::{
     acquisition::socket::CpuSetupClient,
     affordances::{Domain, Event, Host, Snapshot, Verb},
-    bootstrap::{ChannelRequest, InputRequest, connect_v2},
+    input::Mode,
     local::Stream,
 };
 use luchs::{
@@ -316,12 +317,12 @@ while True:
     BufReader::new(process.0.stdout.take().unwrap())
         .read_line(&mut path)
         .unwrap();
-    let connected = connect_v2(
+    let connected = connect_tracks(
         Stream::connect(path.trim()).unwrap(),
-        InputRequest::None,
-        ChannelRequest::Required,
-    )
-    .unwrap();
+        Want::No,
+        Mode::Cooperative,
+        Want::Required,
+    );
     let host = connected.affordances.unwrap();
     // SAFETY: this test owns a conforming source and the received arena mappings.
     let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
@@ -446,12 +447,12 @@ fn helper_replacement_withdraws_all_domains_before_fresh_state() {
         .unwrap()
     };
     let helper = spawn("old");
-    let connected = connect_v2(
+    let connected = connect_tracks(
         Stream::connect(&path).unwrap(),
-        InputRequest::None,
-        ChannelRequest::Required,
-    )
-    .unwrap();
+        Want::No,
+        Mode::Cooperative,
+        Want::Required,
+    );
     let host = connected.affordances.unwrap();
     snapshot(
         &host,

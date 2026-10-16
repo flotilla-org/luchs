@@ -5,9 +5,11 @@ use jackstay::{
         arena::{AcquireOutcome, ArenaConsumer},
         socket::CpuSetupClient,
     },
-    bootstrap::{ChannelRequest, InputRequest, connect_v2},
+    handshake::{self, Selected},
+    input::Mode,
     local::Stream,
 };
+use jackstay_producer::VIDEO;
 use std::{process::Command, sync::atomic::AtomicU32};
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -43,12 +45,15 @@ fn reply(draw: &Draw) -> Ack {
     }
 }
 fn connect(path: &str) -> (CpuSetupClient, ArenaConsumer) {
-    let connected = connect_v2(
-        Stream::connect(path).unwrap(),
-        InputRequest::None,
-        ChannelRequest::None,
-    )
-    .unwrap();
+    let video = Selected {
+        id: VIDEO,
+        required: true,
+        write: false,
+    };
+    let connected = handshake::connect(Stream::connect(path).unwrap())
+        .unwrap()
+        .select(&[video], Mode::Cooperative)
+        .unwrap();
     // SAFETY: this test owns its conforming source and grant.
     let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
     let consumer = setup.attach(2).unwrap();

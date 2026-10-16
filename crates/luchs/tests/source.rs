@@ -6,12 +6,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use common::{Want, connect_tracks};
 use jackstay::{
     acquisition::{
         arena::{AcquireOutcome, ArenaConsumer, FrameLease},
         socket::CpuSetupClient,
     },
-    bootstrap::{self, ChannelRequest, InputRequest},
+    input::Mode,
     local::Stream,
 };
 use luchs::{
@@ -38,8 +39,7 @@ fn connect(path: &str) -> (CpuSetupClient, ArenaConsumer) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let connected =
-        bootstrap::connect_v2(stream, InputRequest::None, ChannelRequest::None).unwrap();
+    let connected = connect_tracks(stream, Want::No, Mode::Cooperative, Want::No);
     assert!(connected.input.is_none());
     assert!(connected.input_error.is_none());
     // SAFETY: the test source is a conforming sole producer. This process owns
@@ -96,7 +96,8 @@ fn private_bootstrap_source_publishes_bgra_and_reconfigures() {
     assert_eq!(old.descriptor().pixel_format, 1);
     // Katzensteg rejects CPU frames without the copy-complete sync contract.
     assert_eq!(old.descriptor().sync_kind, 1);
-    assert_eq!(old.descriptor().clock_domain, 2);
+    // Publishing stamps host time when the source leaves the timestamp zero.
+    assert_ne!(old.descriptor().timestamp_ns, 0);
     assert_eq!(old.descriptor().damage_kind, 1);
     let old_generation = old.descriptor().config_generation;
     source.publish(pixels(2)).unwrap();
@@ -187,18 +188,14 @@ fn consumer_process_death_releases_reservation() {
 
 #[test]
 fn all_typing_modes_advertise_native_families_and_preserve_media() {
-    for mode in [
-        jackstay::input::Mode::Physical,
-        jackstay::input::Mode::SourceText,
-        jackstay::input::Mode::Cooperative,
-    ] {
+    for mode in [Mode::Physical, Mode::SourceText, Mode::Cooperative] {
         let (mut source, path) = source();
-        let connected = bootstrap::connect_v2(
+        let connected = connect_tracks(
             Stream::connect(&path).unwrap(),
-            InputRequest::Optional(mode),
-            ChannelRequest::Optional,
-        )
-        .unwrap();
+            Want::Optional,
+            mode,
+            Want::Optional,
+        );
         assert!(connected.affordances.is_some());
         let input = connected.input.as_ref().unwrap();
         assert_eq!(
@@ -243,12 +240,12 @@ cmd=command(); assert cmd['type']=='cleanup'; ack(cmd)
     .unwrap();
     let (source, path) = source();
     source.attach_input(&helper);
-    let connected = bootstrap::connect_v2(
+    let connected = connect_tracks(
         Stream::connect(&path).unwrap(),
-        InputRequest::Required(jackstay::input::Mode::Physical),
-        ChannelRequest::None,
-    )
-    .unwrap();
+        Want::Required,
+        Mode::Physical,
+        Want::No,
+    );
     let input = connected.input.as_ref().unwrap();
     let sequence = input
         .send(jackstay::input::Event::Key {

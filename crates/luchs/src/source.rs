@@ -11,7 +11,7 @@ use jackstay::{
     acquisition::arena::{ArenaConfig, FrameDescriptor},
     input::{Config, Outcome, Work},
     local::{Endpoint, Scope, Transport},
-    model::{ClockDomain, DamageKind, FrameSyncKind, PixelFormat},
+    model::{DamageKind, FrameSyncKind, PixelFormat},
 };
 use jackstay_producer::{Builder, Producer};
 use std::{
@@ -87,7 +87,6 @@ pub struct Source {
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     source: jackstay_producer::Source,
     input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
-    started: Instant,
     sequence: u64,
     mapping: Option<crate::arena_capture::Mapping>,
     logical_size: Arc<Mutex<(f64, f64)>>,
@@ -169,7 +168,6 @@ impl Source {
                 input_sender,
                 presentation,
                 source,
-                started: Instant::now(),
                 sequence: 0,
                 mapping: None,
                 logical_size,
@@ -220,13 +218,11 @@ impl Source {
                     slot,
                     FrameDescriptor {
                         sequence: self.sequence,
-                        timestamp_ns: self.started.elapsed().as_nanos() as u64,
                         width: frame.header.width,
                         height: frame.header.height,
                         stride: frame.header.stride,
                         payload_len: frame.pixels.len() as u64,
                         pixel_format: PixelFormat::Bgra8Unorm as u32,
-                        clock_domain: ClockDomain::MediaTime as u32,
                         sync_kind: FrameSyncKind::CpuCopyComplete as u32,
                         damage_kind: DamageKind::FullFrame as u32,
                         ..FrameDescriptor::default()
@@ -331,13 +327,11 @@ impl Source {
                     reservation,
                     FrameDescriptor {
                         sequence: self.sequence,
-                        timestamp_ns: self.started.elapsed().as_nanos() as u64,
                         width: draw.header.width,
                         height: draw.header.height,
                         stride: draw.header.stride,
                         payload_len: draw.header.len as u64,
                         pixel_format: PixelFormat::Bgra8Unorm as u32,
-                        clock_domain: ClockDomain::MediaTime as u32,
                         sync_kind: FrameSyncKind::CpuCopyComplete as u32,
                         damage_kind: DamageKind::FullFrame as u32,
                         ..FrameDescriptor::default()

@@ -8,6 +8,8 @@ use std::{
 };
 
 use clap::Parser;
+use common::{Want, connect_tracks};
+use jackstay::{input::Mode, local::Stream};
 use luchs::cli::Cli;
 
 #[test]
@@ -55,7 +57,7 @@ fn sigterm_cleanup(optional_controls: bool) {
     let log = dir.path().join("console");
     let pid = dir.path().join("helper-pid");
     std::fs::write(&page, "old page").unwrap();
-    // Fake only the renderer subprocess boundary; bootstrap and media are real.
+    // Fake only the renderer subprocess boundary; the handshake and media are real.
     std::fs::write(
         &helper,
         format!(
@@ -112,17 +114,17 @@ while True:
         std::thread::sleep(Duration::from_millis(10));
     }
     let logged = std::fs::read_to_string(&log).unwrap();
-    // SIGTERM must stop with a live v2 consumer and reap the helper.
-    let connected = jackstay::bootstrap::connect_v2(
-        jackstay::local::Stream::connect(endpoint.trim()).unwrap(),
+    // SIGTERM must stop with a live consumer and reap the helper.
+    let connected = connect_tracks(
+        Stream::connect(endpoint.trim()).unwrap(),
         if optional_controls {
-            jackstay::bootstrap::InputRequest::Optional(jackstay::input::Mode::Cooperative)
+            Want::Optional
         } else {
-            jackstay::bootstrap::InputRequest::None
+            Want::No
         },
-        jackstay::bootstrap::ChannelRequest::Optional,
-    )
-    .unwrap();
+        Mode::Cooperative,
+        Want::Optional,
+    );
     if optional_controls {
         let input = connected.input.as_ref().unwrap();
         assert!(
@@ -503,12 +505,12 @@ fn helper_crash_during_input_preserves_renderer_error_and_removes_endpoint() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let connected = jackstay::bootstrap::connect_v2(
-        jackstay::local::Stream::connect(endpoint.trim()).unwrap(),
-        jackstay::bootstrap::InputRequest::Required(jackstay::input::Mode::Physical),
-        jackstay::bootstrap::ChannelRequest::None,
-    )
-    .unwrap();
+    let connected = connect_tracks(
+        Stream::connect(endpoint.trim()).unwrap(),
+        Want::Required,
+        Mode::Physical,
+        Want::No,
+    );
     let input = connected.input.as_ref().unwrap();
     input
         .send(jackstay::input::Event::Key {

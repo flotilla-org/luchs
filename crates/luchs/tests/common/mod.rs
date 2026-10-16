@@ -1,5 +1,11 @@
 #![allow(dead_code)]
 
+use jackstay::{
+    handshake::{self, Connected, Selected},
+    input::Mode,
+    local::Stream,
+};
+use jackstay_producer::{AFFORDANCES, INPUT, VIDEO};
 use serde_json::{Value, json};
 
 pub fn frame(width: u32, pixels: &[u8]) -> Vec<u8> {
@@ -111,3 +117,33 @@ def frame():
     assert cmd['type'] == 'draw'
     ack(cmd, capture={'published':True, 'snapshot_ns':100, 'publish_ns':100})
 "#;
+
+/// Whether a consumer asks for a track, and whether the handshake must admit it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    No,
+    Optional,
+    Required,
+}
+
+/// Selects Luchs's video track, plus input and affordances as asked.
+pub fn connect_tracks(stream: Stream, input: Want, mode: Mode, affordances: Want) -> Connected {
+    let mut selection = vec![Selected {
+        id: VIDEO,
+        required: true,
+        write: false,
+    }];
+    for (id, want, write) in [(INPUT, input, true), (AFFORDANCES, affordances, false)] {
+        if want != Want::No {
+            selection.push(Selected {
+                id,
+                required: want == Want::Required,
+                write,
+            });
+        }
+    }
+    handshake::connect(stream)
+        .unwrap()
+        .select(&selection, mode)
+        .unwrap()
+}
