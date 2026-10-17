@@ -24,6 +24,11 @@ swiftc -O -parse-as-library \
     -o "$temporary/snapshot-recovery-tests"
 "$temporary/snapshot-recovery-tests"
 swiftc -O -parse-as-library \
+    "$repo/native/macos/SnapshotChanges.swift" \
+    "$repo/native/tests/SnapshotChangesTests.swift" \
+    -o "$temporary/snapshot-changes-tests"
+"$temporary/snapshot-changes-tests"
+swiftc -O -parse-as-library \
     "$repo/native/macos/PageAffordances.swift" \
     "$repo/native/tests/PageAffordancesTests.swift" \
     -o "$temporary/page-affordances-tests"

@@ -320,42 +320,47 @@ A successful capture ack adds an optional report without changing its outcome:
 ```
 
 `published` means the helper completed a changed draw. Snapshot time measures
-WebKit API latency; publish time measures drawing and hashing through completion
-of the slot write. It excludes the small JSON acknowledgement and Rust commit.
-Skipped frames report zero publish time. Hidden/loading attempts have no report.
-`--stats` reports completed snapshots, Jackstay publications, unchanged skips,
-the mean times and `copies_per_frame=1`. The copy count describes the explicit
-full-frame destination writes in this path; it excludes WebKit internals and
-hashing reads. Orderly shutdown allows up to one second to complete a pending
+WebKit API latency; publish time measures drawing and exact change detection
+through completion of the slot write. It excludes the small JSON acknowledgement
+and Rust commit. Jackstay frame timestamps retain the capture-request time
+(before helper IPC), not WebKit's unknown internal paint time. They use Jackstay's
+host clock and include helper queueing in frame-age measurements. Skipped frames report zero publish time. Hidden/loading attempts
+have no report. `--stats` reports completed snapshots, Jackstay publications,
+unchanged skips, mean times and `copies_per_frame=2`. For a changed frame the
+helper draws into the shared arena and copies into an owned previous image;
+WebKit internals and comparison reads are excluded. Rust commits the shared slot
+without copying. Orderly shutdown allows up to one second to complete a pending
 draw, then acknowledges unmap while keeping the helper alive for native input
 cleanup. Helper termination follows toolkit shutdown.
 
-The helper compares an FNV-1a fingerprint of dimensions and native pixels with
-its last changed draw. A match acknowledges unchanged and writes no frame header.
-Rust accepts that report and abandons the slot; it performs no second pixel scan.
+The helper compares dimensions and native pixels exactly with its last changed
+draw, using libc comparison/copy operations rather than a serial full-frame hash.
+The previous image is privately owned, bounded to the 64 MiB frame limit, and
+never borrows an arena slot after acknowledgement. Equal pixels acknowledge
+unchanged with no frame header. Rust abandons that slot without a second scan.
+
 After one second without a changed frame or wake, captures back off from `--fps`
-(default 30) to 2 fps. Deadlines run from snapshot completion, so the effective
-frame rate is lower than `--fps` by snapshot and publish latency. The Rust loop
-sleeps until the next capture or 250 ms watch/signal deadline; acks, page activity
-and presentation callbacks interrupt its condition-variable wait immediately.
-A changed frame restores full rate. Reload and presentation
-commands wake capture; input, navigation and presentation commands also report a wake; arena setup
-and release do not.
-Page mutations, editing, selection, focus, scroll and resize report
-`{"capture_changed":true}` on the existing state tag. Active CSS animations report
-activity from a page rAF probe started by animation/transition events or DOM
-mutations. The probe stops when no animation is running, so static pages have
-no continuous animation-probe work. The
-caret updates from page events, with a deferred rAF after native default actions.
-Canvas/video changes without a DOM or animation signal are discovered by the idle
-probe, within its 500 ms interval, then restore full rate.
+(default 30) to 2 fps. Active capture deadlines run from the actual capture start,
+so work fits within the interval rather than adding another interval after
+completion. An overrun admits one fresh capture, without queued catch-up work.
+Activity wakes coalesce and cannot bypass `--fps`. Rust sleeps until the capture
+or 250 ms watch/signal deadline; acks and native events interrupt the wait.
+
+Native input, navigation, reload and presentation commands report
+`{"capture_changed":true}` on the existing state tag; arena setup and release do
+not. Navigation completion and popup closure also wake capture. No activity
+script, MutationObserver or animation enumeration is injected for scheduling.
+The idle snapshot discovers autonomous CSS, WAAPI, canvas and video changes
+within its 500 ms interval, plus snapshot time; changed pixels restore full rate.
+The existing caret and cursor/scroll affordance scripts remain independent of
+capture scheduling.
 
 The toolkit's `affordance()` callback forwards host presentation hints. Last
 received hints win; withdrawal or channel closure restores defaults. An oversized
 scale hint is logged and retains the previous scale; its visibility still applies. `visible=false` stops capture requests and
 suppresses queued publications while leaving the WebKit window ordered in, so
 its page clock keeps running. `visible=true` requests an immediate capture and
-invalidates the previous fingerprint so an unchanged image can be presented
+invalidates the previous image comparison so an unchanged image can be presented
 again. `--frames=N` counts committed changed frames; a static page with N greater
 than one can therefore remain running until content or presentation changes.
 

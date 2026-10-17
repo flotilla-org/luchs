@@ -73,7 +73,8 @@ exact Jackstay revision pinned here and use `--source-endpoint`. Add `--observe`
 for frames without input, or choose `--typing text` / `--typing physical` to
 exercise those modes. Consumers on bootstrap v1 or v2 cannot connect.
 Rust consumers use `jackstay::handshake::connect` and then `select`. Frames carry
-host time, stamped when they are published.
+host time: helper frames retain their capture-request timestamp through
+publication, while locally supplied fixture frames are stamped on publication.
 
 The endpoint lives in Jackstay's private per-user runtime directory and the
 socket mode is `0600`. Its default name is `luchs-<pid>`; `--endpoint` chooses a
@@ -108,8 +109,12 @@ copy; socket records contain only commands, acknowledgements and page state.
 A live macOS desktop session is required.
 
 Each snapshot is compared with the previous publication. Unchanged pixels are
-skipped, and capture backs off to 2 fps after one second idle. Commands and page
-activity restore full rate. `visible=false` pauses snapshots while WebKit's window
+skipped, and capture backs off to 2 fps after one second idle. Native input and
+navigation wake capture within the frame limit; autonomous page changes are
+discovered by the 500 ms idle probe. Capture scheduling does not inject a DOM
+activity observer or enumerate animations. Active deadlines run from capture
+start, with one capture in flight and no catch-up queue. Changed pixels restore
+full rate. `visible=false` pauses snapshots while WebKit's window
 stays ordered in; showing it again captures immediately. A `scale` hint requests
 rounded `width * scale` by `height * scale` device pixels and draws them 1:1,
 including Retina and odd fractional sizes. Input coordinates stay logical.

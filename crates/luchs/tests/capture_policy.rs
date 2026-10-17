@@ -16,6 +16,57 @@ use std::{
 };
 
 #[test]
+fn capture_work_does_not_add_another_interval() {
+    let start = Instant::now();
+    let mut policy = CapturePolicy::new(30, start);
+    policy.started(start);
+    policy.completed(true, start + Duration::from_millis(20));
+    assert!(
+        policy.due(start + Duration::from_millis(34)),
+        "20 ms of capture work must fit inside the 33.3 ms period"
+    );
+}
+
+#[test]
+fn activity_coalesces_without_bypassing_the_frame_limit() {
+    let start = Instant::now();
+    let mut policy = CapturePolicy::new(30, start);
+    policy.started(start);
+    for ms in [5, 10, 20] {
+        policy.wake(start + Duration::from_millis(ms));
+        assert!(!policy.due(start + Duration::from_millis(ms)));
+    }
+    policy.completed(true, start + Duration::from_millis(25));
+    assert!(policy.due(start + Duration::from_millis(34)));
+}
+
+#[test]
+fn small_timer_delays_do_not_accumulate_into_a_lower_frame_rate() {
+    let start = Instant::now();
+    let mut policy = CapturePolicy::new(30, start);
+    policy.started(start);
+    policy.completed(true, start + Duration::from_millis(20));
+    // A slightly late wake must retain the cadence's phase.
+    policy.started(start + Duration::from_millis(36));
+    policy.completed(true, start + Duration::from_millis(56));
+    assert!(policy.due(start + Duration::from_millis(67)));
+}
+
+#[test]
+fn overrun_starts_one_fresh_capture_without_a_catch_up_burst() {
+    let start = Instant::now();
+    let mut policy = CapturePolicy::new(30, start);
+    policy.started(start);
+    let finished = start + Duration::from_millis(90);
+    policy.completed(true, finished);
+    assert!(policy.due(finished));
+    policy.started(finished);
+    policy.completed(true, finished + Duration::from_millis(1));
+    assert!(!policy.due(finished + Duration::from_millis(2)));
+    assert!(policy.due(finished + Duration::from_millis(34)));
+}
+
+#[test]
 fn exact_idle_threshold_and_command_wake() {
     let now = Instant::now();
     let mut policy = CapturePolicy::new(30, now);

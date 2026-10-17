@@ -327,6 +327,7 @@ impl Source {
                     reservation,
                     FrameDescriptor {
                         sequence: self.sequence,
+                        timestamp_ns: draw.timestamp_ns,
                         width: draw.header.width,
                         height: draw.header.height,
                         stride: draw.header.stride,
@@ -394,10 +395,11 @@ impl CaptureStats {
         }
     }
     fn log(&self, received: u64) {
-        // One explicit destination write is a path invariant, not a runtime
-        // hardware counter; kernel/WebKit internals and hashing reads are excluded.
+        // Two explicit destination writes (arena and previous image) are a path
+        // invariant for changed frames, not a runtime
+        // hardware counter; kernel/WebKit internals and comparison reads are excluded.
         eprintln!(
-            "luchs: stats snapshots={} published={received} skipped={} copies_per_frame=1 mean_snapshot_ms={:.3} mean_publish_ms={:.3}",
+            "luchs: stats snapshots={} published={received} skipped={} copies_per_frame=2 mean_snapshot_ms={:.3} mean_publish_ms={:.3}",
             self.snapshots,
             self.skipped,
             self.snapshot_ns as f64 / self.snapshots.max(1) as f64 / 1e6,
@@ -577,6 +579,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
             && !helper.ended()
             && policy.due(Instant::now())
         {
+            policy.started(Instant::now());
             match source.draw(
                 &helper,
                 viewport.pixels.0,
