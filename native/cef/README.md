@@ -36,12 +36,39 @@ still supplies input and page affordances. The companion Wheelhouse experiment
 selects the Mach service through its explicit `macos_service` View setting.
 Without a Mach service, the internal observer can still validate GPU ownership.
 
+For visible interactive content, set `ProcessType` to `Interactive` in that job:
+
+```xml
+<key>ProcessType</key>
+<string>Interactive</string>
+```
+
+Leaving it unset selects `Standard`, which permits CPU and I/O throttling even
+when the machine is otherwise idle. In the M4 experiment this caused recurring
+75–150 ms delivery gaps. Changing only the job classification restored 60 fps
+through the complete GPU producer, including its copy-completion wait.
+See Apple's [launchd job classifications](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5).
+
 `LUCHS_CEF_DIAGNOSTICS=directory` samples frame 1, retains that lease across 59 more
 publications, verifies that its bytes remain unchanged, verifies that frame 60
 differs, and writes both PPMs plus `ownership.json`. This deliberately expensive
 readback is off during ordinary runs. `LUCHS_CEF_TRACE=file` records up to 600
 publications as timestamp_ns,width,height,callback_duration_ns,frame_count.
 The duration includes publication and copy completion, not just the Metal blit.
+
+Run a finite producer timing check on a quiet machine using a continuously
+animating local fixture:
+
+```sh
+python3 scripts/profile-cef.py target/cef/LuchsCEF.app/Contents/MacOS/LuchsCEF \
+  path/to/animation.html --output /tmp/luchs-cef-profile
+```
+
+The output directory must be new. The check runs 600 publications at 680×430,
+discards the first ten, records callback and arrival timings, then removes its
+private job. It requires at least 55 delivered fps and no gaps exceeding 33.4 ms.
+Use `--process-type Standard` to reproduce the launch-classification problem.
+These are producer measurements; they do not measure consumer display latency.
 
 ## Scope
 
