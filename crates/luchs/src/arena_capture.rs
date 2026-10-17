@@ -104,6 +104,8 @@ pub struct Draw {
     pub(crate) command: PendingCommand,
     pub(crate) reservation: Reservation,
     pub(crate) header: Header,
+    /// Capture-request time in Jackstay's host clock, before helper IPC.
+    pub(crate) timestamp_ns: u64,
 }
 impl Draw {
     pub(crate) fn start(
@@ -119,6 +121,7 @@ impl Draw {
             slot: Some(reservation),
             sender,
         };
+        let timestamp_ns = jackstay::model::host_time_ns();
         let command = reservation.sender.send_json_command(
             serde_json::json!({
                 "type":"draw", "arena_scope":slot.arena_scope,
@@ -131,6 +134,7 @@ impl Draw {
             command,
             reservation,
             header,
+            timestamp_ns,
         })
     }
     pub fn remaining(&self) -> Duration {

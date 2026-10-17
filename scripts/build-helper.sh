@@ -30,6 +30,7 @@ swiftc -import-objc-header "$repo/native/transport/SocketRights.h" "$temporary/S
     -Xlinker -rpath -Xlinker @executable_path \
     "$repo/native/macos/CaptureInputWindow.swift" \
     "$repo/native/macos/SnapshotRecovery.swift" \
+    "$repo/native/macos/SnapshotChanges.swift" \
     "$repo/native/macos/PageAffordances.swift" \
     "$repo/native/macos/WriterImport.swift" \
     "$repo/native/macos/LuchsWebviewCapture.swift" \

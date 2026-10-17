@@ -226,37 +226,9 @@ private func writeData(_ data: Data) {
     data.withUnsafeBytes { if let base = $0.baseAddress { writeBytes(base, $0.count) } }
 }
 
-// Mutations and native edit/selection events wake capture. Probe animation
-// activity only while something is running; static pages have no rAF loop.
-private let activityScriptSource = """
-(() => {
-  let last = -Infinity, probing = false;
-  const changed = () => {
-    const now = performance.now();
-    if (now - last < 30) return;
-    last = now;
-    window.webkit.messageHandlers.luchsActivity.postMessage({capture_changed: true});
-  };
-  const animations = () => {
-    if (document.getAnimations().some(a => a.playState === "running")) {
-      changed();
-      requestAnimationFrame(animations);
-    } else { probing = false; }
-  };
-  const probe = () => {
-    if (!probing) { probing = true; requestAnimationFrame(animations); }
-  };
-  new MutationObserver(() => { changed(); probe(); }).observe(document, {subtree:true, childList:true, attributes:true, characterData:true});
-  for (const name of ["input", "change", "selectionchange", "focusin", "focusout", "scroll", "resize"]) {
-    window.addEventListener(name, changed, true);
-  }
-  for (const name of ["animationstart", "transitionrun"]) {
-    window.addEventListener(name, () => { changed(); probe(); }, true);
-  }
-  probe();
-})();
-"""
-
+// Capture activity comes from native commands/navigation and changed pixels.
+// Idle snapshots provide a bounded fallback for script-, canvas- and video-led
+// changes, without inspecting animations or instrumenting the page DOM.
 private let maxControlBytes = 128 * 1024
 private let maxFrameBytes = 64 * 1024 * 1024
 
@@ -449,7 +421,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     private var visible = true
     private var focused = false
     private var arena: WriterMapping?
-    private var fingerprint: UInt64?
+    private var changes = SnapshotChanges()
     private var emittedFrames = 0
     private var activityPending = false
     private var snapshotRecovery = SnapshotRecovery()
@@ -473,12 +445,9 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         configuration.userContentController.addUserScript(
             WKUserScript(source: consoleForwarderSource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         configuration.userContentController.add(self, name: "luchsConsole")
-        configuration.userContentController.add(self, name: "luchsActivity")
         configuration.userContentController.add(self, name: "luchsState")
         configuration.userContentController.addUserScript(
             WKUserScript(source: pageAffordancesScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-        configuration.userContentController.addUserScript(
-            WKUserScript(source: activityScriptSource, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         configuration.userContentController.addUserScript(
             WKUserScript(source: caretScriptSource, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         debugLog("luchs-webview-capture \(width)x\(height) page \(pageURL.absoluteString)")
@@ -543,10 +512,6 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             emitState(body)
             return
         }
-        if message.name == "luchsActivity" {
-            reportActivity()
-            return
-        }
         let level = body["level"] as? String ?? "log"
         let text = body["text"] as? String ?? ""
         debugLog("console.\(level) \(text)")
@@ -600,6 +565,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             applyFocus(view, completion: nil)
             view.evaluateJavaScript("window.__luchsPublishPageState && window.__luchsPublishPageState()", completionHandler: nil)
         }
+        reportActivity()
         debugLog("popup \(index + 1) closed by the page; \(popups.isEmpty ? "main view" : "popup \(popups.count)") is active")
     }
 
@@ -693,7 +659,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
     }
 
     private func reportActivity() {
-        // Coalesce page wakes while one state record is in flight.
+        // Coalesce native wakes while one state record is in flight.
         guard !activityPending else { return }
         activityPending = true
         writer.async { [weak self] in
@@ -709,7 +675,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         case "arena":
             guard let layout = command.layout, let fd = descriptor else { fail("arena command needs one payload descriptor") }
             arena = WriterMapping(layout, fd: fd) // releases the previous mapping before ack
-            fingerprint = nil
+            changes.invalidate()
             emitAck(command.id, outcome: "executed", generation: layout.generation)
         case "arena_release":
             guard let generation = command.generation, generation == arena?.layout.generation else {
@@ -748,7 +714,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
             for popup in popups { popup.frame = rect }
             window?.contentView?.layoutSubtreeIfNeeded()
             configuredScale = 0
-            fingerprint = nil
+            changes.invalidate()
             emitAck(command.id, outcome: "executed")
         case "focus":
             guard let focused = command.focused, let view = activeView else {
@@ -771,7 +737,7 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
                 emitAck(command.id, outcome: "failed", detail: "pixel size exceeds capture limit")
                 return
             }
-            if self.scale != scale || (!self.visible && visible) { fingerprint = nil }
+            if self.scale != scale || (!self.visible && visible) { changes.invalidate() }
             self.scale = scale
             self.visible = visible
             emitAck(command.id, outcome: "executed")
@@ -1178,17 +1144,11 @@ private final class CaptureController: NSObject, WKNavigationDelegate, WKUIDeleg
         }
         snapshotRecovery.succeeded()
         let count = width * height * 4
-        // FNV-1a over native words: one read pass, no previous-frame allocation.
-        let words = bitmap.bindMemory(to: UInt32.self, capacity: count / 4)
-        var hash: UInt64 = (14695981039346656037 ^ UInt64(width)) &* 1099511628211
-        hash = (hash ^ UInt64(height)) &* 1099511628211
-        for i in 0..<(count / 4) { hash = (hash ^ UInt64(words[i])) &* 1099511628211 }
-        if fingerprint == hash {
+        if !changes.changed(UnsafeRawPointer(bitmap), width: width, height: height) {
             emitDrawAck(command, outcome: "executed", capture: ["published": false,
                 "snapshot_ns": UInt64(snapshotSeconds * 1e9), "publish_ns": 0])
             return
         }
-        fingerprint = hash
         emittedFrames += 1
         if emittedFrames == 1 { publishPageState() }
         let elapsed = ProcessInfo.processInfo.systemUptime - publishStart
