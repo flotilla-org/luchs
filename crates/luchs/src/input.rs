@@ -5,10 +5,30 @@ use crate::{
 };
 use jackstay::input::{Action, Event, Key, Mode, Operation, Outcome, Scope, ScrollUnit, Work};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 
+/// An engine command is acknowledged after execution, including input cleanup.
+/// In-process engines preserve the same bounded wait as process helpers.
+#[derive(Clone)]
+pub struct CommandPort(Arc<dyn Fn(Value, Duration) -> Outcome + Send + Sync>);
+impl CommandPort {
+    pub fn new(dispatch: impl Fn(Value, Duration) -> Outcome + Send + Sync + 'static) -> Self {
+        Self(Arc::new(dispatch))
+    }
+    pub fn helper(sender: CommandSender) -> Self {
+        Self::new(move |command, timeout| {
+            sender
+                .send_json_command(command, timeout)
+                .map_or(Outcome::Uncertain, |pending| {
+                    pending.wait().execution_outcome()
+                })
+        })
+    }
+}
+
 pub struct Executor {
-    sender: Option<CommandSender>,
+    sender: Option<CommandPort>,
     timeout: Duration,
     viewport_height: f64,
     scroll: ScrollRemainder,
@@ -26,6 +46,9 @@ impl Executor {
         self.viewport_height = height;
     }
     pub fn attach(&mut self, sender: CommandSender) {
+        self.attach_port(CommandPort::helper(sender));
+    }
+    pub fn attach_port(&mut self, sender: CommandPort) {
         self.sender = Some(sender);
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -51,11 +74,7 @@ impl Executor {
         let Some(sender) = &self.sender else {
             return Outcome::Unsupported;
         };
-        let outcome = sender
-            .send_json_command(command, self.timeout)
-            .map_or(Outcome::Uncertain, |pending| {
-                pending.wait().execution_outcome()
-            });
+        let outcome = (sender.0)(command, self.timeout);
         if outcome == Outcome::Executed {
             self.scroll = next_scroll;
         }

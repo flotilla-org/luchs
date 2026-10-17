@@ -9,6 +9,12 @@ fn run() -> Result<()> {
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, stop.clone())?;
     }
+    if cli.renderer == "cef" {
+        #[cfg(all(feature = "cef", target_os = "macos"))]
+        return luchs::cef::run(cli, stop);
+        #[cfg(not(all(feature = "cef", target_os = "macos")))]
+        return Err("CEF requires the optional macOS spike build: scripts/build-cef.py".into());
+    }
     luchs::source::run(cli, stop)
 }
 

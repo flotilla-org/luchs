@@ -13,3 +13,6 @@ pub mod input;
 pub mod keymap;
 
 pub mod arena_capture;
+
+#[cfg(all(feature = "cef", target_os = "macos"))]
+pub mod cef;

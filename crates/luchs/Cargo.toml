@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+cef = ["jackstay/backend-macos"]
+
 [dependencies]
 jackstay.workspace = true
 jackstay-producer.workspace = true

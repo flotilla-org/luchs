@@ -34,8 +34,8 @@ pub struct Cli {
     /// Renderer executable; defaults to luchs-webview-capture beside luchs.
     #[arg(long)]
     pub helper: Option<PathBuf>,
-    /// Compatibility with existing native-WebView launch profiles.
-    #[arg(long, default_value = "native-webview", value_parser = ["native-webview"])]
+    /// Page engine. CEF is an optional spike build (scripts/build-cef.py).
+    #[arg(long, default_value = "native-webview", value_parser = ["native-webview", "cef"])]
     pub renderer: String,
     /// Stop after this many helper frames (0 means unbounded).
     #[arg(long, default_value_t = 0)]
