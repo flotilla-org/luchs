@@ -92,12 +92,15 @@ while True:
     let (mut setup, mut consumer) = connect(&path);
     let draw = source.draw(&helper, 1, 1, TIMEOUT).unwrap().unwrap();
     let generation = draw.reservation.slot().generation;
+    let captured_at = draw.timestamp_ns;
     let ack = reply(&draw);
     source.complete_draw(&helper, draw, ack).unwrap();
     let AcquireOutcome::Frame(old) = consumer.acquire_latest(0).unwrap() else {
         panic!()
     };
     assert_eq!(old.bytes(), [0, 10, 255, 1]);
+    assert!(captured_at > 0);
+    assert_eq!(old.descriptor().timestamp_ns, captured_at);
     let draw = source.draw(&helper, 3, 2, TIMEOUT).unwrap().unwrap();
     assert!(draw.reservation.slot().generation > generation);
     let ack = reply(&draw);

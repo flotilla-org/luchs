@@ -441,6 +441,86 @@ fn native_socket_eof_exits_successfully() {
 
 #[test]
 #[ignore = "requires built Swift helper and a live macOS desktop"]
+fn native_idle_canvas_resumes_without_dom_activity_notifications() {
+    let dir = tempfile::tempdir().unwrap();
+    let html = dir.path().join("canvas.html");
+    std::fs::write(
+        &html,
+        r#"<!doctype html><style>html,body{margin:0}</style>
+<canvas id="canvas" width="32" height="32"></canvas><script>
+const ctx = canvas.getContext('2d');
+ctx.fillStyle = 'red'; ctx.fillRect(0,0,32,32);
+// Longer than the policy's one-second active tail. Subsequent canvas writes
+// produce no DOM mutations, input, animation events or navigation callbacks.
+setTimeout(() => { let n=0; const tick=()=>{
+  ctx.fillStyle=`rgb(0,${++n % 255},255)`; ctx.fillRect(0,0,32,32);
+  requestAnimationFrame(tick);
+}; tick(); }, 2500);
+</script>"#,
+    )
+    .unwrap();
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_luchs"))
+            .args(["--size=32x32", "--fps=30"])
+            .arg(&html)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let mut endpoint = String::new();
+    BufReader::new(process.0.stdout.take().unwrap())
+        .read_line(&mut endpoint)
+        .unwrap();
+    let connected = connect_tracks(
+        Stream::connect(endpoint.trim()).unwrap(),
+        Want::No,
+        Mode::Cooperative,
+        Want::No,
+    );
+    // SAFETY: this test owns the conforming producer.
+    let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
+    let consumer = setup.attach(1).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut cursor = 0;
+    let mut red = false;
+    let mut static_observed = None;
+    let mut resumed = None;
+    let mut animated_frames = 0;
+    loop {
+        if let AcquireOutcome::Frame(frame) = consumer.acquire_latest(cursor).unwrap() {
+            cursor = frame.descriptor().cursor;
+            if frame.bytes()[..4] == [0, 0, 255, 255] {
+                red = true;
+                static_observed.get_or_insert_with(Instant::now);
+            } else if frame.bytes()[0] == 255 {
+                resumed.get_or_insert_with(Instant::now);
+                animated_frames += 1;
+                if animated_frames >= 5 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle canvas did not resume: red={red} frames={animated_frames}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(red, "initial static pixels were not received");
+    assert!(
+        resumed.unwrap().duration_since(static_observed.unwrap()) < Duration::from_millis(3500),
+        "idle animation discovery exceeded the remaining 2.5 s page delay, 500 ms probe and 500 ms allowance"
+    );
+    assert!(
+        resumed.unwrap().elapsed() < Duration::from_millis(600),
+        "changed pixels did not restore active cadence"
+    );
+    drop((consumer, setup));
+}
+
+#[test]
+#[ignore = "requires built Swift helper and a live macOS desktop"]
 fn native_skip_scale_and_hidden_capture() {
     use serde_json::json;
     let dir = tempfile::tempdir().unwrap();

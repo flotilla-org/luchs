@@ -8,6 +8,9 @@ pub struct CapturePolicy {
     interval: Duration,
     active: Instant,
     next: Instant,
+    // While a capture is in flight, not_before <= next; a native wake cannot
+    // admit another capture before this deadline.
+    not_before: Instant,
     pub visible: bool,
     pub scale: f64,
 }
@@ -18,16 +21,31 @@ impl CapturePolicy {
             interval: Duration::from_secs_f64(1.0 / fps as f64),
             active: now,
             next: now,
+            not_before: now,
             visible: true,
             scale: 1.0,
         }
     }
     pub fn wake(&mut self, now: Instant) {
         self.active = now;
-        self.next = now;
+        // Wake an idle capture promptly, but don't let page notifications
+        // bypass the rate limit or queue extra captures during a snapshot.
+        self.next = self.next.min(now.max(self.not_before));
     }
     pub fn due(&self, now: Instant) -> bool {
         self.visible && now >= self.next
+    }
+    /// Record admission of one capture, including an unavailable arena slot.
+    pub fn started(&mut self, now: Instant) {
+        // Keep phase through small timer delays instead of accumulating drift.
+        // completed() rebases overruns, so no catch-up work is queued.
+        let deadline = self.next + self.interval;
+        self.not_before = if deadline > now {
+            deadline
+        } else {
+            now + self.interval
+        };
+        self.next = self.not_before;
     }
     pub fn wait(&self, now: Instant) -> Duration {
         if self.visible {
@@ -40,12 +58,11 @@ impl CapturePolicy {
         if published {
             self.active = now;
         }
-        self.next = now
-            + if now.duration_since(self.active) >= IDLE_AFTER {
-                IDLE_INTERVAL
-            } else {
-                self.interval
-            };
+        if now.duration_since(self.active) >= IDLE_AFTER {
+            self.next = now + IDLE_INTERVAL;
+        } else if now > self.next {
+            self.next = now;
+        }
     }
     pub fn presentation(&mut self, visible: bool, scale: f64, now: Instant) {
         self.visible = visible;
