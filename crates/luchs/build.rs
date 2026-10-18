@@ -40,7 +40,7 @@ fn main() {
             .arg("-o")
             .arg(&object)
             .status()
-            .unwrap()
+            .expect("failed to start clang++ for the CEF shim")
             .success(),
         "CEF shim compilation failed"
     );
@@ -50,7 +50,7 @@ fn main() {
             .arg(out.join("libluchs_cef.a"))
             .arg(object)
             .status()
-            .unwrap()
+            .expect("failed to start ar for the CEF shim archive")
             .success()
     );
     println!("cargo:rustc-link-search=native={}", out.display());

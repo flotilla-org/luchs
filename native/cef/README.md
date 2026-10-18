@@ -8,16 +8,33 @@ python3 scripts/build-cef.py --output target/cef/LuchsCEF.app
 target/cef/LuchsCEF.app/Contents/MacOS/LuchsCEF --renderer cef --fps 60 page.html
 ```
 
-The script downloads the pinned CEF distribution, verifies its published SHA1,
+The script downloads the pinned CEF distribution, verifies its SHA256 and published SHA1,
 builds its sandbox-enabled wrapper, bundles the framework and subprocess helpers,
 and signs the development bundle. It refuses to overwrite an existing bundle.
 The SDK, wrapper and Cargo targets can be supplied explicitly. CEF is an optional
 Cargo feature; normal builds neither download nor link it.
 
+`python3 scripts/test-cef-builder.py` checks interrupted extraction and checksum
+failure without downloading CEF. After building a bundle, run
+`python3 scripts/test-cef-startup.py path/to/LuchsCEF` to check profile cleanup
+when setup fails before native initialization.
+The ad-hoc development bundle enables debugging and disables library validation;
+it is not a distributable application.
+Downloads have a timeout, and cached SDKs are installed from complete staged
+extractions. An interrupted extraction cannot become a reusable SDK cache.
+
 Every CEF run uses a fresh disposable profile. The browser and subprocesses use
 Chromium's mock Keychain; Media Router and DIAL discovery are disabled. This
 experiment must not use a real Chrome profile or ask for Chromium Safe Storage
 access. Mock encryption is suitable only for these disposable test profiles.
+Temporary profiles are removed on normal exits and setup errors. An abort or
+process kill can leave one behind. Rust FFI callbacks currently abort on panic,
+including a poisoned mutex; they do not unwind through CEF.
+
+Top-level loads use the shared `LoadPolicy`. All file subresources, subframe file
+navigations and file redirect targets are checked against the original local
+page directory. HTTP(S) resources and ordinary browser-internal/data/blob
+subresources retain CEF's normal behavior. Popup windows are rejected.
 
 ## GPU path
 

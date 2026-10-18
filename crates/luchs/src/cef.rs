@@ -62,12 +62,23 @@ fn command(value: serde_json::Value, timeout: Duration) -> jackstay::input::Outc
     match unsafe {
         luchs_cef_command(
             text.as_ptr(),
-            timeout.as_millis().min(u64::MAX as u128) as u64,
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         )
     } {
         0 => Outcome::Executed,
         1 => Outcome::Unsupported,
         _ => Outcome::Uncertain,
+    }
+}
+fn note_command(value: serde_json::Value) {
+    let kind = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let outcome = command(value, Duration::from_secs(1));
+    if outcome != jackstay::input::Outcome::Executed {
+        eprintln!("luchs cef: {kind} command was not executed: {outcome:?}");
     }
 }
 struct Gpu {
@@ -261,7 +272,6 @@ impl Context {
     }
     fn published(&self) {
         *self.count.lock().unwrap() += 1;
-        self.page.frame_published();
     }
 }
 unsafe fn context<'a>(raw: *mut c_void) -> &'a Context {
@@ -326,6 +336,7 @@ unsafe extern "C" fn surface(
     match gpu.as_mut().unwrap().publish(surface, width, height, stamp) {
         Ok(true) => {
             ctx.published();
+            ctx.page.frame_published();
             if gpu.as_ref().unwrap().frames <= 600 {
                 if let Some(file) = ctx.trace.lock().unwrap().as_mut() {
                     use std::io::Write;
@@ -370,8 +381,12 @@ unsafe extern "C" fn tick(raw: *mut c_void) -> i32 {
     }
     let presentation = { ctx.source.lock().unwrap().presentation() };
     if let Some(hint) = presentation {
-        let viewport = Viewport::resolve(ctx.logical_size, &hint, *ctx.scale.lock().unwrap());
-        *ctx.scale.lock().unwrap() = viewport.scale;
+        let viewport = {
+            let mut scale = ctx.scale.lock().unwrap();
+            let viewport = Viewport::resolve(ctx.logical_size, &hint, *scale);
+            *scale = viewport.scale;
+            viewport
+        };
         let width = viewport.logical.0;
         let height = viewport.logical.1;
         let outcome = command(
@@ -383,17 +398,11 @@ unsafe extern "C" fn tick(raw: *mut c_void) -> i32 {
             return 1;
         }
         ctx.source.lock().unwrap().set_logical_size(width, height);
-        command(
-            serde_json::json!({"type":"presentation","visible":hint.visible}),
-            Duration::from_secs(1),
-        );
-        command(
-            serde_json::json!({"type":"focus","focused":hint.focused}),
-            Duration::from_secs(1),
-        );
+        note_command(serde_json::json!({"type":"presentation","visible":hint.visible}));
+        note_command(serde_json::json!({"type":"focus","focused":hint.focused}));
     }
     if let Some(value) = ctx.page.command() {
-        command(value, Duration::from_secs(1));
+        note_command(value);
     }
     0
 }
@@ -416,10 +425,9 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     let (source, path) = Source::bind_page(&name, cli.size.0, cli.size.1, local.as_deref())?;
     source.attach_engine(CommandPort::new(command));
     let page = source.page.clone();
-    let cache = std::env::temp_dir().join(format!("luchs-cef-{}", std::process::id()));
-    std::fs::create_dir(&cache)?;
+    let cache = tempfile::Builder::new().prefix("luchs-cef-").tempdir()?;
     let url = CString::new(url)?;
-    let cache_name = CString::new(cache.to_str().ok_or("non-UTF8 cache path")?)?;
+    let cache_name = CString::new(cache.path().to_str().ok_or("non-UTF8 cache path")?)?;
     let gpu_enabled = std::env::var_os("LUCHS_CEF_GPU").is_some();
     let ctx = Context {
         source: Mutex::new(source),
@@ -473,7 +481,7 @@ pub fn run(cli: Cli, stop: Arc<AtomicBool>) -> Result<()> {
     );
     let failed = ctx.failed.lock().unwrap().take();
     drop(ctx);
-    let _ = std::fs::remove_dir_all(cache);
+    drop(cache);
     if let Some(error) = failed {
         return Err(error.into());
     }

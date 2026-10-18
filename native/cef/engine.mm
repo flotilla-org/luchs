@@ -384,6 +384,13 @@ public:
                ? RV_CANCEL
                : RV_CONTINUE;
   }
+  void OnResourceRedirect(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+                          CefRefPtr<CefRequest>, CefRefPtr<CefResponse>,
+                          CefString &new_url) override {
+    auto url = new_url.ToString();
+    if (url.starts_with("file:") && !callbacks.allowed(context, url.c_str()))
+      new_url = "about:blank";
+  }
   bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
                      const CefString &, const CefString &,
                      WindowOpenDisposition, bool, const CefPopupFeatures &,
@@ -394,8 +401,9 @@ public:
   }
   bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request, bool, bool) override {
-    return frame->IsMain() &&
-           !callbacks.allowed(context, request->GetURL().ToString().c_str());
+    auto url = request->GetURL().ToString();
+    return (frame->IsMain() || url.starts_with("file:")) &&
+           !callbacks.allowed(context, url.c_str());
   }
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                    ErrorCode error, const CefString &message,
