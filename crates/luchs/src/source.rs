@@ -399,7 +399,7 @@ impl CaptureStats {
         // invariant for changed frames, not a runtime
         // hardware counter; kernel/WebKit internals and comparison reads are excluded.
         eprintln!(
-            "luchs: stats snapshots={} published={received} skipped={} copies_per_frame=2 mean_snapshot_ms={:.3} mean_publish_ms={:.3}",
+            "luchs: stats snapshots={} published={received} skipped={} copies_per_frame_changed=2 mean_snapshot_ms={:.3} mean_publish_ms={:.3}",
             self.snapshots,
             self.skipped,
             self.snapshot_ns as f64 / self.snapshots.max(1) as f64 / 1e6,

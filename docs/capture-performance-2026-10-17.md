@@ -24,7 +24,7 @@ collisions. An arena pointer is never retained after its acknowledgement.
 
 Frame timestamps now retain capture-request time in Jackstay's host clock,
 including helper queueing. They do not identify WebKit's internal paint time.
-Non-helper fixture publication still uses the publication-time default.
+Non-helper fixture publication retains its zero timestamp default.
 
 ## Validation
 
@@ -67,10 +67,35 @@ better throughput and latency. No broad claim of solved large-page pacing follow
 from these results. Video/WebGL final median delivery intervals were about 33 ms;
 their p95 remained about 44–45 ms. The default 30 fps ceiling remains unchanged.
 
-Artifacts on the test machine are in
+Machine-local artifacts, not checked into this repository, are in
 `wheelhouse/local/diagnostics/web-performance/implementation`: `final.json` is the
 before/first-patch comparison; `paced.json` is the final deadline run. Scripts,
 fixtures, console logs and per-run outputs are alongside them.
+
+### Launch classification correction
+
+The earlier throughput table does not establish a WebKit capacity limit. A later
+controlled comparison on an unlocked, mostly idle M4 machine used the same frozen
+`7e01d51` executable and helper, a page encoding its frame identity in pixels, and
+an Interactive consumer. Changing only the source's launchd `ProcessType` produced:
+
+| Physical image | Standard images/sec, two trials | Interactive images/sec, two trials |
+| --- | ---: | ---: |
+| 800 × 600 | 18.250 / 20.375 | 50.000 / 50.000 |
+| 2948 × 2040 | 32.375 / 32.875 | 50.125 / 50.000 |
+
+The display's primary clock was 50 Hz. Every Interactive run received every page
+frame without duplicates over its eight-second sample. The 50.125 result reflects
+the finite counting window. Large snapshots still averaged about 10.6 ms, with
+another 2.3 ms for helper drawing/publication. Delivery p95 gaps were 34–36 ms;
+this is not perfect pacing or a measurement of Wheelhouse presentation.
+
+The historical subprocess launches did not record their task roles, so this does
+not prove their exact cause. Future engine comparisons must establish interactive
+classification, visible animation, and matched display/workload conditions first.
+The repeated comparison reversed launch order and excluded earlier screen-locked
+runs. Local evidence is under
+`wheelhouse/local/diagnostics/web-performance/launch-classification/unlocked-{1,2}`.
 
 No reproduction established that removing animation enumeration fixes the
 observed YouTube WebKit crash. Its stack involved `getAnimations`; this change

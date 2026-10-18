@@ -8,6 +8,8 @@ pub struct CapturePolicy {
     interval: Duration,
     active: Instant,
     next: Instant,
+    // While a capture is in flight, not_before <= next; a native wake cannot
+    // admit another capture before this deadline.
     not_before: Instant,
     pub visible: bool,
     pub scale: f64,

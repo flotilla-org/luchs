@@ -484,6 +484,7 @@ setTimeout(() => { let n=0; const tick=()=>{
     let deadline = Instant::now() + TIMEOUT;
     let mut cursor = 0;
     let mut red = false;
+    let mut static_observed = None;
     let mut resumed = None;
     let mut animated_frames = 0;
     loop {
@@ -491,6 +492,7 @@ setTimeout(() => { let n=0; const tick=()=>{
             cursor = frame.descriptor().cursor;
             if frame.bytes()[..4] == [0, 0, 255, 255] {
                 red = true;
+                static_observed.get_or_insert_with(Instant::now);
             } else if frame.bytes()[0] == 255 {
                 resumed.get_or_insert_with(Instant::now);
                 animated_frames += 1;
@@ -506,6 +508,10 @@ setTimeout(() => { let n=0; const tick=()=>{
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(red, "initial static pixels were not received");
+    assert!(
+        resumed.unwrap().duration_since(static_observed.unwrap()) < Duration::from_millis(3500),
+        "idle animation discovery exceeded the remaining 2.5 s page delay, 500 ms probe and 500 ms allowance"
+    );
     assert!(
         resumed.unwrap().elapsed() < Duration::from_millis(600),
         "changed pixels did not restore active cadence"
