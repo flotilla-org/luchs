@@ -31,7 +31,7 @@ struct PageProducer {
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
     logical_size: Arc<Mutex<(f64, f64)>>,
-    input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
+    input_sender: Arc<Mutex<Option<crate::input::CommandPort>>>,
 }
 impl Producer for PageProducer {
     fn frame(&mut self) -> Option<jackstay_producer::Frame> {
@@ -43,7 +43,7 @@ impl Producer for PageProducer {
         // shared; release its lock before the helper acknowledgement wait.
         let sender = self.input_sender.lock().unwrap().clone();
         if let Some(sender) = sender {
-            self.input.attach(sender);
+            self.input.attach_port(sender);
         }
         self.input
             .set_viewport_height(self.logical_size.lock().unwrap().1);
@@ -86,7 +86,7 @@ pub struct Source {
     wake: Arc<Mutex<Option<crate::helper::Wake>>>,
     presentation: Arc<Mutex<Option<jackstay::affordances::Presentation>>>,
     source: jackstay_producer::Source,
-    input_sender: Arc<Mutex<Option<crate::helper::CommandSender>>>,
+    input_sender: Arc<Mutex<Option<crate::input::CommandPort>>>,
     sequence: u64,
     mapping: Option<crate::arena_capture::Mapping>,
     logical_size: Arc<Mutex<(f64, f64)>>,
@@ -179,7 +179,15 @@ impl Source {
     }
 
     pub fn attach_input(&self, helper: &Helper) {
-        *self.input_sender.lock().unwrap() = Some(helper.command_sender());
+        self.attach_engine(crate::input::CommandPort::helper(helper.command_sender()));
+    }
+
+    pub fn attach_engine(&self, sender: crate::input::CommandPort) {
+        *self.input_sender.lock().unwrap() = Some(sender);
+    }
+
+    pub fn set_logical_size(&self, width: u32, height: u32) {
+        *self.logical_size.lock().unwrap() = (f64::from(width), f64::from(height));
     }
 
     fn setup_writer(&mut self, helper: &Helper) -> Result<()> {
@@ -195,6 +203,11 @@ impl Source {
     /// Publish locally supplied pixels, for non-helper producers and fixtures.
     /// Helper draws use `draw`/`complete_draw` and never enter this copying path.
     pub fn publish(&mut self, frame: Frame) -> Result<()> {
+        self.publish_at(frame, 0).map(|_| ())
+    }
+
+    /// Callback-driven engines supply their own host-clock frame timestamp.
+    pub fn publish_at(&mut self, frame: Frame, timestamp_ns: u64) -> Result<bool> {
         if self.source.is_finished() {
             return Err("source pump stopped".into());
         }
@@ -208,16 +221,17 @@ impl Source {
         }
         let dimensions = (frame.header.width, frame.header.height, frame.header.stride);
         if !self.configure_dimensions(dimensions, frame.pixels.len())? {
-            return Ok(());
+            return Ok(false);
         }
         self.sequence += 1;
-        self.source.with_arena(|arena| -> Result<()> {
+        self.source.with_arena(|arena| -> Result<bool> {
             if let Some(mut slot) = arena.reserve()? {
                 slot.bytes_mut()[..frame.pixels.len()].copy_from_slice(&frame.pixels);
                 arena.commit(
                     slot,
                     FrameDescriptor {
                         sequence: self.sequence,
+                        timestamp_ns,
                         width: frame.header.width,
                         height: frame.header.height,
                         stride: frame.header.stride,
@@ -229,8 +243,9 @@ impl Source {
                     },
                 )?;
                 self.page.frame_published();
+                return Ok(true);
             }
-            Ok(())
+            Ok(false)
         })
     }
 
