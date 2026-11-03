@@ -42,7 +42,8 @@ recovery, page affordances and headless writer imports) on macOS; CI runs it
 after the helper build.
 
 The helper and `libjackstay.dylib` must sit beside the `luchs` executable.
-`--helper PATH` overrides its location, including for fake helpers on Linux and Windows.
+`--helper PATH` overrides its location, including for fake helpers on Linux
+and Windows.
 When choosing a Swift helper elsewhere, place `libjackstay.dylib` in that helper's
 own directory; its rpath resolves relative to the helper, rather than `luchs`.
 The Rust workspace builds and tests on macOS, Linux and Windows (MSVC) without
@@ -193,15 +194,17 @@ On a logged-in macOS desktop, `scripts/test-hover-window.sh` checks desktop focu
 preservation. The ignored `native_host_motion_delivers_trusted_dom_hover` test
 checks trusted native motion, CSS hover, cursor transitions and clean teardown.
 
-CI runs these checks on macOS, Linux and Windows, plus helper compilation on macOS.
+CI runs these checks on macOS, Linux and Windows, plus helper compilation on
+macOS.
 Tests spawn fake helpers without WebKit and exercise framed records, ack
 ordering and timeouts, state callbacks, bounds, reload, console environment,
 termination, source bootstrap, replacement, delegated slots, idle policy,
 presentation hints, page-state propagation, helper replacement, URL containment,
 navigation/scroll command forwarding and consumer process death. Command
-fixtures require `python3` (`python` on Windows). The Windows CLI has no orderly
-stop request yet (#43), so the tests that check a `SIGTERM` stop run only on macOS
-and Linux, and the ones that stop the CLI end by terminating it on Windows. The ignored `live_macos` test requires a built Swift
+fixtures require `python3` (`python` on Windows). The Windows CLI has no
+orderly stop request yet (#43). The tests that check a `SIGTERM` stop therefore
+run only on macOS and Linux, and on Windows the tests that stop the CLI
+terminate it instead. The ignored `live_macos` test requires a built Swift
 helper and a logged-in desktop; a separate ignored child-process fixture runs
 inside the consumer-death test.
 

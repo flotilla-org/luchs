@@ -1,10 +1,11 @@
 # Helper protocol
 
-On macOS and Linux, Rust creates one `AF_UNIX` `SOCK_STREAM` socketpair per renderer and passes the
-child endpoint in `LUCHS_HELPER_FD`. Only that endpoint survives exec; the helper
-sets close-on-exec again before starting WebKit. Stdin and stdout are `/dev/null`
-and carry no protocol bytes. Stderr carries diagnostics. The socket carries one `SCM_RIGHTS` payload descriptor with each `arena` command.
-No pixel bytes travel over the socket. Windows uses a named pipe and passes the
+On macOS and Linux, Rust creates one `AF_UNIX` `SOCK_STREAM` socketpair per
+renderer and passes the child endpoint in `LUCHS_HELPER_FD`. Only that endpoint
+survives exec; the helper sets close-on-exec again before starting WebKit. Stdin
+and stdout are `/dev/null` and carry no protocol bytes. Stderr carries
+diagnostics. The socket carries one `SCM_RIGHTS` payload descriptor with each
+`arena` command. No pixel bytes travel over the socket. Windows uses a named pipe and passes the
 payload handle in-band; records and commands are otherwise identical (see
 [Windows transport](#windows-transport)).
 
@@ -255,7 +256,8 @@ policy.
 At setup Rust exports Jackstay's writable payload object. An `arena` command
 carries its descriptor and exactly one fd in `SCM_RIGHTS`, attached to the first
 command byte (on Windows, a duplicated handle named by `"handle"`; see
-[Windows transport](#windows-transport)). Ancillary receipt uses `recvmsg` even across split reads. Jackstay
+[Windows transport](#windows-transport)). Ancillary receipt uses `recvmsg` even
+across split reads. Jackstay
 validates the object length and layout, maps it shared read/write and consumes the
 fd. The helper acknowledges its allocation generation. No Jackstay bookkeeping
 is exported. `arena_scope` is carried unchanged in both the layout and each draw;
