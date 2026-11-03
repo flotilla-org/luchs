@@ -198,6 +198,8 @@ fn accept(
                     };
                     match in_job(&peer, job) {
                         Ok(true) => break Ok(Some((stream, peer))),
+                        // Fails closed: if the job check errors, only the
+                        // started process itself is accepted, never a launcher's child.
                         _ if peer_pid == pid => break Ok(Some((stream, peer))),
                         // Another process of this user found the pipe: refuse it.
                         _ => {}

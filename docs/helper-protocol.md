@@ -326,15 +326,21 @@ unchanged.
   `\\.\pipe\...` name in `LUCHS_HELPER_PIPE`. Nothing is inherited, because
   `std::process::Command` exposes every inheritable handle to every concurrent
   spawn. The helper opens that name for reading and writing before anything
-  else. A helper that reads on one thread while writing on another should open
-  it with `FILE_FLAG_OVERLAPPED`: a synchronous pipe handle serializes the two.
+  else. Either handle mode works with this protocol. A helper that reads on one
+  thread while writing on another, as a real renderer will, must open the pipe
+  with `FILE_FLAG_OVERLAPPED`, because a synchronous handle serializes the two
+  and a blocked read would stall every write. A single-threaded helper, such
+  as the test fakes, may open it synchronously.
 - **Admission.** Rust assigns the helper to a job object and accepts only a
   client that is the started process or a member of its job, so a launcher
   such as `cmd.exe` may start the real helper. Any other process of the user
   that finds the pipe is disconnected. Rust waits up to 10 s for the helper. If
   the helper exits without connecting, the stream is closed, as at EOF before
   any record. If it is still running and unconnected after 10 s, Rust
-  terminates it and the spawn fails.
+  terminates it and the spawn fails. `std::process::Command` cannot start a
+  process suspended, so Rust assigns the job just after the spawn. A launcher
+  that starts the real helper within that window would leave it outside the
+  job, and Rust would refuse its connection, so the failure is visible.
 - **Payload handle.** For `arena`, Rust duplicates the payload section into the
   connected helper process with `DuplicateHandle` (same access, not
   inheritable) and sends its value in the command as `"handle"`, an unsigned
