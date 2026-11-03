@@ -2,14 +2,13 @@ mod common;
 
 use std::{
     io::{BufRead, BufReader, Read},
-    os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
 use clap::Parser;
 use common::{Want, connect_tracks};
-use jackstay::{input::Mode, local::Stream};
+use jackstay::input::Mode;
 use luchs::cli::Cli;
 
 #[test]
@@ -39,32 +38,33 @@ fn host_arguments_and_limits() {
     assert!(cli.local_page().is_none());
 }
 
+// Unix-only: these check the orderly SIGTERM stop. The Windows CLI has no stop
+// request yet (terminating it skips cleanup), see #43.
+#[cfg(unix)]
 #[test]
 fn watch_console_environment_and_sigterm_cleanup_with_fake_helper() {
     sigterm_cleanup(false);
 }
 
 // Optional input must acknowledge cleanup without failing an orderly SIGTERM.
+#[cfg(unix)]
 #[test]
 fn optional_controls_do_not_fail_sigterm_cleanup() {
     sigterm_cleanup(true);
 }
 
+#[cfg(unix)]
 fn sigterm_cleanup(optional_controls: bool) {
     let dir = tempfile::tempdir().unwrap();
     let page = dir.path().join("page.html");
-    let helper = dir.path().join("helper");
     let log = dir.path().join("console");
     let pid = dir.path().join("helper-pid");
     std::fs::write(&page, "old page").unwrap();
     // Fake only the renderer subprocess boundary; the handshake and media are real.
-    std::fs::write(
-        &helper,
-        format!(
-            "#!/usr/bin/env python3\n{}\n{}",
-            common::PYTHON_PROTOCOL,
-            format_args!(
-                r#"
+    let helper = common::helper_script(
+        dir.path(),
+        &format!(
+            r#"
 with open('{}', 'w') as out: out.write(str(os.getpid()))
 with open(os.environ['LUCHS_CONSOLE_LOG'], 'w') as out: out.write(' '.join(sys.argv[1:]) + '\n')
 frame()
@@ -74,12 +74,9 @@ while True:
     ack(cmd)
     with open(os.environ['LUCHS_CONSOLE_LOG'], 'a') as out: out.write(json.dumps(cmd) + '\n')
 "#,
-                pid.display()
-            )
+            pid.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_luchs"))
         .arg("--helper")
         .arg(&helper)
@@ -116,7 +113,7 @@ while True:
     let logged = std::fs::read_to_string(&log).unwrap();
     // SIGTERM must stop with a live consumer and reap the helper.
     let connected = connect_tracks(
-        Stream::connect(endpoint.trim()).unwrap(),
+        common::connect(endpoint.trim()),
         if optional_controls {
             Want::Optional
         } else {
@@ -177,24 +174,35 @@ while True:
     }
     assert!(logged.contains("1 1 0 30"));
     assert!(logged.contains("\"type\": \"reload\""));
-    assert!(!std::path::Path::new(endpoint.trim()).exists());
-    let helper_pid: i32 = std::fs::read_to_string(pid)
+    assert!(common::endpoint_gone(endpoint.trim()));
+    let helper_pid = std::fs::read_to_string(pid)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    // SAFETY: signal zero is a liveness probe only.
-    assert_eq!(unsafe { libc::kill(helper_pid, 0) }, -1);
+    assert!(common::gone(helper_pid));
 }
 
 // Helper EOF before a completed draw must stop without publishing or waiting for a consumer.
 #[test]
 fn immediate_helper_eof_without_consumer_never_publishes() {
     let dir = tempfile::tempdir().unwrap();
-    let helper = dir.path().join("helper");
-    // Fake only the renderer subprocess boundary.
-    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Fake only the renderer subprocess boundary. On Windows the helper exits
+    // without ever opening its pipe.
+    #[cfg(unix)]
+    let helper = {
+        use std::os::unix::fs::PermissionsExt;
+        let helper = dir.path().join("helper");
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        helper
+    };
+    #[cfg(windows)]
+    let helper = {
+        let helper = dir.path().join("helper.cmd");
+        std::fs::write(&helper, "@exit /b 0\r\n").unwrap();
+        helper
+    };
     let mut child = Command::new(env!("CARGO_BIN_EXE_luchs"))
         .arg("--helper")
         .arg(&helper)
@@ -231,7 +239,7 @@ fn immediate_helper_eof_without_consumer_never_publishes() {
         .unwrap()
         .read_to_string(&mut endpoint)
         .unwrap();
-    assert!(!std::path::Path::new(endpoint.trim()).exists());
+    assert!(common::endpoint_gone(endpoint.trim()));
 }
 
 // A malformed helper frame must fail the CLI, remove its endpoint via Drop,
@@ -239,23 +247,16 @@ fn immediate_helper_eof_without_consumer_never_publishes() {
 #[test]
 fn invalid_helper_record_drops_source_and_reaps_helper() {
     let dir = tempfile::tempdir().unwrap();
-    let helper = dir.path().join("helper");
     let pid = dir.path().join("helper-pid");
     // Fake only the renderer subprocess boundary.
-    std::fs::write(
-        &helper,
-        format!(
-            r#"#!/bin/sh
-echo $$ > '{}'
-{}
-exec sleep 60
-"#,
-            pid.display(),
-            common::socket_write(&[1, 0, 0, 0, 99])
+    let helper = common::helper_script(
+        dir.path(),
+        &format!(
+            "{}{}time.sleep(60)\n",
+            common::record_pid(&pid),
+            common::raw_write(&[1, 0, 0, 0, 99])
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_luchs"))
         .arg("--helper")
         .arg(&helper)
@@ -294,17 +295,16 @@ exec sleep 60
         .unwrap();
 
     assert!(
-        !std::path::Path::new(endpoint.trim()).exists(),
+        common::endpoint_gone(endpoint.trim()),
         "endpoint leaked: {}",
         endpoint.trim()
     );
-    let helper_pid: i32 = std::fs::read_to_string(pid)
+    let helper_pid = std::fs::read_to_string(pid)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    // SAFETY: signal zero only probes the helper whose PID the test recorded.
-    assert_eq!(unsafe { libc::kill(helper_pid, 0) }, -1);
+    assert!(common::gone(helper_pid));
 }
 
 struct Process(std::process::Child);
@@ -333,16 +333,12 @@ fn watch_unsupported_reload_stops_the_run() {
 fn watch_reload_outcome(first_outcome: &str) {
     let dir = tempfile::tempdir().unwrap();
     let page = dir.path().join("page.html");
-    let helper = dir.path().join("helper");
     let log = dir.path().join("reloads");
     std::fs::write(&page, "old page").unwrap();
-    std::fs::write(
-        &helper,
-        format!(
-            "#!/usr/bin/env python3\n{}\n{}",
-            common::PYTHON_PROTOCOL,
-            format_args!(
-                r#"
+    let helper = common::helper_script(
+        dir.path(),
+        &format!(
+            r#"
 log = r'{}'
 with open(log, 'w') as out: out.write('ready\n')
 frame()
@@ -364,15 +360,12 @@ while True:
     try: ack(command())
     except EOFError: break
 "#,
-                log.display(),
-                first_outcome,
-                first_outcome,
-                first_outcome
-            )
+            log.display(),
+            first_outcome,
+            first_outcome,
+            first_outcome
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut child = Process(
         Command::new(env!("CARGO_BIN_EXE_luchs"))
             .arg("--helper")
@@ -408,10 +401,7 @@ while True:
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        // SAFETY: the test owns the unreaped CLI child.
-        unsafe {
-            libc::kill(child.0.id() as i32, libc::SIGTERM);
-        }
+        common::stop(&mut child.0);
     }
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
@@ -420,7 +410,10 @@ while True:
         assert!(Instant::now() < deadline, "CLI did not stop");
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert_eq!(status.success(), first_outcome != "unsupported");
+    // Windows terminates rather than stops the CLI (see common::stop).
+    if cfg!(unix) || first_outcome == "unsupported" {
+        assert_eq!(status.success(), first_outcome != "unsupported");
+    }
     let mut stderr = String::new();
     child
         .0
@@ -440,27 +433,20 @@ while True:
         1,
         "duplicate retry diagnostics: {stderr}"
     );
-    assert!(!std::path::Path::new(endpoint.trim()).exists());
+    assert!(common::endpoint_gone(endpoint.trim()));
 }
 
 #[test]
 fn exhausted_snapshot_retry_diagnostic_reaches_cli() {
     let dir = tempfile::tempdir().unwrap();
-    let helper = dir.path().join("helper");
-    std::fs::write(
-        &helper,
-        format!(
-            "#!/usr/bin/env python3\n{}\n{}",
-            common::PYTHON_PROTOCOL,
-            r#"
+    let helper = common::helper_script(
+        dir.path(),
+        r#"
 cmd = raw_command()
 assert cmd['type'] == 'draw'
 ack(cmd, 'failed', detail='snapshot failed after 3 consecutive attempts: unexpected pixel size')
-"#
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+"#,
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_luchs"))
         .arg("--helper")
         .arg(helper)
@@ -475,17 +461,10 @@ ack(cmd, 'failed', detail='snapshot failed after 3 consecutive attempts: unexpec
 #[test]
 fn helper_crash_during_input_preserves_renderer_error_and_removes_endpoint() {
     let dir = tempfile::tempdir().unwrap();
-    let helper = dir.path().join("helper");
-    std::fs::write(
-        &helper,
-        format!(
-            "#!/usr/bin/env python3\n{}\n{}",
-            common::PYTHON_PROTOCOL,
-            "frame()\ncmd=command()\nassert cmd['type']=='key_down'\nsys.exit(23)\n"
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let helper = common::helper_script(
+        dir.path(),
+        "frame()\ncmd=command()\nassert cmd['type']=='key_down'\nsys.exit(23)\n",
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_luchs"))
         .arg("--helper")
         .arg(&helper)
@@ -506,7 +485,7 @@ fn helper_crash_during_input_preserves_renderer_error_and_removes_endpoint() {
         );
     }
     let connected = connect_tracks(
-        Stream::connect(endpoint.trim()).unwrap(),
+        common::connect(endpoint.trim()),
         Want::Required,
         Mode::Physical,
         Want::No,
@@ -551,5 +530,5 @@ fn helper_crash_during_input_preserves_renderer_error_and_removes_endpoint() {
         !stderr.contains("input cleanup failed"),
         "cleanup masked the renderer error: {stderr}"
     );
-    assert!(!std::path::Path::new(endpoint.trim()).exists());
+    assert!(common::endpoint_gone(endpoint.trim()));
 }

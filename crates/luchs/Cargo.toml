@@ -20,5 +20,16 @@ signal-hook = "0.3"
 tempfile = "3"
 url = "2"
 
+[target.'cfg(windows)'.dependencies]
+# Already locked through Jackstay: helper job objects, pipe disconnect and
+# payload handle duplication (docs/helper-protocol.md).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [lints]
 workspace = true

@@ -31,3 +31,23 @@ jobs:
         run: scripts/build-helper.sh
       - if: runner.os == 'macOS'
         run: scripts/test-helper.sh
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.0'
+          components: rustfmt
+      # Fake helpers run under `python`; Windows has no `python3` executable.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: cargo +1.98.0 fmt --all --check
+      - run: cargo +stable build --workspace --locked
+      - run: cargo +stable test --workspace --locked
+      - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings

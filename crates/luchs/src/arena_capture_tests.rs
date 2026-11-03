@@ -7,10 +7,9 @@ use jackstay::{
     },
     handshake::{self, Selected},
     input::Mode,
-    local::Stream,
 };
 use jackstay_producer::VIDEO;
-use std::{process::Command, sync::atomic::AtomicU32};
+use std::sync::atomic::AtomicU32;
 #[path = "../tests/common/mod.rs"]
 mod common;
 
@@ -29,10 +28,7 @@ fn source() -> (Source, String) {
     .unwrap()
 }
 fn helper(script: &str) -> Helper {
-    Helper::spawn(
-        Command::new("python3").args(["-c", &format!("{}{script}", common::PYTHON_PROTOCOL)]),
-    )
-    .unwrap()
+    Helper::spawn(&mut common::python(script)).unwrap()
 }
 fn reply(draw: &Draw) -> Ack {
     let deadline = Instant::now() + TIMEOUT;
@@ -50,7 +46,7 @@ fn connect(path: &str) -> (CpuSetupClient, ArenaConsumer) {
         required: true,
         write: false,
     };
-    let connected = handshake::connect(Stream::connect(path).unwrap())
+    let connected = handshake::connect(common::connect(path))
         .unwrap()
         .select(&[video], Mode::Cooperative)
         .unwrap();

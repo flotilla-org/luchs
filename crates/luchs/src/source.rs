@@ -16,7 +16,6 @@ use jackstay::{
 use jackstay_producer::{Builder, Producer};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -157,10 +156,7 @@ impl Source {
         )
         .max_connections(16)
         .start()?;
-        // Builder starts accepting before this chmod, but Jackstay creates and
-        // verifies an owner-only (0700) runtime directory before binding. That
-        // parent protects the socket regardless of the launcher's umask.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        restrict_endpoint(&path)?;
         Ok((
             Self {
                 page,
@@ -378,6 +374,22 @@ impl Source {
         self.source.stop()?;
         Ok(())
     }
+}
+
+/// Builder starts accepting before this chmod, but Jackstay creates and
+/// verifies an owner-only (0700) runtime directory before binding. That
+/// parent protects the socket regardless of the launcher's umask.
+#[cfg(unix)]
+fn restrict_endpoint(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+/// Jackstay creates the named pipe with a protected DACL (the user and
+/// SYSTEM only); there is no file mode to tighten.
+#[cfg(windows)]
+fn restrict_endpoint(_path: &str) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn modification_time(path: &std::path::Path) -> Option<SystemTime> {

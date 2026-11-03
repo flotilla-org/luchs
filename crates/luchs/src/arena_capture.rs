@@ -1,6 +1,6 @@
 //! Exclusive delegated draws. A failed or cancelled draw reaps the writer before
 //! its reservation can be reused; exports stay charged until unmap acknowledgement.
-use std::{os::fd::AsFd, time::Duration};
+use std::time::Duration;
 
 use crate::{
     Result,
@@ -25,12 +25,12 @@ impl Mapping {
         // SAFETY: mapping retains the export until a replacement unmap ack or
         // verified helper exit. Draw owns the exclusive reserved-slot protocol.
         let object = unsafe { mapping.export.duplicate_object()? };
-        let command = mapping.sender.send_with_fd(
+        let command = mapping.sender.send_with_payload(
             serde_json::json!({
                 "type": "arena", "layout": mapping.export.descriptor(),
             }),
             Duration::from_secs(5),
-            Some(object.as_fd()),
+            Some(crate::helper::payload(&object)),
         )?;
         if !command.wait_ack().is_some_and(|ack| {
             ack.outcome == AckOutcome::Executed
