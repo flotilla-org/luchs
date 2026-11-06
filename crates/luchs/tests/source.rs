@@ -1,7 +1,6 @@
 mod common;
 
 use std::{
-    os::unix::fs::MetadataExt,
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
@@ -13,7 +12,6 @@ use jackstay::{
         socket::CpuSetupClient,
     },
     input::Mode,
-    local::Stream,
 };
 use luchs::{
     protocol::{Frame, Header},
@@ -35,7 +33,7 @@ fn source() -> (Source, String) {
 }
 
 fn connect(path: &str) -> (CpuSetupClient, ArenaConsumer) {
-    let stream = Stream::connect(path).unwrap();
+    let stream = common::connect(path);
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -78,17 +76,21 @@ fn acquire(consumer: &ArenaConsumer) -> FrameLease {
 fn private_bootstrap_source_publishes_bgra_and_reconfigures() {
     let (mut source, path) = source();
     // Private parent permissions protect the socket before inode chmod.
-    let parent = std::path::Path::new(&path).parent().unwrap();
-    assert_eq!(std::fs::metadata(parent).unwrap().mode() & 0o777, 0o700);
-    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
-    assert!(
-        Source::bind(
-            path.rsplit('/').next().unwrap().trim_end_matches(".sock"),
-            1,
-            1
-        )
-        .is_err()
-    );
+    // (Windows: Jackstay's pipe DACL admits only the user and SYSTEM.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = std::path::Path::new(&path).parent().unwrap();
+        assert_eq!(std::fs::metadata(parent).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+    #[cfg(unix)]
+    let name = path.rsplit('/').next().unwrap().trim_end_matches(".sock");
+    #[cfg(windows)]
+    let name = common::endpoint(&path);
+    #[cfg(windows)]
+    let name = name.name();
+    assert!(Source::bind(name, 1, 1).is_err());
     let (mut setup, mut consumer) = connect(&path);
     source.publish(pixels(1)).unwrap();
     let old = acquire(&consumer);
@@ -125,14 +127,14 @@ fn private_bootstrap_source_publishes_bgra_and_reconfigures() {
     // Shutdown closes even a connected consumer and removes the endpoint.
     drop((setup, consumer));
     source.stop().unwrap();
-    assert!(!std::path::Path::new(&path).exists());
+    assert!(common::endpoint_gone(&path));
 }
 
 // An idle handshake cannot block media publication or ordered shutdown.
 #[test]
 fn stalled_bootstrap_does_not_block_frames_or_shutdown() {
     let (mut source, path) = source();
-    let stalled = Stream::connect(&path).unwrap();
+    let stalled = common::connect(&path);
     let (setup, consumer) = connect(&path);
     source.publish(pixels(1)).unwrap();
     assert_eq!(acquire(&consumer).bytes(), [42; 4]);
@@ -190,12 +192,8 @@ fn consumer_process_death_releases_reservation() {
 fn all_typing_modes_advertise_native_families_and_preserve_media() {
     for mode in [Mode::Physical, Mode::SourceText, Mode::Cooperative] {
         let (mut source, path) = source();
-        let connected = connect_tracks(
-            Stream::connect(&path).unwrap(),
-            Want::Optional,
-            mode,
-            Want::Optional,
-        );
+        let connected =
+            connect_tracks(common::connect(&path), Want::Optional, mode, Want::Optional);
         assert!(connected.affordances.is_some());
         let input = connected.input.as_ref().unwrap();
         assert_eq!(
@@ -228,20 +226,17 @@ cmd=command(); assert cmd['type']=='cleanup'; ack(cmd)
         path = serde_json::to_string(&release.to_string_lossy()).unwrap()
     );
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut helper = luchs::helper::Helper::spawn_with_state(
-        std::process::Command::new("python3")
-            .args(["-c", &format!("{}{script}", common::PYTHON_PROTOCOL)]),
-        move |state| {
+    let mut helper =
+        luchs::helper::Helper::spawn_with_state(&mut common::python(&script), move |state| {
             if state["started"].as_bool() == Some(true) {
                 tx.send(()).unwrap();
             }
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     let (source, path) = source();
     source.attach_input(&helper);
     let connected = connect_tracks(
-        Stream::connect(&path).unwrap(),
+        common::connect(&path),
         Want::Required,
         Mode::Physical,
         Want::No,

@@ -1,10 +1,13 @@
 # Helper protocol
 
-Rust creates one `AF_UNIX` `SOCK_STREAM` socketpair per renderer and passes the
-child endpoint in `LUCHS_HELPER_FD`. Only that endpoint survives exec; the helper
-sets close-on-exec again before starting WebKit. Stdin and stdout are `/dev/null`
-and carry no protocol bytes. Stderr carries diagnostics. The socket carries one `SCM_RIGHTS` payload descriptor with each `arena` command.
-No pixel bytes travel over the socket.
+On macOS and Linux, Rust creates one `AF_UNIX` `SOCK_STREAM` socketpair per
+renderer and passes the child endpoint in `LUCHS_HELPER_FD`. Only that endpoint
+survives exec; the helper sets close-on-exec again before starting WebKit. Stdin
+and stdout are `/dev/null` and carry no protocol bytes. Stderr carries
+diagnostics. The socket carries one `SCM_RIGHTS` payload descriptor with each
+`arena` command. No pixel bytes travel over the socket. Windows uses a named pipe and passes the
+payload handle in-band; records and commands are otherwise identical (see
+[Windows transport](#windows-transport)).
 
 One helper process owns each engine and uses `takeSnapshot`, without Screen
 Recording permission. Rust reserves and commits Jackstay CPU slots; the helper
@@ -225,7 +228,8 @@ The timeout starts when the command is admitted and includes writing the socket.
 Writes use a nonblocking socket; a timeout or write failure terminates and reaps
 the helper because a partial command cannot be retried on the same stream. Socket
 readiness uses `poll`; the event wait retains the write error even if socket
-EOF races shutdown.
+EOF races shutdown. On Windows each write is an overlapped pipe write bounded by
+the same deadline and cancelled when it expires.
 `Helper::command` maps send failure, timeout, and helper disconnection to
 `CommandOutcome::Uncertain`. A reader accepts an ack only before its command's
 deadline; even a caller that waits later cannot turn a late ack into `Executed`.
@@ -251,7 +255,9 @@ policy.
 
 At setup Rust exports Jackstay's writable payload object. An `arena` command
 carries its descriptor and exactly one fd in `SCM_RIGHTS`, attached to the first
-command byte. Ancillary receipt uses `recvmsg` even across split reads. Jackstay
+command byte (on Windows, a duplicated handle named by `"handle"`; see
+[Windows transport](#windows-transport)). Ancillary receipt uses `recvmsg` even
+across split reads. Jackstay
 validates the object length and layout, maps it shared read/write and consumes the
 fd. The helper acknowledges its allocation generation. No Jackstay bookkeeping
 is exported. `arena_scope` is carried unchanged in both the layout and each draw;
@@ -309,6 +315,56 @@ the snapshot's RGB colour space is determined once per allocation. No channel
 swizzle, intermediate pixel `Data`, Rust pixel vector or socket pixel write remains
 in the helper path. Small command/ack JSON and WebKit snapshot objects still
 allocate. Input geometry stays in the fixed logical viewport.
+
+## Windows transport
+
+Windows has no descriptor passing, so only the transport differs. Envelopes,
+records, command IDs, acknowledgements, timeouts and every command above are
+unchanged.
+
+- **Connection.** Rust binds a fresh user-scoped Jackstay Local Endpoint: a
+  byte-mode duplex named pipe with a protected DACL (the user and SYSTEM),
+  remote clients rejected and first-instance creation. It passes the full
+  `\\.\pipe\...` name in `LUCHS_HELPER_PIPE`. Nothing is inherited, because
+  `std::process::Command` exposes every inheritable handle to every concurrent
+  spawn. The helper opens that name for reading and writing before anything
+  else. Either handle mode works with this protocol. A helper that reads on one
+  thread while writing on another, as a real renderer will, must open the pipe
+  with `FILE_FLAG_OVERLAPPED`, because a synchronous handle serializes the two
+  and a blocked read would stall every write. A single-threaded helper, such
+  as the test fakes, may open it synchronously.
+- **Admission.** Rust assigns the helper to a job object and accepts only a
+  client that is the started process or a member of its job, so a launcher
+  such as `cmd.exe` may start the real helper. Any other process of the user
+  that finds the pipe is disconnected. Rust waits up to 10 s for the helper. If
+  the helper exits without connecting, the stream is closed, as at EOF before
+  any record. If it is still running and unconnected after 10 s, Rust
+  terminates it and the spawn fails. `std::process::Command` cannot start a
+  process suspended, so Rust assigns the job just after the spawn. A launcher
+  that starts the real helper within that window would leave it outside the
+  job, and Rust would refuse its connection, so the failure is visible.
+- **Payload handle.** For `arena`, Rust duplicates the payload section into the
+  connected helper process with `DuplicateHandle` (same access, not
+  inheritable) and sends its value in the command as `"handle"`, an unsigned
+  64-bit integer. No other command carries `"handle"`. The helper owns the
+  handle once it has read the complete command. It imports the handle with
+  Jackstay's writer API, which takes ownership, or maps it with
+  `MapViewOfFile(FILE_MAP_READ | FILE_MAP_WRITE)` and closes it. If Rust cannot
+  write the whole command (timeout or disconnect), it closes the duplicate in
+  the helper again: the helper cannot have learned a value from a partial
+  record.
+
+  ```json
+  {"id":1,"type":"arena","handle":1268,"layout":{"arena_scope":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"generation":1,"map_len":131072,"slot_capacity":16384,"slots":8}}
+  ```
+
+- **Termination.** The job is created with kill-on-close. To stop a helper,
+  Rust disconnects the pipe, so the helper reads EOF. Windows has no `SIGTERM`
+  for a windowless process, so the disconnect takes its place. After up to
+  500 ms Rust terminates the whole job and reaps the child. Where Unix kills
+  the helper, Windows terminates the job, which includes any processes the
+  helper started. If Luchs itself exits abruptly, closing its job handle kills
+  the helper tree.
 
 ## Capture policy and reports
 

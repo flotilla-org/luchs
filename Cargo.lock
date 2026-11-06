@@ -368,6 +368,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "url",
+ "windows-sys",
 ]
 
 [[package]]

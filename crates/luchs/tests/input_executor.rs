@@ -4,13 +4,10 @@ use luchs::{
     helper::Helper,
     input::{Executor, ScrollRemainder},
 };
-use std::{process::Command, time::Duration};
+use std::time::Duration;
 
 fn fake(script: &str) -> Helper {
-    Helper::spawn(
-        Command::new("python3").args(["-c", &format!("{}{script}", common::PYTHON_PROTOCOL)]),
-    )
-    .unwrap()
+    Helper::spawn(&mut common::python(script)).unwrap()
 }
 fn work(operation: Operation) -> Work {
     Work {

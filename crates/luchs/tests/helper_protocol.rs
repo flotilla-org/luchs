@@ -7,42 +7,33 @@ use luchs::{
 use serde_json::json;
 use std::{
     io,
-    process::Command,
     sync::mpsc,
     time::{Duration, Instant},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
-fn fake(script: &str) -> Helper {
-    Helper::spawn(Command::new("/bin/sh").args(["-c", script])).unwrap()
-}
-
 fn python(script: &str) -> Helper {
-    Helper::spawn(
-        Command::new("python3").args(["-c", &format!("{}{script}", common::PYTHON_PROTOCOL)]),
-    )
-    .unwrap()
+    Helper::spawn(&mut common::python(script)).unwrap()
 }
 
 #[test]
 fn fake_helper_streams_split_and_coalesced_control_records() {
+    // Unix: occupy low descriptors so the inherited socket gets a high number.
+    #[cfg(unix)]
     let _occupied: Vec<_> = (0..16)
         .map(|_| std::fs::File::open("/dev/null").unwrap())
         .collect();
     let bytes = common::control(3, json!({"revision":7}));
     let (send, receive) = mpsc::channel();
     let script = format!(
-        "{}; {}",
-        common::socket_write(&bytes[..2]),
-        common::socket_write(&bytes[2..])
+        "{}time.sleep(0.01)\n{}",
+        common::raw_write(&bytes[..2]),
+        common::raw_write(&bytes[2..])
     );
-    let mut helper = Helper::spawn_with_state(
-        Command::new("/bin/sh").args(["-c", &script]),
-        move |state| {
-            send.send(state).unwrap();
-        },
-    )
+    let mut helper = Helper::spawn_with_state(&mut common::python(&script), move |state| {
+        send.send(state).unwrap();
+    })
     .unwrap();
     assert_eq!(receive.recv_timeout(TIMEOUT).unwrap()["revision"], 7);
     helper.finish().unwrap();
@@ -152,16 +143,13 @@ ack(command(), 'failed', 'no view')
 #[test]
 fn state_event_is_delivered_to_callback() {
     let (send, receive) = mpsc::channel();
-    let script = common::socket_write(&common::control(
+    let script = common::raw_write(&common::control(
         3,
         json!({"url":"file:///page", "nested":{"revision":7}}),
     ));
-    let mut helper = Helper::spawn_with_state(
-        Command::new("/bin/sh").args(["-c", &script]),
-        move |state| {
-            send.send(state).unwrap();
-        },
-    )
+    let mut helper = Helper::spawn_with_state(&mut common::python(&script), move |state| {
+        send.send(state).unwrap();
+    })
     .unwrap();
     let state = receive.recv_timeout(TIMEOUT).unwrap();
     assert_eq!(state["nested"]["revision"], 7);
@@ -231,10 +219,10 @@ fn command_ids_preserve_the_full_u64_range() {
 fn malformed_record_stops_and_reaps_without_waiting_for_drop() {
     let dir = tempfile::tempdir().unwrap();
     let pid_path = dir.path().join("pid");
-    let helper = fake(&format!(
-        "echo $$ > '{}'; {}; exec sleep 60",
-        pid_path.display(),
-        common::socket_write(&common::envelope(&[99]))
+    let helper = python(&format!(
+        "{}{}time.sleep(60)\n",
+        common::record_pid(&pid_path),
+        common::raw_write(&common::envelope(&[99]))
     ));
     assert_eq!(
         helper.receive_event(TIMEOUT).unwrap_err().kind(),
@@ -248,14 +236,13 @@ fn panicking_state_callback_fails_and_reaps_helper() {
     let dir = tempfile::tempdir().unwrap();
     let pid_path = dir.path().join("pid");
     let script = format!(
-        "echo $$ > '{}'; {}; exec sleep 60",
-        pid_path.display(),
-        common::socket_write(&common::control(3, json!({})))
+        "{}{}time.sleep(60)\n",
+        common::record_pid(&pid_path),
+        common::raw_write(&common::control(3, json!({})))
     );
-    let helper = Helper::spawn_with_state(Command::new("/bin/sh").args(["-c", &script]), |_| {
-        panic!("test callback")
-    })
-    .unwrap();
+    let helper =
+        Helper::spawn_with_state(&mut common::python(&script), |_| panic!("test callback"))
+            .unwrap();
     let error = helper.receive_event(TIMEOUT).unwrap_err();
     assert!(error.to_string().contains("state callback panicked"));
     assert_reaped(&pid_path);
@@ -263,23 +250,21 @@ fn panicking_state_callback_fails_and_reaps_helper() {
 }
 
 fn assert_reaped(path: &std::path::Path) {
-    let pid: i32 = std::fs::read_to_string(path)
+    let pid = std::fs::read_to_string(path)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    // SAFETY: signal zero only probes whether the test child still exists.
-    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    assert!(common::gone(pid), "helper {pid} was not reaped");
 }
 
 #[test]
 fn dropping_a_blocked_helper_terminates_and_reaps_it() {
     let dir = tempfile::tempdir().unwrap();
     let pid_path = dir.path().join("pid");
-    let helper = fake(&format!(
-        "echo $$ > '{}'; exec sleep 60",
-        pid_path.display()
+    let helper = python(&format!(
+        "{}time.sleep(60)\n",
+        common::record_pid(&pid_path)
     ));
     let deadline = Instant::now() + TIMEOUT;
     while !pid_path.exists() {
@@ -402,9 +387,12 @@ raw_command()
     );
 }
 
+// Unix-only: it checks that the inherited descriptor avoids 0..=2. Windows
+// helpers inherit nothing; they open the pipe by name.
+#[cfg(unix)]
 #[test]
 fn inherited_socket_survives_closed_parent_stdio() {
-    let status = Command::new(std::env::current_exe().unwrap())
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "child_closed_stdio"])
         .env("LUCHS_CLOSED_STDIO_CHILD", "1")
         .status()
@@ -415,6 +403,7 @@ fn inherited_socket_survives_closed_parent_stdio() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "spawned by inherited_socket_survives_closed_parent_stdio"]
 fn child_closed_stdio() {

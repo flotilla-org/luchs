@@ -4,12 +4,10 @@ use jackstay::{
     acquisition::{arena::AcquireOutcome, socket::CpuSetupClient},
     affordances::{Presentation, Size},
     input::{Event, Mode},
-    local::Stream,
 };
 use luchs::capture::{PRESENTATION_DEBOUNCE, PresentationDebounce, Viewport};
 use std::{
     io::{BufRead, BufReader},
-    os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -81,14 +79,10 @@ fn sizes_round_clamp_at_scale_and_restore_cli_default() {
 #[test]
 fn fake_host_resize_geometry_focus_bursts_and_withdrawal() {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("helper");
     let log = dir.path().join("commands");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/usr/bin/env python3\n{}\n{}",
-            common::PYTHON_PROTOCOL,
-            r#"
+    let script = common::helper_script(
+        dir.path(),
+        r#"
 width, height, scale, fresh = 32, 24, 1, True
 fail_focus = True
 while True:
@@ -109,11 +103,8 @@ while True:
     elif cmd['type'] == 'focus' and cmd['focus_failed']:
         ack(cmd, 'failed', 'navigation replaced the document')
     else: ack(cmd)
-"#
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+"#,
+    );
     let mut process = Process(
         Command::new(env!("CARGO_BIN_EXE_luchs"))
             .args(["--size=32x24", "--helper"])
@@ -129,7 +120,7 @@ while True:
         .read_line(&mut path)
         .unwrap();
     let connected = connect_tracks(
-        Stream::connect(path.trim()).unwrap(),
+        common::connect(path.trim()),
         Want::Required,
         Mode::Cooperative,
         Want::Required,
@@ -306,9 +297,7 @@ while True:
     assert_eq!(last["visible"], true);
     assert_eq!(last["scale"], 1.);
     drop((consumer, setup, input, host));
-    unsafe {
-        libc::kill(process.0.id() as i32, libc::SIGTERM);
-    }
+    common::stop(&mut process.0);
     wait(|| process.0.try_wait().unwrap().is_some());
 }
 

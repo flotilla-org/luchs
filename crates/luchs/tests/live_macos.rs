@@ -125,7 +125,7 @@ impl NativeCapture {
         let ack = self
             .helper
             .command_sender()
-            .send_with_fd(
+            .send_with_payload(
                 serde_json::json!({"type":"arena", "layout":export.descriptor()}),
                 TIMEOUT,
                 Some(fd.as_fd()),

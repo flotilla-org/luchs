@@ -1,12 +1,11 @@
+//! Helper process ownership, command ids and acknowledgement routing over a
+//! per-OS transport (see docs/helper-protocol.md): a Unix socketpair, or a
+//! Windows named pipe. Everything above the transport is shared.
 use std::{
     collections::HashMap,
-    io::{self, BufReader, Read, Write},
-    os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd},
-        unix::{net::UnixStream, process::CommandExt},
-    },
+    io::{self, BufReader},
     panic::{AssertUnwindSafe, catch_unwind},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         mpsc::{self, Receiver, SyncSender},
@@ -16,7 +15,18 @@ use std::{
 };
 
 use crate::protocol::{Ack, AckOutcome, Record, encode_json_command, read_record};
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as transport;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as transport;
+
+pub use transport::{OwnedPayload, Payload, borrow as payload};
+type Process = transport::Process;
 
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_PENDING_COMMANDS: usize = 64;
@@ -130,10 +140,10 @@ pub enum HelperEvent {
     Closed,
 }
 
-/// Owns the process and a socket demultiplexer for acknowledgements and state.
+/// Owns the process and a transport demultiplexer for acknowledgements and state.
 pub struct Helper {
-    child: Arc<Mutex<Child>>,
-    socket: Option<UnixStream>,
+    child: Arc<Mutex<Process>>,
+    link: Option<transport::Link>,
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
     sender: CommandSender,
@@ -145,10 +155,10 @@ pub struct Helper {
 pub struct CommandSender {
     writer: Arc<Mutex<CommandWriter>>,
     shared: Arc<Shared>,
-    process: Arc<Mutex<Child>>,
+    process: Arc<Mutex<Process>>,
 }
 struct CommandWriter {
-    socket: UnixStream,
+    transport: transport::Writer,
     next_id: u64,
 }
 
@@ -164,44 +174,22 @@ impl Helper {
         command: &mut Command,
         mut state_event: impl FnMut(serde_json::Map<String, serde_json::Value>) + Send + 'static,
     ) -> io::Result<Self> {
-        let (socket, inherited) = UnixStream::pair()?;
-        socket.set_nonblocking(true)?;
-        let input = socket.try_clone()?;
-        // Stdio setup may overwrite descriptors 0..=2 before pre_exec runs.
-        // Duplicate above that range even when the launching process closed stdio.
-        let inherited = {
-            // SAFETY: fcntl duplicates a live descriptor; UnixStream owns the result.
-            let fd = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            unsafe { UnixStream::from_raw_fd(fd) }
-        };
-        let fd = inherited.as_raw_fd();
-        command.env("LUCHS_HELPER_FD", fd.to_string());
-        // SAFETY: only async-signal-safe fcntl runs between fork and exec. The
-        // parent retains CLOEXEC; only this child's socket survives exec.
-        unsafe {
-            command.pre_exec(move || {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        drop(inherited);
-        let child = Arc::new(Mutex::new(child));
+            .stderr(Stdio::inherit());
+        let transport::Spawned {
+            process,
+            reader,
+            writer,
+            link,
+        } = transport::spawn(command)?;
+        let child = Arc::new(Mutex::new(process));
         let shared = Arc::new(Shared::default());
         let stream = shared.clone();
         let process = child.clone();
         let reader = thread::spawn(move || {
-            let mut reader = BufReader::new(BlockingRead(input));
+            let mut reader = BufReader::new(reader);
             loop {
                 match read_record(&mut reader) {
                     Ok(Some(Record::Ack(ack))) => {
@@ -238,14 +226,14 @@ impl Helper {
         let sender = CommandSender {
             process: child.clone(),
             writer: Arc::new(Mutex::new(CommandWriter {
-                socket: socket.try_clone()?,
+                transport: writer,
                 next_id: 1,
             })),
             shared: shared.clone(),
         };
         Ok(Self {
             child,
-            socket: Some(socket),
+            link: Some(link),
             shared,
             reader: Some(reader),
             sender,
@@ -359,14 +347,16 @@ impl CommandSender {
         command: serde_json::Value,
         timeout: Duration,
     ) -> io::Result<PendingCommand> {
-        self.send_with_fd(command, timeout, None)
+        self.send_with_payload(command, timeout, None)
     }
 
-    pub fn send_with_fd(
+    /// Send a command carrying one payload object, transferred as the
+    /// platform's transport defines (docs/helper-protocol.md).
+    pub fn send_with_payload(
         &self,
         mut command: serde_json::Value,
         timeout: Duration,
-        fd: Option<BorrowedFd<'_>>,
+        payload: Option<Payload<'_>>,
     ) -> io::Result<PendingCommand> {
         let mut writer = self.writer.lock().unwrap();
         let id = writer.next_id;
@@ -377,6 +367,9 @@ impl CommandSender {
             io::Error::new(io::ErrorKind::InvalidInput, "command must be an object")
         })?;
         object.insert("id".into(), id.into());
+        let attachment = payload
+            .map(|payload| writer.transport.attach(object, payload))
+            .transpose()?;
         let bytes = encode_json_command(&command)?;
         let (send, ack) = mpsc::sync_channel(1);
         let deadline = Instant::now() + timeout;
@@ -400,7 +393,7 @@ impl CommandSender {
             shared: self.shared.clone(),
             deadline,
         };
-        if let Err(error) = write_command(&mut writer.socket, &bytes, deadline, fd) {
+        if let Err(error) = writer.transport.write(&bytes, deadline, attachment) {
             if matches!(
                 error.kind(),
                 io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
@@ -418,15 +411,10 @@ impl CommandSender {
     }
 }
 
-fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn end_stream(shared: &Shared, process: &Mutex<Child>, error: Option<io::Error>) {
+fn end_stream(shared: &Shared, process: &Mutex<Process>, error: Option<io::Error>) {
     if error.is_some() {
         // Fail immediately even when nobody is receiving frames or awaiting acks.
-        kill_and_reap(&mut process.lock().unwrap());
+        process.lock().unwrap().kill_and_reap();
     }
     let mut state = shared.state.lock().unwrap();
     // EOF can race a command-write failure; never erase its root cause.
@@ -438,129 +426,20 @@ fn end_stream(shared: &Shared, process: &Mutex<Child>, error: Option<io::Error>)
     shared.ready.notify_all();
 }
 
-// dup'd socket descriptors share O_NONBLOCK. Poll only the reader thread,
-// retaining bounded writes on all Unix platforms (Darwin ignores MSG_DONTWAIT).
-struct BlockingRead(UnixStream);
-impl Read for BlockingRead {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.0.read(bytes) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    let mut fds = [PollFd::new(&self.0, PollFlags::IN)];
-                    if let Err(error) = poll(&mut fds, None) {
-                        if error != rustix::io::Errno::INTR {
-                            return Err(error.into());
-                        }
-                    }
-                }
-                result => return result,
-            }
-        }
-    }
-}
-
-fn write_command(
-    socket: &mut UnixStream,
-    mut bytes: &[u8],
-    deadline: Instant,
-    mut fd: Option<BorrowedFd<'_>>,
-) -> io::Result<()> {
-    while !bytes.is_empty() {
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "command write timed out",
-            ));
-        }
-        let result = if let Some(object) = fd {
-            send_fd(socket, bytes, object)
-        } else {
-            socket.write(bytes)
-        };
-        match result {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "helper socket closed",
-                ));
-            }
-            Ok(len) => {
-                fd = None;
-                bytes = &bytes[len..];
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                // Keep each wait representable on platforms with millisecond
-                // poll limits, while the outer loop enforces the full deadline.
-                let remaining = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(1));
-                let timeout = Timespec::try_from(remaining).expect("at most one second");
-                let mut fds = [PollFd::new(&*socket, PollFlags::OUT)];
-                if let Err(error) = poll(&mut fds, Some(&timeout)) {
-                    if error != rustix::io::Errno::INTR {
-                        return Err(error.into());
-                    }
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-// Aligned ancillary storage, one payload fd, attached to the first command byte.
-fn send_fd(socket: &UnixStream, bytes: &[u8], fd: BorrowedFd<'_>) -> io::Result<usize> {
-    // SAFETY: all message pointers stay live through sendmsg; CMSG_SPACE bounds
-    // the aligned storage and CMSG_DATA points to one initialized descriptor.
-    unsafe {
-        let mut control = [0usize; 8];
-        let mut iov = libc::iovec {
-            iov_base: bytes.as_ptr().cast_mut().cast(),
-            iov_len: bytes.len(),
-        };
-        let mut message: libc::msghdr = std::mem::zeroed();
-        message.msg_iov = &mut iov;
-        message.msg_iovlen = 1;
-        message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) as _;
-        let header = libc::CMSG_FIRSTHDR(&message);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
-        libc::CMSG_DATA(header)
-            .cast::<libc::c_int>()
-            .write(fd.as_raw_fd());
-        #[cfg(target_os = "linux")]
-        let flags = libc::MSG_NOSIGNAL;
-        #[cfg(not(target_os = "linux"))]
-        let flags = 0;
-        let n = libc::sendmsg(socket.as_raw_fd(), &message, flags);
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
-        }
-    }
-}
-
 impl Drop for Helper {
     fn drop(&mut self) {
-        if let Some(socket) = self.socket.take() {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
+        if let Some(link) = self.link.take() {
+            link.shutdown();
         }
         let mut child = self.child.lock().unwrap();
         if matches!(child.try_wait(), Ok(None)) {
-            // SAFETY: the unreaped child owns this PID.
-            unsafe {
-                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
-            }
+            child.request_stop();
             let deadline = Instant::now() + Duration::from_millis(500);
             while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        kill_and_reap(&mut child);
+        child.kill_and_reap();
         drop(child);
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();

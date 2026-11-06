@@ -42,12 +42,15 @@ recovery, page affordances and headless writer imports) on macOS; CI runs it
 after the helper build.
 
 The helper and `libjackstay.dylib` must sit beside the `luchs` executable.
-`--helper PATH` overrides its location, including for fake helpers on Linux.
+`--helper PATH` overrides its location, including for fake helpers on Linux
+and Windows.
 When choosing a Swift helper elsewhere, place `libjackstay.dylib` in that helper's
 own directory; its rpath resolves relative to the helper, rather than `luchs`.
-The Rust workspace builds and tests on macOS and Linux without WebKit; only
-`scripts/build-helper.sh` compiles the Swift renderer. Linux has no real renderer
-yet.
+The Rust workspace builds and tests on macOS, Linux and Windows (MSVC) without
+WebKit; only `scripts/build-helper.sh` compiles the Swift renderer. Linux and
+Windows have no real renderer yet. On Windows the helper connects to a private
+named pipe instead of inheriting a socket (see the
+[helper protocol](docs/helper-protocol.md#windows-transport)).
 
 Jackstay is pinned to a full git revision in the workspace `Cargo.toml`, with
 resolved dependencies committed in `Cargo.lock`.
@@ -191,13 +194,17 @@ On a logged-in macOS desktop, `scripts/test-hover-window.sh` checks desktop focu
 preservation. The ignored `native_host_motion_delivers_trusted_dom_hover` test
 checks trusted native motion, CSS hover, cursor transitions and clean teardown.
 
-CI runs these checks on macOS and Linux, plus helper compilation on macOS.
+CI runs these checks on macOS, Linux and Windows, plus helper compilation on
+macOS.
 Tests spawn fake helpers without WebKit and exercise framed records, ack
 ordering and timeouts, state callbacks, bounds, reload, console environment,
 termination, source bootstrap, replacement, delegated slots, idle policy,
 presentation hints, page-state propagation, helper replacement, URL containment,
 navigation/scroll command forwarding and consumer process death. Command
-fixtures require `python3`. The ignored `live_macos` test requires a built Swift
+fixtures require `python3` (`python` on Windows). The Windows CLI has no
+orderly stop request yet (#43). The tests that check a `SIGTERM` stop therefore
+run only on macOS and Linux, and on Windows the tests that stop the CLI
+terminate it instead. The ignored `live_macos` test requires a built Swift
 helper and a logged-in desktop; a separate ignored child-process fixture runs
 inside the consumer-death test.
 

@@ -5,12 +5,10 @@ use jackstay::{
     acquisition::{arena::AcquireOutcome, socket::CpuSetupClient},
     affordances::Presentation,
     input::Mode,
-    local::Stream,
 };
 use luchs::capture::{CapturePolicy, IDLE_AFTER, IDLE_INTERVAL};
 use std::{
     io::{BufRead, BufReader, Read},
-    os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -107,12 +105,12 @@ fn events(path: &std::path::Path) -> Vec<serde_json::Value> {
 #[test]
 fn socketpair_fake_checks_idle_wakes_scale_visibility_and_unchanged_publications() {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("helper");
     let log = dir.path().join("commands");
     let page = dir.path().join("page.html");
     std::fs::write(&page, "fixture").unwrap();
-    std::fs::write(&script, format!("#!/usr/bin/env python3\n{}\n{}", common::PYTHON_PROTOCOL, r#"
-import select
+    let script = common::helper_script(
+        dir.path(),
+        r#"
 scale, visible, fresh, revision, retries = 1, True, True, 1, 0
 while True:
     if os.path.exists(os.environ['CAPTURE_WAKE']):
@@ -123,7 +121,7 @@ while True:
         revision += 1
         fresh = True
         retries = 2
-    if not select.select([transport], [], [], .01)[0]: continue
+    if not readable(.01): continue
     try: cmd = raw_command()
     except EOFError: break
     if cmd['type'] == 'draw' and retries: cmd['retry_discard'] = True
@@ -155,8 +153,8 @@ while True:
         ack(cmd)
         control(3, {'capture_changed': True})
     else: ack(cmd, 'unsupported')
-"#)).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+"#,
+    );
     let mut process = Process(
         Command::new(env!("CARGO_BIN_EXE_luchs"))
             .args(["--size=1x1", "--watch", "--stats"])
@@ -175,7 +173,7 @@ while True:
         .read_line(&mut path)
         .unwrap();
     let connected = connect_tracks(
-        Stream::connect(path.trim()).unwrap(),
+        common::connect(path.trim()),
         Want::Optional,
         Mode::Cooperative,
         Want::Required,
@@ -329,11 +327,13 @@ while True:
     // Release media before shutdown, but keep presentation attached: its closure
     // restores scale=1 and may publish another frame before SIGTERM arrives.
     drop((consumer, setup, input));
-    unsafe {
-        libc::kill(process.0.id() as i32, libc::SIGTERM);
-    }
+    common::stop(&mut process.0);
     wait(|| process.0.try_wait().unwrap().is_some());
     drop(hints);
+    // Only an orderly stop reports statistics (Windows terminates, see common::stop).
+    if cfg!(windows) {
+        return;
+    }
     let mut stderr = String::new();
     process
         .0

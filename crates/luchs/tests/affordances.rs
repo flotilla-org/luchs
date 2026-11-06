@@ -5,7 +5,6 @@ use jackstay::{
     acquisition::socket::CpuSetupClient,
     affordances::{Domain, Event, Host, Snapshot, Verb},
     input::Mode,
-    local::Stream,
 };
 use luchs::{
     affordances::{LoadPolicy, PageState},
@@ -15,7 +14,6 @@ use luchs::{
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
-    os::unix::fs::{PermissionsExt, symlink},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -82,8 +80,13 @@ fn load_policy_accept_reject_table() {
     for file in [&start, &sibling, &outside] {
         std::fs::write(file, "page").unwrap();
     }
-    symlink(&outside, root.join("escape.html")).unwrap();
-    symlink(dir.path(), root.join("escape-dir")).unwrap();
+    // Windows symlinks need Developer Mode or elevation; Unix covers escapes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(&outside, root.join("escape.html")).unwrap();
+        symlink(dir.path(), root.join("escape-dir")).unwrap();
+    }
     let prefix = dir.path().join("site-other");
     std::fs::create_dir(&prefix).unwrap();
     std::fs::write(prefix.join("page.html"), "page").unwrap();
@@ -91,15 +94,13 @@ fn load_policy_accept_reject_table() {
     fn file(path: impl AsRef<std::path::Path>) -> String {
         Url::from_file_path(path).unwrap().to_string()
     }
-    let cases = vec![
+    let mut cases: Vec<(String, bool)> = vec![
         ("https://example.com/page?q=1#part".into(), true),
         ("http://localhost:8080".into(), true),
         ("HTTPS://example.com".into(), true),
         (file(&sibling), true),
         (format!("{}#part", file(&sibling)), true),
         (file(&outside), false),
-        (file(root.join("escape.html")), false),
-        (file(root.join("escape-dir/outside.html")), false),
         (file(prefix.join("page.html")), false),
         (file(root.join("missing.html")), false),
         (
@@ -129,6 +130,10 @@ fn load_policy_accept_reject_table() {
         ("https://".into(), false),
         ("not a URL".into(), false),
     ];
+    if cfg!(unix) {
+        cases.push((file(root.join("escape.html")), false));
+        cases.push((file(root.join("escape-dir/outside.html")), false));
+    }
     for (value, expected) in cases {
         assert_eq!(policy.allowed_url(&value).is_some(), expected, "{value}");
     }
@@ -268,7 +273,6 @@ fn commands(path: &std::path::Path) -> Vec<Value> {
 #[test]
 fn fake_helper_and_required_host_publish_changes_and_execute_verbs() {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("helper");
     let log = dir.path().join("commands");
     let html = dir.path().join("page.html");
     std::fs::write(&html, "fixture").unwrap();
@@ -278,11 +282,10 @@ fn fake_helper_and_required_host_publish_changes_and_execute_verbs() {
         json!({"domain":"cursor","body":{"shape":"pointer"}}),
         json!({"domain":"scroll","body":scroll(0., true)}),
     ];
-    std::fs::write(
-        &script,
-        format!(
-            "#!/usr/bin/env python3\n{}\ninitial = {}\n{}",
-            common::PYTHON_PROTOCOL,
+    let script = common::helper_script(
+        dir.path(),
+        &format!(
+            "initial = {}\n{}",
             serde_json::to_string(&serde_json::to_string(&initial).unwrap()).unwrap(),
             r#"
 for value in json.loads(initial): control(3, value)
@@ -300,9 +303,7 @@ while True:
     ack(cmd)
 "#
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut process = Process(
         Command::new(env!("CARGO_BIN_EXE_luchs"))
             .args(["--size=1x1", "--helper"])
@@ -318,7 +319,7 @@ while True:
         .read_line(&mut path)
         .unwrap();
     let connected = connect_tracks(
-        Stream::connect(path.trim()).unwrap(),
+        common::connect(path.trim()),
         Want::No,
         Mode::Cooperative,
         Want::Required,
@@ -416,11 +417,10 @@ while True:
         && c["step"] == "large"
         && c["direction"] == "decrement"));
     drop((host, consumer, setup));
-    // SAFETY: this is our own child process.
-    unsafe {
-        libc::kill(process.0.id() as i32, libc::SIGTERM);
-    }
-    assert!(process.0.wait().unwrap().success());
+    common::stop(&mut process.0);
+    let status = process.0.wait().unwrap();
+    // Windows terminates rather than stops the CLI (see common::stop).
+    assert!(cfg!(windows) || status.success());
 }
 
 #[test]
@@ -439,16 +439,14 @@ fn helper_replacement_withdraws_all_domains_before_fresh_state() {
         }
         let page = source.page.clone();
         Helper::spawn_with_state(
-            Command::new("sh")
-                .arg("-c")
-                .arg(format!("{}; sleep 20", common::socket_write(&records))),
+            &mut common::python(&format!("{}time.sleep(20)\n", common::raw_write(&records))),
             move |value| page.helper_state(value),
         )
         .unwrap()
     };
     let helper = spawn("old");
     let connected = connect_tracks(
-        Stream::connect(&path).unwrap(),
+        common::connect(&path),
         Want::No,
         Mode::Cooperative,
         Want::Required,
