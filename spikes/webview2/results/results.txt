@@ -1,0 +1,82 @@
+Windows: "Microsoft Windows [Version 10.0.26200.8653]"
+GetAvailableCoreWebView2BrowserVersionString -> Ok(()) 156.0.4314.58
+foreground at start: hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+message-only hwnd = 0x1902ce
+env.BrowserVersionString = 156.0.4314.58
+default RasterizationScale=1
+readyState="complete" title="spike"
+GraphicsCaptureSession::IsSupported = Ok(true)
+item.Size = Ok(SizeInt32 { Width: 800, Height: 600 }) DisplayName=Ok("")
+== Q1 offscreen frames, default session properties
+  session props: IsBorderRequired=Ok(true) IsCursorCaptureEnabled=Ok(true) MinUpdateInterval=Ok(16.0)
+frames after 1.5s: 48
+saved frame_default_800x600.png tex=800x600 fmt=DXGI_FORMAT(87) px(0,0)=ffffffff px(1,h/2)=fcfcffff px(w/2,h/2)=fcfcffff px(w-1,h-1)=2c2c2cff nonwhite=265599 yellowish=27 contentSize=800x600
+== Q1b border=false cursor=false
+  SetIsBorderRequired(false) -> Ok(())
+  SetIsCursorCaptureEnabled(false) -> Ok(())
+  session props: IsBorderRequired=Ok(false) IsCursorCaptureEnabled=Ok(false) MinUpdateInterval=Ok(16.0)
+saved frame_noborder_800x600.png tex=800x600 fmt=DXGI_FORMAT(87) px(0,0)=ffffffff px(1,h/2)=fcfcffff px(w/2,h/2)=fcfcffff px(w-1,h-1)=2c2c2cff nonwhite=265599 yellowish=27 contentSize=800x600
+== Q2 cadence
+[animating 800x600 10s] 10.0s: frames=320 => 32.0 fps; gap ms min/med/max=30.5/31.3/32.0; rAF 32.0/s; last=(800, 600, 800, 600); fg: hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+[static (rAF loop running, no paint) 5s] 5.0s: frames=2 => 0.4 fps; gap ms min/med/max=31.1/31.1/31.1; rAF 32.0/s; last=(800, 600, 800, 600); fg: hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+  SetIsBorderRequired(false) -> Ok(())
+  SetIsCursorCaptureEnabled(false) -> Ok(())
+  SetMinUpdateInterval(33ms) -> Ok(())
+  session props: IsBorderRequired=Ok(false) IsCursorCaptureEnabled=Ok(false) MinUpdateInterval=Ok(33.0)
+[animating MinUpdateInterval=33ms] 4.0s: frames=64 => 15.9 fps; gap ms min/med/max=60.3/62.5/63.4; rAF 32.4/s; last=(800, 600, 800, 600); fg: hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+  SetIsBorderRequired(false) -> Ok(())
+  SetIsCursorCaptureEnabled(false) -> Ok(())
+  SetMinUpdateInterval(100ms) -> Ok(())
+  session props: IsBorderRequired=Ok(false) IsCursorCaptureEnabled=Ok(false) MinUpdateInterval=Ok(100.0)
+[animating MinUpdateInterval=100ms] 4.0s: frames=32 => 8.0 fps; gap ms min/med/max=122.3/124.9/125.7; rAF 31.9/s; last=(800, 600, 800, 600); fg: hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+  SetIsBorderRequired(false) -> Ok(())
+  SetIsCursorCaptureEnabled(false) -> Ok(())
+  SetMinUpdateInterval(1ms) -> Ok(())
+  session props: IsBorderRequired=Ok(false) IsCursorCaptureEnabled=Ok(false) MinUpdateInterval=Ok(1.0)
+[animating MinUpdateInterval=1ms] 4.0s: frames=128 => 31.9 fps; gap ms min/med/max=28.0/31.2/31.9; rAF 32.1/s; last=(800, 600, 800, 600); fg: hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+== Q3 keyboard
+fg before input: hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+initial: hasFocus=false active="BODY" focusEvents="[]"
+after inp.focus(): hasFocus=false active="inp" :focus=false gotfocus_evts=0
+after typing: value="Hello, World!" errs=[] fg=hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+after Backspace: "Hello, World"
+after 2xArrowLeft + X: "Hello, WorXld" sel="11,11"
+after Ctrl+A: sel="0,13" len=13
+after Tab: active="ta"
+insertText -> {}
+textarea value="\"ab\\ncé😀\""
+events count=106 untrusted=0 sample="[[\"keydown\",\"H\",\"KeyH\",true,\"inp\",null,false],[\"keydown\",\"e\",\"KeyE\",true,\"inp\",null,false],[\"keydown\",\"l\",\"KeyL\",true,\"inp\",null,false],[\"keydown\",\"l\",\"KeyL\",true,\"inp\",null,false],[\"keydown\",\"Backspace\",\"Backspace\",true,\"inp\",null,false],[\"keydown\",\"ArrowLeft\",\"ArrowLeft\",true,\"inp\",null,false],[\"keydown\",\"ArrowLeft\",\"ArrowLeft\",true,\"inp\",null,false],[\"keydown\",\"a\",\"KeyA\",true,\"inp\",null,true],[\"keydown\",\"Tab\",\"Tab\",true,\"inp\",null,false],[\"keydown\",\"Enter\",\"Enter\",true,\"ta\",null,false],[\"input\",null,null,true,\"ta\",null,null],[\"input\",null,null,true,\"ta\",\"c\",null],[\"input\",null,null,true,\"ta\",\"é😀\",null]]"
+hasFocus before emulation=true :focus(ta)=true
+Emulation.setFocusEmulationEnabled -> {}
+hasFocus after emulation=true :focus(ta)=true :focus-visible=true focusEvents="[\"wfocus\"]"
+fg after keyboard: hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+== Q4 mouse
+button center (54, 252); fg before: hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+move Ok(())
+down Ok(())
+up Ok(())
+clicks=1 clickTrusted=true btnText="clicked 1" active="btn" gotfocus_evts=1 fg after: hwnd=0x1902ce pid=217100 title="wv2spike"
+wheel Ok(())
+wheel Ok(())
+wheel Ok(())
+after 3 wheel notches: scrollY=300 wheelSum=300 wheelTrusted=true fg=hwnd=0x1902ce pid=217100 title="wv2spike"
+NO FRAME within 5s
+== Q5 cursor
+hover blank (700, 20): SystemCursorId=32512 HCURSOR=0x10003 events so far=[32512]
+hover link (239, 250): SystemCursorId=32512 HCURSOR=0x10003 events so far=[32512]
+hover input (204, 163): SystemCursorId=32649 HCURSOR=0x1001f events so far=[32512, 32649]
+hover blank (700, 20): SystemCursorId=32513 HCURSOR=0x10005 events so far=[32512, 32649, 32513]
+== Q6 resize to 1024x768
+item.Size after visual resize = Ok(SizeInt32 { Width: 1024, Height: 768 }); last frame before Recreate=(800, 600, 800, 600)
+Recreate -> Ok(())
+page innerWidth x innerHeight = "1024x768"
+saved frame_1024x768.png tex=1024x768 fmt=DXGI_FORMAT(87) px(0,0)=ffffffff px(1,h/2)=f5f5ffff px(w/2,h/2)=f5f5ffff px(w-1,h-1)=2c2c2cff nonwhite=501218 yellowish=59 contentSize=1024x768
+[animating 1024x768] 3.0s: frames=96 => 32.0 fps; gap ms min/med/max=29.1/31.2/32.7; rAF 32.0/s; last=(1024, 768, 1024, 768); fg: hwnd=0x1902ce pid=217100 title="wv2spike"
+== Q7 visibility
+visibilityState="visible" hidden=false
+[IsVisible=FALSE] 4.0s: frames=0 => 0.0 fps; gap ms min/med/max=0.0/0.0/0.0; rAF 0.0/s; last=(1024, 768, 1024, 768); fg: hwnd=0x1902ce pid=217100 title="wv2spike"
+visibilityState="visible"
+[IsVisible=TRUE again] 4.0s: frames=128 => 32.0 fps; gap ms min/med/max=30.6/31.2/32.0; rAF 32.0/s; last=(1024, 768, 1024, 768); fg: hwnd=0x1902ce pid=217100 title="wv2spike"
+saved frame_after_visible.png tex=1024x768 fmt=DXGI_FORMAT(87) px(0,0)=ffffffff px(1,h/2)=f5f5ffff px(w/2,h/2)=f5f5ffff px(w-1,h-1)=2c2c2cff nonwhite=501218 yellowish=59 contentSize=1024x768
+fg at end: hwnd=0x1902ce pid=217100 title="wv2spike"
+DONE
