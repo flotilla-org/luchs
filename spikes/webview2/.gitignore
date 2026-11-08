@@ -1,0 +1,5 @@
+target/
+udf/
+*.png
+!results/*.png
+results.txt

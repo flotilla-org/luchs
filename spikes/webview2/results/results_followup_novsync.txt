@@ -1,0 +1,39 @@
+Windows: "Microsoft Windows [Version 10.0.26200.8653]"
+GetAvailableCoreWebView2BrowserVersionString -> Ok(()) 156.0.4314.58
+foreground at start: hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+message-only hwnd = 0x8603b8
+env.BrowserVersionString = 156.0.4314.58
+default RasterizationScale=1
+readyState="complete" title="spike"
+GraphicsCaptureSession::IsSupported = Ok(true)
+item.Size = Ok(SizeInt32 { Width: 800, Height: 600 }) DisplayName=Ok("")
+  SetIsBorderRequired(false) -> Ok(())
+  SetIsCursorCaptureEnabled(false) -> Ok(())
+  session props: IsBorderRequired=Ok(false) IsCursorCaptureEnabled=Ok(false) MinUpdateInterval=Ok(16.0)
+args env WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=Some("--disable-gpu-vsync --disable-frame-rate-limit")
+[followup animating 800x600] 5.0s: frames=160 => 32.0 fps; gap ms min/med/max=29.3/31.3/32.0; rAF 6578.7/s; last=(800, 600, 800, 600); fg: hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+[start] hasFocus=false active="BODY" focusEvents="[]" ctlGotFocus=0 fg=hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+[after inp.focus()] hasFocus=false active="inp" focusEvents="[]" ctlGotFocus=0 fg=hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+[after one CDP key] hasFocus=true active="inp" focusEvents="[\"wfocus\"]" ctlGotFocus=0 fg=hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+inp value="q"
+  CDP mouseMoved -> {}
+  CDP mousePressed -> {}
+  CDP mouseReleased -> {}
+CDP click: clicks=1 clickTrusted=true active="btn"
+[after CDP click] hasFocus=true active="btn" focusEvents="[\"wfocus\"]" ctlGotFocus=0 fg=hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+CDP wheel -> {}
+after CDP wheel: scrollY=240 wheel=240 trusted=true
+SendMouseInput MOVE blank (700, 20): SystemCursorId=0 newEvents=[] firstEventAfterMs=None fg=hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+SendMouseInput MOVE link (239, 250): SystemCursorId=0 newEvents=[] firstEventAfterMs=None fg=hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+SendMouseInput MOVE link+1 (240, 250): SystemCursorId=32649 newEvents=[32649] firstEventAfterMs=Some(11) fg=hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+SendMouseInput MOVE input (204, 163): SystemCursorId=32649 newEvents=[] firstEventAfterMs=None fg=hwnd=0x1013c pid=7524 title="◑ Wheelhouse catch-up"
+SendMouseInput MOVE input+1 (205, 163): SystemCursorId=32513 newEvents=[32513] firstEventAfterMs=Some(10) fg=hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+SendMouseInput MOVE blank (700, 20): SystemCursorId=32513 newEvents=[] firstEventAfterMs=None fg=hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+SendMouseInput MOVE blank+1 (701, 20): SystemCursorId=32512 newEvents=[32512] firstEventAfterMs=Some(11) fg=hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+CSS cursor at link: "pointer"
+CDP mouseMoved over link: SystemCursorId=32512 newEvents=[]
+hidden 1.5s: visibilityState="hidden" raf=141900
+hidden 2.5s: raf=141900
+[visible again] hasFocus=true active="btn" focusEvents="[\"wfocus\"]" ctlGotFocus=0 fg=hwnd=0x1013c pid=7524 title="◐ Wheelhouse catch-up"
+[after controller.MoveFocus(PROGRAMMATIC)] hasFocus=true active="btn" focusEvents="[\"wfocus\"]" ctlGotFocus=1 fg=hwnd=0x8603b8 pid=217424 title="wv2spike"
+DONE
